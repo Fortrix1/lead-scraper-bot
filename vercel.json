@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "builds": [
+    { "src": "api/scraper_bot.js", "use": "@vercel/node" }
+  ],
+  "routes": [
+    { "src": "/api/scraper_bot", "dest": "/api/scraper_bot.js" }
+  ]
+}
