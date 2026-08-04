@@ -28,17 +28,14 @@ module.exports = async (req, res) => {
   if (typeof body === 'string') { try { body = JSON.parse(body) } catch { return res.status(200).send('OK') } }
   if (!body) return res.status(200).send('OK')
 
-  const msg = body.message
-  if (!msg) return res.status(200).send('OK')
-
-  const chatId = msg.chat.id
-  const userId = String(msg.from?.id || '')
-  const text   = (msg.text || '').trim()
-  const doc    = msg.document
-
-  if (userId !== ADMIN_ID) {
-    await send(chatId, '⛔ This bot is private.')
-    return res.status(200).send('OK')
+  async function answerCallback(callbackQueryId) {
+    try {
+      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callback_query_id: callbackQueryId })
+      })
+    } catch (e) {}
   }
 
   async function send(chatId, text) {
@@ -317,6 +314,59 @@ module.exports = async (req, res) => {
   }
 
   // ══════════════════════════════════════════════
+  //  CALLBACK BUTTONS (must be handled before the body.message
+  //  check below — button taps arrive as body.callback_query,
+  //  which has no top-level body.message)
+  // ══════════════════════════════════════════════
+
+  if (body.callback_query) {
+    const cbChatId = body.callback_query.message.chat.id
+    const cbUserId = String(body.callback_query.from?.id || '')
+    const data     = body.callback_query.data || ''
+    const cbId     = body.callback_query.id
+
+    await answerCallback(cbId)  // stops the button's loading spinner
+
+    if (cbUserId !== ADMIN_ID) return res.status(200).send('OK')
+
+    if (data === 'scout_custom') {
+      await send(cbChatId, 'Send your custom URLScan query now (e.g. page.domain:myshopify.com AND page.title:candles).')
+      const db = await getDB()
+      db.queue[cbUserId] = db.queue[cbUserId] || {}
+      db.queue[cbUserId].awaitingCustomQuery = true
+      await saveDB(db)
+      return res.status(200).send('OK')
+    }
+
+    if (data.startsWith('scout_')) {
+      const key = data.replace('scout_', '')
+      const search = SAVED_SEARCHES[key]
+      if (!search) return res.status(200).send('OK')
+      return await startScoutJob(cbChatId, cbUserId, search.query, search.label)
+    }
+
+    return res.status(200).send('OK')
+  }
+
+  // ══════════════════════════════════════════════
+  //  Everything below here is for normal text/document
+  //  messages only (body.message)
+  // ══════════════════════════════════════════════
+
+  const msg = body.message
+  if (!msg) return res.status(200).send('OK')
+
+  const chatId = msg.chat.id
+  const userId = String(msg.from?.id || '')
+  const text   = (msg.text || '').trim()
+  const doc    = msg.document
+
+  if (userId !== ADMIN_ID) {
+    await send(chatId, '⛔ This bot is private.')
+    return res.status(200).send('OK')
+  }
+
+  // ══════════════════════════════════════════════
   //  COMMANDS
   // ══════════════════════════════════════════════
 
@@ -343,33 +393,6 @@ module.exports = async (req, res) => {
     )
     keyboard.push([{ text: '✏️ Custom search term', callback_data: 'scout_custom' }])
     await sendKeyboard(chatId, 'Which URLScan search do you want to run?', keyboard)
-    return res.status(200).send('OK')
-  }
-
-  // ── Callback buttons (scout menu) ──
-  if (body.callback_query) {
-    const cbChatId = body.callback_query.message.chat.id
-    const cbUserId = String(body.callback_query.from?.id || '')
-    const data     = body.callback_query.data || ''
-
-    if (cbUserId !== ADMIN_ID) return res.status(200).send('OK')
-
-    if (data === 'scout_custom') {
-      await send(cbChatId, 'Send your custom URLScan query now (e.g. page.domain:myshopify.com AND page.title:candles).')
-      const db = await getDB()
-      db.queue[cbUserId] = db.queue[cbUserId] || {}
-      db.queue[cbUserId].awaitingCustomQuery = true
-      await saveDB(db)
-      return res.status(200).send('OK')
-    }
-
-    if (data.startsWith('scout_')) {
-      const key = data.replace('scout_', '')
-      const search = SAVED_SEARCHES[key]
-      if (!search) return res.status(200).send('OK')
-      return await startScoutJob(cbChatId, cbUserId, search.query, search.label)
-    }
-
     return res.status(200).send('OK')
   }
 
