@@ -521,22 +521,24 @@ module.exports = async (req, res) => {
     const withEmail = results.filter(r => r.email !== 'no email').length
     const remaining = userQueue.pending.length
 
-    let reply = `✓ Batch done: ${results.length} checked, ${withEmail} have emails.\n`
+    let reply = `✓ <b>Batch done:</b> ${results.length} checked, ${withEmail} have emails.\n`
+    let leadNum = 0
     results.forEach(r => {
       if (r.email !== 'no email') {
+        leadNum++
         const genericNote = r.email_is_generic ? ' (generic)' : ''
-        const contactNote = r.contact_page ? `\n   ↳ contact: ${r.contact_page}` : ''
-        const socialsList = Object.entries(r.socials || {}).map(([k,v]) => `${k}: ${v}`).join(', ')
-        const socialsNote  = socialsList ? `\n   ↳ social: ${socialsList}` : ''
-        reply += `\n📧 ${r.email}${genericNote}  —  ${r.store_name || r.url}${contactNote}${socialsNote}`
+        const contactNote = r.contact_page ? `\n    ↳ contact: ${r.contact_page}` : ''
+        const socialsList = Object.entries(r.socials || {}).map(([k,v]) => `${k}: ${v}`).join('\n              ')
+        const socialsNote  = socialsList ? `\n    ↳ social: ${socialsList}` : ''
+        reply += `\n\n<b>${leadNum}.</b> ${r.store_name || r.url}\n    📧 ${r.email}${genericNote}${contactNote}${socialsNote}`
       }
     })
 
     if (remaining > 0) {
-      reply += `\n\n${remaining} links remaining. Send anything to continue.`
+      reply += `\n\n────────\n${remaining} links remaining. Send anything to continue.`
     } else {
       const totalWithEmail = userQueue.results.filter(r => r.email !== 'no email').length
-      reply += `\n\n✓ ALL DONE! ${userQueue.results.length} total processed, ${totalWithEmail} have emails.\n` +
+      reply += `\n\n────────\n✓ ALL DONE! ${userQueue.results.length} total processed, ${totalWithEmail} have emails.\n` +
                `Send anything to move to the message-writing step.`
     }
 
