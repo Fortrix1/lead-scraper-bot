@@ -370,8 +370,10 @@ module.exports = async (req, res) => {
 
     await answerCallback(cbId)  // stops the button's loading spinner
 
-    // Anyone can use the bot now (no longer admin-only) — each user is
-    // tracked separately via their own queue:<userId> key, so this is safe.
+    // RESTRICTED to admin only until the tier/referral system is built —
+    // do not remove this until free/premium logic is in place.
+    if (cbUserId !== ADMIN_ID) return res.status(200).send('OK')
+
     const cbLocked = await acquireLock(cbUserId)
     if (!cbLocked) return res.status(200).send('OK')
 
@@ -410,8 +412,12 @@ module.exports = async (req, res) => {
   const text   = (msg.text || '').trim()
   const doc    = msg.document
 
-  // Anyone can use the bot now (no longer restricted to ADMIN_ID) — every
-  // user gets their own isolated queue:<userId> Redis key.
+  // RESTRICTED to admin only until the tier/referral system is built —
+  // do not remove this until free/premium logic is in place.
+  if (userId !== ADMIN_ID) {
+    await send(chatId, '⛔ This bot is private for now — coming soon.')
+    return res.status(200).send('OK')
+  }
 
   // ══════════════════════════════════════════════
   //  COMMANDS
