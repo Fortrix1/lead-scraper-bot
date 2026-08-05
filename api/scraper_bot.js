@@ -75,14 +75,21 @@ module.exports = async (req, res) => {
         body: JSON.stringify(args)
       })
       const d = await r.json()
-      return d.result
-    } catch (e) { return null }
+      if (d.error) {
+        console.error('Redis command error:', d.error, 'args:', args[0])
+        return { ok: false, result: null }
+      }
+      return { ok: true, result: d.result }
+    } catch (e) {
+      console.error('Redis unreachable:', e.message)
+      return { ok: false, result: null }
+    }
   }
 
   // seen-domains hash: field = normalized domain, value = JSON {status,email,checkedAt}
   async function getSeenBatch(keys) {
     if (!keys.length) return {}
-    const vals = await redis('HMGET', 'seen', ...keys)
+    const { result: vals } = await redis('HMGET', 'seen', ...keys)
     const out = {}
     if (vals) keys.forEach((k, i) => { if (vals[i]) out[k] = JSON.parse(vals[i]) })
     return out
@@ -97,7 +104,7 @@ module.exports = async (req, res) => {
 
   // per-user session (pending links / results / message-writing state)
   async function getUserQueue(userId) {
-    const v = await redis('GET', `queue:${userId}`)
+    const { result: v } = await redis('GET', `queue:${userId}`)
     return v ? JSON.parse(v) : { pending: [], results: [], awaitingMessages: false, messages: [], awaitingCustomQuery: false }
   }
 
@@ -109,9 +116,14 @@ module.exports = async (req, res) => {
   // from reading+writing their queue at the same time and clobbering each other.
   // Self-expires after 25s as a safety net in case a request errors/times out
   // without releasing it, so a crash can't permanently lock someone out.
+  // IMPORTANT: if Redis itself is unreachable/misconfigured, this FAILS OPEN
+  // (proceeds without lock protection) rather than silently blocking every
+  // user with no reply — an infra problem should degrade gracefully, not
+  // make the whole bot go silent.
   async function acquireLock(userId) {
-    const res = await redis('SET', `lock:${userId}`, '1', 'NX', 'EX', '25')
-    return res === 'OK'
+    const { ok, result } = await redis('SET', `lock:${userId}`, '1', 'NX', 'EX', '25')
+    if (!ok) return true  // Redis error — don't block the user for it
+    return result === 'OK'
   }
 
   async function releaseLock(userId) {
