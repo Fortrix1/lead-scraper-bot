@@ -9,8 +9,8 @@ module.exports = async (req, res) => {
 
   const BOT_TOKEN = process.env.SCRAPER_BOT_TOKEN || ''
   const ADMIN_ID  = process.env.SCRAPER_ADMIN_ID  || ''
-  const BIN_URL   = process.env.SCRAPER_BIN_URL   || ''
-  const BIN_KEY   = process.env.SCRAPER_BIN_KEY   || ''
+  const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL   || ''
+  const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || ''
 
   const BATCH_SIZE  = 12   // links checked per message — stays under Vercel's time limit
   const CONCURRENCY = 4
@@ -65,26 +65,57 @@ module.exports = async (req, res) => {
     } catch { return '' }
   }
 
-  async function getDB() {
+  // ── Upstash Redis REST — real atomic ops, no more overwrite races ──
+
+  async function redis(...args) {
     try {
-      const r = await fetch(BIN_URL + '/latest', { headers: { 'X-Master-Key': BIN_KEY } })
+      const r = await fetch(REDIS_URL, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(args)
+      })
       const d = await r.json()
-      const rec = d.record || {}
-      return {
-        seen:  rec.seen  || {},
-        queue: rec.queue || {},
-      }
-    } catch { return { seen: {}, queue: {} } }
+      return d.result
+    } catch (e) { return null }
   }
 
-  async function saveDB(db) {
-    try {
-      await fetch(BIN_URL, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', 'X-Master-Key': BIN_KEY },
-        body: JSON.stringify(db)
-      })
-    } catch (e) {}
+  // seen-domains hash: field = normalized domain, value = JSON {status,email,checkedAt}
+  async function getSeenBatch(keys) {
+    if (!keys.length) return {}
+    const vals = await redis('HMGET', 'seen', ...keys)
+    const out = {}
+    if (vals) keys.forEach((k, i) => { if (vals[i]) out[k] = JSON.parse(vals[i]) })
+    return out
+  }
+
+  async function markSeenBatch(entries) {
+    // entries: [[key, dataObj], ...]
+    if (!entries.length) return
+    const flat = entries.flatMap(([k, v]) => [k, JSON.stringify(v)])
+    await redis('HSET', 'seen', ...flat)
+  }
+
+  // per-user session (pending links / results / message-writing state)
+  async function getUserQueue(userId) {
+    const v = await redis('GET', `queue:${userId}`)
+    return v ? JSON.parse(v) : { pending: [], results: [], awaitingMessages: false, messages: [], awaitingCustomQuery: false }
+  }
+
+  async function saveUserQueue(userId, queue) {
+    await redis('SET', `queue:${userId}`, JSON.stringify(queue))
+  }
+
+  // per-user lock — stops the SAME user's overlapping/double-tapped requests
+  // from reading+writing their queue at the same time and clobbering each other.
+  // Self-expires after 25s as a safety net in case a request errors/times out
+  // without releasing it, so a crash can't permanently lock someone out.
+  async function acquireLock(userId) {
+    const res = await redis('SET', `lock:${userId}`, '1', 'NX', 'EX', '25')
+    return res === 'OK'
+  }
+
+  async function releaseLock(userId) {
+    await redis('DEL', `lock:${userId}`)
   }
 
   // ══════════════════════════════════════════════
@@ -331,10 +362,9 @@ module.exports = async (req, res) => {
 
     if (data === 'scout_custom') {
       await send(cbChatId, 'Send your custom URLScan query now (e.g. page.domain:myshopify.com AND page.title:candles).')
-      const db = await getDB()
-      db.queue[cbUserId] = db.queue[cbUserId] || {}
-      db.queue[cbUserId].awaitingCustomQuery = true
-      await saveDB(db)
+      const q = await getUserQueue(cbUserId)
+      q.awaitingCustomQuery = true
+      await saveUserQueue(cbUserId, q)
       return res.status(200).send('OK')
     }
 
@@ -396,74 +426,83 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK')
   }
 
-  const db = await getDB()
-  const userQueue = db.queue[userId] || { pending: [], results: [], awaitingMessages: false, messages: [] }
-
-  // ── Awaiting a custom URLScan query typed by the user ──
-  if (userQueue.awaitingCustomQuery) {
-    userQueue.awaitingCustomQuery = false
-    db.queue[userId] = userQueue
-    await saveDB(db)
-    return await startScoutJob(chatId, userId, text, 'Custom search')
+  // Lock this user's session for the rest of this request — stops two
+  // overlapping requests from the same user (e.g. impatient double-tapping
+  // "continue") from reading the same queue state and writing back over
+  // each other. Self-expires in 25s if something crashes before release.
+  const locked = await acquireLock(userId)
+  if (!locked) {
+    await send(chatId, '⏳ Still working on your last request — one sec.')
+    return res.status(200).send('OK')
   }
 
-  // ── File upload — start a new batch job ──
-  if (doc) {
-    await send(chatId, '📄 Reading file...')
-    const content = await getFileContent(doc.file_id)
-    const rawLinks = extractAndCleanLinks(content)
-    return await startBatchJob(chatId, userId, db, rawLinks, `file (${rawLinks.length} links)`)
-  }
+  try {
+    const userQueue = await getUserQueue(userId)
 
-  // ── Awaiting outreach messages ──
-  if (userQueue.awaitingMessages) {
-    const withEmail = userQueue.results.filter(r => r.email !== 'no email')
-    const parts = text.split('/').map(s => s.trim()).filter(Boolean)
-    userQueue.messages.push(...parts)
-    db.queue[userId] = userQueue
-    await saveDB(db)
+    // ── Awaiting a custom URLScan query typed by the user ──
+    if (userQueue.awaitingCustomQuery) {
+      userQueue.awaitingCustomQuery = false
+      await saveUserQueue(userId, userQueue)
+      return await startScoutJob(chatId, userId, text, 'Custom search')
+    }
 
-    const have = userQueue.messages.length
-    const need = withEmail.length
+    // ── File upload — start a new batch job ──
+    if (doc) {
+      await send(chatId, '📄 Reading file...')
+      const content = await getFileContent(doc.file_id)
+      const rawLinks = extractAndCleanLinks(content)
+      return await startBatchJob(chatId, userId, rawLinks, `file (${rawLinks.length} links)`)
+    }
 
-    if (have < need) {
+    // ── Awaiting outreach messages ──
+    if (userQueue.awaitingMessages) {
+      const withEmail = userQueue.results.filter(r => r.email !== 'no email')
+      const parts = text.split('/').map(s => s.trim()).filter(Boolean)
+      userQueue.messages.push(...parts)
+      await saveUserQueue(userId, userQueue)
+
+      const have = userQueue.messages.length
+      const need = withEmail.length
+
+      if (have < need) {
+        await send(chatId,
+          `Got ${have} message(s) so far. Need ${need - have} more ` +
+          `(separate with /) for the ${need} leads with emails.`
+        )
+        return res.status(200).send('OK')
+      }
+
+      await sendFinalPairs(chatId, withEmail, userQueue.messages)
+      userQueue.awaitingMessages = false
+      userQueue.pending = []
+      userQueue.results = []
+      userQueue.messages = []
+      await saveUserQueue(userId, userQueue)
+      return res.status(200).send('OK')
+    }
+
+    // ── Any other message = continue processing next batch ──
+    if (userQueue.pending.length > 0) {
+      return await runBatch(chatId, userId, userQueue)
+    }
+
+    if (userQueue.results.length > 0 && !userQueue.awaitingMessages) {
+      const withEmail = userQueue.results.filter(r => r.email !== 'no email')
+      userQueue.awaitingMessages = true
+      await saveUserQueue(userId, userQueue)
       await send(chatId,
-        `Got ${have} message(s) so far. Need ${need - have} more ` +
-        `(separate with /) for the ${need} leads with emails.`
+        `✓ All done! ${userQueue.results.length} processed, ${withEmail.length} have emails.\n\n` +
+        `Send your outreach messages now, separated by /.\n` +
+        `Need at least ${withEmail.length} messages.`
       )
       return res.status(200).send('OK')
     }
 
-    await sendFinalPairs(chatId, withEmail, userQueue.messages)
-    userQueue.awaitingMessages = false
-    userQueue.pending = []
-    userQueue.results = []
-    userQueue.messages = []
-    db.queue[userId] = userQueue
-    await saveDB(db)
+    await send(chatId, 'Send a .txt/.csv file, or use /scout to pull fresh links from URLScan.io.')
     return res.status(200).send('OK')
+  } finally {
+    await releaseLock(userId)
   }
-
-  // ── Any other message = continue processing next batch ──
-  if (userQueue.pending.length > 0) {
-    return await runBatch(chatId, userId, db, userQueue)
-  }
-
-  if (userQueue.results.length > 0 && !userQueue.awaitingMessages) {
-    const withEmail = userQueue.results.filter(r => r.email !== 'no email')
-    userQueue.awaitingMessages = true
-    db.queue[userId] = userQueue
-    await saveDB(db)
-    await send(chatId,
-      `✓ All done! ${userQueue.results.length} processed, ${withEmail.length} have emails.\n\n` +
-      `Send your outreach messages now, separated by /.\n` +
-      `Need at least ${withEmail.length} messages.`
-    )
-    return res.status(200).send('OK')
-  }
-
-  await send(chatId, 'Send a .txt/.csv file, or use /scout to pull fresh links from URLScan.io.')
-  return res.status(200).send('OK')
 
   // ══════════════════════════════════════════════
   //  HELPERS
@@ -473,17 +512,18 @@ module.exports = async (req, res) => {
     await send(chatId, `🔍 Scraping URLScan.io — "${label}"...`)
     const rawLinks = await scrapeUrlscan(query, 100)
     const cleaned  = [...new Set(rawLinks.map(fixUrl).filter(Boolean).filter(looksLikeValidLead))]
-    const db = await getDB()
-    return await startBatchJob(chatId, userId, db, cleaned, `URLScan: ${label}`)
+    return await startBatchJob(chatId, userId, cleaned, `URLScan: ${label}`)
   }
 
-  async function startBatchJob(chatId, userId, db, rawLinks, sourceLabel) {
+  async function startBatchJob(chatId, userId, rawLinks, sourceLabel) {
     if (!rawLinks.length) {
       await send(chatId, `No links found from ${sourceLabel}.`)
       return res.status(200).send('OK')
     }
 
-    const newLinks = rawLinks.filter(u => !db.seen[normalizeForDedupe(u)])
+    const dedupeKeys = rawLinks.map(normalizeForDedupe)
+    const seenMap = await getSeenBatch(dedupeKeys)
+    const newLinks = rawLinks.filter((u, i) => !seenMap[dedupeKeys[i]])
     const alreadySeen = rawLinks.length - newLinks.length
 
     if (!newLinks.length) {
@@ -492,31 +532,29 @@ module.exports = async (req, res) => {
     }
 
     const userQueue = { pending: newLinks, results: [], awaitingMessages: false, messages: [] }
-    db.queue[userId] = userQueue
-    await saveDB(db)
+    await saveUserQueue(userId, userQueue)
 
     await send(chatId,
       `✓ ${sourceLabel}: found ${rawLinks.length} links (${alreadySeen} already seen, skipped).\n` +
       `${newLinks.length} new to process.\n\nProcessing first batch of ${BATCH_SIZE}...`
     )
 
-    return await runBatch(chatId, userId, db, userQueue)
+    return await runBatch(chatId, userId, userQueue)
   }
 
-  async function runBatch(chatId, userId, db, userQueue) {
+  async function runBatch(chatId, userId, userQueue) {
     const batch = userQueue.pending.slice(0, BATCH_SIZE)
     userQueue.pending = userQueue.pending.slice(BATCH_SIZE)
 
     const results = await processBatch(batch)
     userQueue.results.push(...results)
 
-    for (const r of results) {
-      db.seen[normalizeForDedupe(r.url)] = {
-        status: r.status, email: r.email, checkedAt: new Date().toISOString()
-      }
-    }
-    db.queue[userId] = userQueue
-    await saveDB(db)
+    const seenEntries = results.map(r => [
+      normalizeForDedupe(r.url),
+      { status: r.status, email: r.email, checkedAt: new Date().toISOString() }
+    ])
+    await markSeenBatch(seenEntries)
+    await saveUserQueue(userId, userQueue)
 
     const withEmail = results.filter(r => r.email !== 'no email').length
     const remaining = userQueue.pending.length
