@@ -358,24 +358,31 @@ module.exports = async (req, res) => {
 
     await answerCallback(cbId)  // stops the button's loading spinner
 
-    if (cbUserId !== ADMIN_ID) return res.status(200).send('OK')
+    // Anyone can use the bot now (no longer admin-only) — each user is
+    // tracked separately via their own queue:<userId> key, so this is safe.
+    const cbLocked = await acquireLock(cbUserId)
+    if (!cbLocked) return res.status(200).send('OK')
 
-    if (data === 'scout_custom') {
-      await send(cbChatId, 'Send your custom URLScan query now (e.g. page.domain:myshopify.com AND page.title:candles).')
-      const q = await getUserQueue(cbUserId)
-      q.awaitingCustomQuery = true
-      await saveUserQueue(cbUserId, q)
+    try {
+      if (data === 'scout_custom') {
+        await send(cbChatId, 'Send your custom search query now (e.g. myshopify.com AND candles).')
+        const q = await getUserQueue(cbUserId)
+        q.awaitingCustomQuery = true
+        await saveUserQueue(cbUserId, q)
+        return res.status(200).send('OK')
+      }
+
+      if (data.startsWith('scout_')) {
+        const key = data.replace('scout_', '')
+        const search = SAVED_SEARCHES[key]
+        if (!search) return res.status(200).send('OK')
+        return await startScoutJob(cbChatId, cbUserId, search.query, search.label)
+      }
+
       return res.status(200).send('OK')
+    } finally {
+      await releaseLock(cbUserId)
     }
-
-    if (data.startsWith('scout_')) {
-      const key = data.replace('scout_', '')
-      const search = SAVED_SEARCHES[key]
-      if (!search) return res.status(200).send('OK')
-      return await startScoutJob(cbChatId, cbUserId, search.query, search.label)
-    }
-
-    return res.status(200).send('OK')
   }
 
   // ══════════════════════════════════════════════
@@ -391,10 +398,8 @@ module.exports = async (req, res) => {
   const text   = (msg.text || '').trim()
   const doc    = msg.document
 
-  if (userId !== ADMIN_ID) {
-    await send(chatId, '⛔ This bot is private.')
-    return res.status(200).send('OK')
-  }
+  // Anyone can use the bot now (no longer restricted to ADMIN_ID) — every
+  // user gets their own isolated queue:<userId> Redis key.
 
   // ══════════════════════════════════════════════
   //  COMMANDS
@@ -406,7 +411,7 @@ module.exports = async (req, res) => {
       `Works even when your PC is off.\n\n` +
       `<b>Two ways to feed it links:</b>\n` +
       `📄 Send a .txt/.csv file — I extract, dedupe, check it\n` +
-      `🔍 /scout — I pull fresh links directly from URLScan.io\n\n` +
+      `🔍 /scout — I pull fresh leads from a live web index\n\n` +
       `Either way I process ${BATCH_SIZE} at a time (Vercel time limit).\n` +
       `Send anything to continue the next batch.\n` +
       `Already-checked links are never re-checked, ever.\n\n` +
@@ -422,7 +427,7 @@ module.exports = async (req, res) => {
       [{ text: s.label, callback_data: `scout_${key}` }]
     )
     keyboard.push([{ text: '✏️ Custom search term', callback_data: 'scout_custom' }])
-    await sendKeyboard(chatId, 'Which URLScan search do you want to run?', keyboard)
+    await sendKeyboard(chatId, 'Which search do you want to run?', keyboard)
     return res.status(200).send('OK')
   }
 
@@ -498,7 +503,7 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
 
-    await send(chatId, 'Send a .txt/.csv file, or use /scout to pull fresh links from URLScan.io.')
+    await send(chatId, 'Send a .txt/.csv file, or use /scout to pull fresh leads.')
     return res.status(200).send('OK')
   } finally {
     await releaseLock(userId)
@@ -509,10 +514,10 @@ module.exports = async (req, res) => {
   // ══════════════════════════════════════════════
 
   async function startScoutJob(chatId, userId, query, label) {
-    await send(chatId, `🔍 Scraping URLScan.io — "${label}"...`)
+    await send(chatId, `🔍 Searching for fresh leads — "${label}"...`)
     const rawLinks = await scrapeUrlscan(query, 100)
     const cleaned  = [...new Set(rawLinks.map(fixUrl).filter(Boolean).filter(looksLikeValidLead))]
-    return await startBatchJob(chatId, userId, cleaned, `URLScan: ${label}`)
+    return await startBatchJob(chatId, userId, cleaned, label)
   }
 
   async function startBatchJob(chatId, userId, rawLinks, sourceLabel) {
