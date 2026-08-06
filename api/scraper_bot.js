@@ -28,12 +28,41 @@ module.exports = async (req, res) => {
   if (typeof body === 'string') { try { body = JSON.parse(body) } catch { return res.status(200).send('OK') } }
   if (!body) return res.status(200).send('OK')
 
+  const PREMIUM_STARS_PRICE = 2  // Telegram Stars for 1 full-detail premium scrape
+
   async function answerCallback(callbackQueryId) {
     try {
       await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ callback_query_id: callbackQueryId })
+      })
+    } catch (e) {}
+  }
+
+  async function sendInvoice(chatId) {
+    try {
+      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendInvoice`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          title: '1 Premium Scrape',
+          description: 'Unlock 1 full-detail scrape — name, socials, and contact page included.',
+          payload: `premium_scrape_${chatId}_${Date.now()}`,
+          currency: 'XTR',
+          prices: [{ label: 'Premium Scrape', amount: PREMIUM_STARS_PRICE }]
+        })
+      })
+    } catch (e) {}
+  }
+
+  async function answerPreCheckoutQuery(id, ok, errorMessage) {
+    try {
+      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerPreCheckoutQuery`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pre_checkout_query_id: id, ok, ...(errorMessage ? { error_message: errorMessage } : {}) })
       })
     } catch (e) {}
   }
@@ -128,6 +157,83 @@ module.exports = async (req, res) => {
 
   async function releaseLock(userId) {
     await redis('DEL', `lock:${userId}`)
+  }
+
+  // ── Users, referrals, bonus leads ──
+  // Full-detail data (name/socials/contact) and file uploads stay
+  // admin-only, period. Referrals only ever earn MORE of the same
+  // restricted (link+email) leads free users already get — never
+  // upgraded access. That's a deliberate choice, not an oversight.
+
+  function today() {
+    return new Date().toISOString().slice(0, 10)  // YYYY-MM-DD (UTC)
+  }
+
+  const DAY_MS = 24 * 60 * 60 * 1000
+
+  async function getUser(userId) {
+    const { result } = await redis('HGETALL', `user:${userId}`)
+    const flat = {}
+    if (result) for (let i = 0; i < result.length; i += 2) flat[result[i]] = result[i + 1]
+    return {
+      hasStarted:              flat.hasStarted === '1',
+      referredBy:              flat.referredBy || '',
+      totalReferrals:          parseInt(flat.totalReferrals || '0', 10),
+      referralWindowStart:     parseInt(flat.referralWindowStart || '0', 10),
+      referralsInWindow:       parseInt(flat.referralsInWindow || '0', 10),
+      bonusLeadsRemaining:     parseInt(flat.bonusLeadsRemaining || '0', 10),
+      premiumScrapesRemaining: parseInt(flat.premiumScrapesRemaining || '0', 10),
+    }
+  }
+
+  async function setUserFields(userId, fields) {
+    const flat = Object.entries(fields).flatMap(([k, v]) => [k, String(v)])
+    await redis('HSET', `user:${userId}`, ...flat)
+  }
+
+  // Credits a successful referral: +10 bonus leads, max 2 per ROLLING 24h
+  // window (not a calendar-day reset — that would let someone grab 2 right
+  // before midnight UTC and 2 more minutes later after rollover). The
+  // window starts at the first referral and expires exactly 24h later.
+  // Uses Date.now() on the server — nothing here is ever read from the
+  // user's device, so there's no clock to manipulate client-side.
+  async function creditReferral(referrerId) {
+    const user = await getUser(referrerId)
+    const now = Date.now()
+
+    let windowStart = user.referralWindowStart
+    let inWindow = user.referralsInWindow
+    if (!windowStart || (now - windowStart) >= DAY_MS) {
+      windowStart = now
+      inWindow = 0
+    }
+
+    if (inWindow >= 2) {
+      const hoursLeft = Math.ceil((windowStart + DAY_MS - now) / (60 * 60 * 1000))
+      await send(referrerId, `Max referrals met (2/24h) — you can refer again in ~${hoursLeft}h.`)
+      return
+    }
+
+    inWindow += 1
+    const totalReferrals = user.totalReferrals + 1
+    const bonusLeadsRemaining = user.bonusLeadsRemaining + 10
+
+    await setUserFields(referrerId, {
+      referralWindowStart: windowStart, referralsInWindow: inWindow,
+      totalReferrals, bonusLeadsRemaining
+    })
+    await send(referrerId, `🎉 Referral confirmed! +10 bonus leads added (${inWindow}/2 in this 24h window). Use /scout to claim them.`)
+  }
+
+  let cachedBotUsername = ''
+  async function getBotUsername() {
+    if (cachedBotUsername) return cachedBotUsername
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`)
+      const d = await r.json()
+      cachedBotUsername = d.result?.username || ''
+    } catch (e) {}
+    return cachedBotUsername
   }
 
   // ══════════════════════════════════════════════
@@ -357,6 +463,28 @@ module.exports = async (req, res) => {
   }
 
   // ══════════════════════════════════════════════
+  //  TELEGRAM STARS PAYMENTS — must be handled before body.message/
+  //  body.callback_query checks below, since these are their own
+  //  distinct update types.
+  // ══════════════════════════════════════════════
+
+  if (body.pre_checkout_query) {
+    // Always approve — Stars payments for a fixed-price digital good
+    // don't need stock/availability checks.
+    await answerPreCheckoutQuery(body.pre_checkout_query.id, true)
+    return res.status(200).send('OK')
+  }
+
+  if (body.message?.successful_payment) {
+    const payerId = String(body.message.from?.id || '')
+    const payerChatId = body.message.chat.id
+    const user = await getUser(payerId)
+    await setUserFields(payerId, { premiumScrapesRemaining: user.premiumScrapesRemaining + 1 })
+    await send(payerChatId, `✓ Payment received — +1 premium scrape unlocked. Use /scout to spend it.`)
+    return res.status(200).send('OK')
+  }
+
+  // ══════════════════════════════════════════════
   //  CALLBACK BUTTONS (must be handled before the body.message
   //  check below — button taps arrive as body.callback_query,
   //  which has no top-level body.message)
@@ -370,27 +498,77 @@ module.exports = async (req, res) => {
 
     await answerCallback(cbId)  // stops the button's loading spinner
 
-    // RESTRICTED to admin only until the tier/referral system is built —
-    // do not remove this until free/premium logic is in place.
-    if (cbUserId !== ADMIN_ID) return res.status(200).send('OK')
-
     const cbLocked = await acquireLock(cbUserId)
     if (!cbLocked) return res.status(200).send('OK')
 
     try {
-      if (data === 'scout_custom') {
-        await send(cbChatId, 'Send your custom search query now (e.g. myshopify.com AND candles).')
+      // ── ADMIN — unchanged saved-search / custom, but the FIRST scout of
+      // the day also splits the batch: 50 into the shared free pool, the
+      // rest stays admin's own (see adminScoutAndFillPoolIfNeeded).
+      if (cbUserId === ADMIN_ID) {
+        if (data === 'scout_custom') {
+          await send(cbChatId, 'Send your custom search query now (e.g. myshopify.com AND candles).')
+          const q = await getUserQueue(cbUserId)
+          q.awaitingCustomQuery = true
+          await saveUserQueue(cbUserId, q)
+          return res.status(200).send('OK')
+        }
+        if (data.startsWith('scout_')) {
+          const key = data.replace('scout_', '')
+          const search = SAVED_SEARCHES[key]
+          if (!search) return res.status(200).send('OK')
+          return await adminScoutAndFillPoolIfNeeded(cbChatId, cbUserId, search.query, search.label)
+        }
+        return res.status(200).send('OK')
+      }
+
+      // ── PREMIUM (Stars-purchased) — same live-search flow as admin,
+      // minus one paid credit. Full detail, same as admin gets. ──
+      if (data === 'pscout_custom') {
+        const user = await getUser(cbUserId)
+        if (user.premiumScrapesRemaining <= 0) {
+          await send(cbChatId, 'No premium scrapes left. Buy one for 2 Stars via /scout.')
+          return res.status(200).send('OK')
+        }
+        await setUserFields(cbUserId, { premiumScrapesRemaining: user.premiumScrapesRemaining - 1 })
+        await send(cbChatId, 'Send your custom search query now.')
         const q = await getUserQueue(cbUserId)
         q.awaitingCustomQuery = true
         await saveUserQueue(cbUserId, q)
         return res.status(200).send('OK')
       }
-
-      if (data.startsWith('scout_')) {
-        const key = data.replace('scout_', '')
+      if (data.startsWith('pscout_')) {
+        const key = data.replace('pscout_', '')
         const search = SAVED_SEARCHES[key]
         if (!search) return res.status(200).send('OK')
+        const user = await getUser(cbUserId)
+        if (user.premiumScrapesRemaining <= 0) {
+          await send(cbChatId, 'No premium scrapes left. Buy one for 2 Stars via /scout.')
+          return res.status(200).send('OK')
+        }
+        await setUserFields(cbUserId, { premiumScrapesRemaining: user.premiumScrapesRemaining - 1 })
         return await startScoutJob(cbChatId, cbUserId, search.query, search.label)
+      }
+
+      // ── Everyone else — restricted (link+email) claims only. Full-detail
+      // access via referrals never happens — only via a purchased premium
+      // scrape (Stars now, real-money coming soon). ──
+      if (data === 'claim_pool') {
+        return await claimFromPool(cbChatId, cbUserId)
+      }
+
+      if (data === 'claim_bonus') {
+        return await claimBonusLeads(cbChatId, cbUserId)
+      }
+
+      if (data === 'buy_premium') {
+        await sendInvoice(cbChatId)
+        return res.status(200).send('OK')
+      }
+
+      if (data === 'pay_money') {
+        await send(cbChatId, '💵 Card/bank payment — coming soon!')
+        return res.status(200).send('OK')
       }
 
       return res.status(200).send('OK')
@@ -412,40 +590,102 @@ module.exports = async (req, res) => {
   const text   = (msg.text || '').trim()
   const doc    = msg.document
 
-  // RESTRICTED to admin only until the tier/referral system is built —
-  // do not remove this until free/premium logic is in place.
-  if (userId !== ADMIN_ID) {
-    await send(chatId, '⛔ This bot is private for now — coming soon.')
-    return res.status(200).send('OK')
-  }
+  // No blanket gate anymore — /start, /invite, and /scout are role-aware
+  // internally. File uploads (the one feature that's unlimited/full-detail)
+  // get their own premium check right where they're handled below.
 
   // ══════════════════════════════════════════════
   //  COMMANDS
   // ══════════════════════════════════════════════
 
-  if (text === '/start') {
+  if (text.startsWith('/start')) {
+    const payload = text.split(' ')[1] || ''
+    const isFreshUser = !(await getUser(userId)).hasStarted
+
+    if (isFreshUser) {
+      await setUserFields(userId, { hasStarted: '1' })
+      if (payload.startsWith('ref_')) {
+        const referrerId = payload.replace('ref_', '')
+        if (referrerId && referrerId !== userId) {
+          await setUserFields(userId, { referredBy: referrerId })
+          await creditReferral(referrerId)
+        }
+      }
+    }
+
+    const introText = userId === ADMIN_ID
+      ? `👋 <b>Lead Scraper Bot</b>\n\n` +
+        `Works even when your PC is off.\n\n` +
+        `<b>Two ways to feed it links:</b>\n` +
+        `📄 Send a .txt/.csv file — I extract, dedupe, check it\n` +
+        `🔍 /scout — full search menu\n\n` +
+        `Already-checked links are never re-checked, ever.\n\n` +
+        `When done, send your outreach messages separated by /\n` +
+        `and I'll pair each one with an email for you to copy & send.`
+      : `👋 <b>Lead Scraper Bot</b>\n\n` +
+        `🎁 /scout — claim today's free leads (link + email)\n` +
+        `🔗 /invite — get your referral link, earn +10 bonus leads per friend who joins (max 2/day)\n\n` +
+        `Already-checked links are never shown to you twice.`
+
+    await send(chatId, introText)
+    return res.status(200).send('OK')
+  }
+
+  if (text === '/invite') {
+    const user = await getUser(userId)
+    const username = await getBotUsername()
+    const link = username ? `https://t.me/${username}?start=ref_${userId}` : '(could not fetch bot link — try again)'
+
+    const now = Date.now()
+    const windowActive = user.referralWindowStart && (now - user.referralWindowStart) < DAY_MS
+    const usedInWindow = windowActive ? user.referralsInWindow : 0
+    const resetNote = windowActive
+      ? ` (resets in ~${Math.ceil((user.referralWindowStart + DAY_MS - now) / (60 * 60 * 1000))}h)`
+      : ''
+
     await send(chatId,
-      `👋 <b>Lead Scraper Bot</b>\n\n` +
-      `Works even when your PC is off.\n\n` +
-      `<b>Two ways to feed it links:</b>\n` +
-      `📄 Send a .txt/.csv file — I extract, dedupe, check it\n` +
-      `🔍 /scout — I pull fresh leads from a live web index\n\n` +
-      `Either way I process ${BATCH_SIZE} at a time (Vercel time limit).\n` +
-      `Send anything to continue the next batch.\n` +
-      `Already-checked links are never re-checked, ever.\n\n` +
-      `When done, send your outreach messages separated by /\n` +
-      `and I'll pair each one with an email for you to copy & send.`
+      `🔗 <b>Your referral link:</b>\n${link}\n\n` +
+      `Referrals used: ${usedInWindow}/2${resetNote}\n` +
+      `Total referrals ever: ${user.totalReferrals}\n` +
+      `Bonus leads available: ${user.bonusLeadsRemaining}\n\n` +
+      `Each friend who taps Start with your link gives you +10 bonus leads ` +
+      `(link + email, from live search — not the shared pool). Max 2 per rolling 24h window.`
     )
     return res.status(200).send('OK')
   }
 
-  // ── /scout — pick a saved URLScan search ──
+  // ── /scout — role-based menu ──
   if (text === '/scout') {
-    const keyboard = Object.entries(SAVED_SEARCHES).map(([key, s]) =>
-      [{ text: s.label, callback_data: `scout_${key}` }]
-    )
-    keyboard.push([{ text: '✏️ Custom search term', callback_data: 'scout_custom' }])
-    await sendKeyboard(chatId, 'Which search do you want to run?', keyboard)
+    if (userId === ADMIN_ID) {
+      const keyboard = Object.entries(SAVED_SEARCHES).map(([key, s]) =>
+        [{ text: s.label, callback_data: `scout_${key}` }]
+      )
+      keyboard.push([{ text: '✏️ Custom search term', callback_data: 'scout_custom' }])
+      await sendKeyboard(chatId, 'Which search do you want to run?', keyboard)
+      return res.status(200).send('OK')
+    }
+
+    const user = await getUser(userId)
+    const keyboard = []
+
+    if (user.premiumScrapesRemaining > 0) {
+      keyboard.push(...Object.entries(SAVED_SEARCHES).map(([key, s]) =>
+        [{ text: `💎 ${s.label}`, callback_data: `pscout_${key}` }]
+      ))
+      keyboard.push([{ text: '💎 ✏️ Custom search', callback_data: 'pscout_custom' }])
+    }
+    if (user.bonusLeadsRemaining > 0) {
+      keyboard.push([{ text: `🔗 Claim bonus leads (${user.bonusLeadsRemaining})`, callback_data: 'claim_bonus' }])
+    }
+    keyboard.push([{ text: "🎁 Claim today's free leads", callback_data: 'claim_pool' }])
+    keyboard.push([{ text: `💫 Buy premium scrape (${PREMIUM_STARS_PRICE} Stars)`, callback_data: 'buy_premium' }])
+    keyboard.push([{ text: '💵 Pay with card', callback_data: 'pay_money' }])
+
+    const intro = user.premiumScrapesRemaining > 0
+      ? `💎 You have ${user.premiumScrapesRemaining} premium scrape(s) — full details (name, socials, contact).\n\n`
+      : `Free/bonus leads are link + email only. Buy a premium scrape for full details.\n\n`
+
+    await sendKeyboard(chatId, intro + 'What would you like to do?', keyboard)
     return res.status(200).send('OK')
   }
 
@@ -469,8 +709,16 @@ module.exports = async (req, res) => {
       return await startScoutJob(chatId, userId, text, 'Custom search')
     }
 
-    // ── File upload — start a new batch job ──
+    // ── File upload — admin, or a purchased premium scrape ──
     if (doc) {
+      if (userId !== ADMIN_ID) {
+        const user = await getUser(userId)
+        if (user.premiumScrapesRemaining <= 0) {
+          await send(chatId, `📄 File uploads need a premium scrape. Buy one for ${PREMIUM_STARS_PRICE} Stars via /scout, or use /scout to claim free/bonus leads.`)
+          return res.status(200).send('OK')
+        }
+        await setUserFields(userId, { premiumScrapesRemaining: user.premiumScrapesRemaining - 1 })
+      }
       await send(chatId, '📄 Reading file...')
       const content = await getFileContent(doc.file_id)
       const rawLinks = extractAndCleanLinks(content)
@@ -531,6 +779,133 @@ module.exports = async (req, res) => {
   //  HELPERS
   // ══════════════════════════════════════════════
 
+  // Admin's FIRST /scout of the day also fills the shared free pool with up
+  // to 30 leads — but admin still sees the FULL list either way, just with
+  // whichever of those links are (still) sitting in today's pool flagged.
+  async function adminScoutAndFillPoolIfNeeded(chatId, userId, query, label) {
+    const date = today()
+    const { result: filledDate } = await redis('GET', 'poolFilledDate')
+
+    await send(chatId, `🔍 Searching for fresh leads — "${label}"...`)
+    const rawLinks = await scrapeUrlscan(query, 100)
+    const cleaned  = [...new Set(rawLinks.map(fixUrl).filter(Boolean).filter(looksLikeValidLead))]
+
+    if (filledDate !== date) {
+      const dedupeKeys = cleaned.map(normalizeForDedupe)
+      const seenMap = await getSeenBatch(dedupeKeys)
+      const eligible = cleaned.filter((u, i) => !seenMap[dedupeKeys[i]])
+      const forPool = eligible.slice(0, 30)
+
+      if (forPool.length) {
+        await redis('RPUSH', `pool:${date}`, ...forPool)
+        await redis('EXPIRE', `pool:${date}`, 172800)  // auto-clears in 2 days, no manual cleanup needed
+      }
+      await redis('SET', 'poolFilledDate', date)
+
+      await send(chatId, `✓ Today's free pool refilled with ${forPool.length} leads (flagged 🔒 below).`)
+    }
+
+    // Whatever's currently still sitting in today's pool gets flagged in
+    // admin's own list — this naturally shrinks over the day as free users
+    // claim from it, which is accurate: it always shows what's STILL shared.
+    const { result: poolNow } = await redis('LRANGE', `pool:${date}`, '0', '-1')
+    const poolSet = new Set((poolNow || []).map(normalizeForDedupe))
+
+    return await startBatchJob(chatId, userId, cleaned, label, poolSet)
+  }
+
+  // Free users pull straight from today's shared pool — no live search
+  // access, no queue/continue flow, just one immediate capped batch per
+  // tap. Restricted fields only: link + email, no name/socials/contact.
+  async function claimFromPool(chatId, userId) {
+    const date = today()
+    const { result: popped } = await redis('LPOP', `pool:${date}`, String(BATCH_SIZE))
+
+    if (!popped || !popped.length) {
+      await send(chatId,
+        `😔 Today's free leads are all claimed.\n` +
+        `Check back tomorrow, or refer friends (/invite) for +10 bonus leads each.`
+      )
+      return res.status(200).send('OK')
+    }
+
+    const dedupeKeys = popped.map(normalizeForDedupe)
+    const seenMap = await getSeenBatch(dedupeKeys)
+    const fresh = popped.filter((u, i) => !seenMap[dedupeKeys[i]])
+
+    const results = fresh.length ? await processBatch(fresh) : []
+    const seenEntries = results.map(r => [
+      normalizeForDedupe(r.url),
+      { status: r.status, email: r.email, checkedAt: new Date().toISOString() }
+    ])
+    await markSeenBatch(seenEntries)
+
+    const withEmail = results.filter(r => r.email !== 'no email')
+    let reply = `🎁 <b>Free leads:</b> ${results.length} checked, ${withEmail.length} have emails.`
+    withEmail.forEach((r, i) => {
+      reply += `\n\n<b>${i + 1}.</b> ${r.url}\n    📧 ${r.email}`
+    })
+
+    const { result: remaining } = await redis('LLEN', `pool:${date}`)
+    reply += (remaining && remaining > 0)
+      ? `\n\n────────\n${remaining} free leads left today. Send /scout again to claim more.`
+      : `\n\n────────\nThat's it — today's free pool is fully claimed. New leads tomorrow, or refer friends (/invite) for +10 bonus leads each.`
+
+    await send(chatId, reply)
+    return res.status(200).send('OK')
+  }
+
+  // Referral-earned bonus leads — a personal top-up separate from the shared
+  // pool (so one referrer claiming theirs doesn't eat into what's left for
+  // everyone else). Still restricted format: link + email only, never
+  // full-detail — that stays admin-only regardless of referrals.
+  async function claimBonusLeads(chatId, userId) {
+    const user = await getUser(userId)
+    if (user.bonusLeadsRemaining <= 0) {
+      await send(chatId, `No bonus leads left. Refer more friends (/invite) to earn +10 each.`)
+      return res.status(200).send('OK')
+    }
+
+    const want = Math.min(BATCH_SIZE, user.bonusLeadsRemaining)
+    await send(chatId, `🔍 Pulling your bonus leads...`)
+
+    const rawLinks = await scrapeUrlscan(SAVED_SEARCHES['1'].query, 100)
+    let cleaned = [...new Set(rawLinks.map(fixUrl).filter(Boolean).filter(looksLikeValidLead))]
+
+    const dedupeKeys = cleaned.map(normalizeForDedupe)
+    const seenMap = await getSeenBatch(dedupeKeys)
+    cleaned = cleaned.filter((u, i) => !seenMap[dedupeKeys[i]])
+
+    const batch = cleaned.slice(0, want)
+    if (!batch.length) {
+      await send(chatId, `Couldn't find any new leads right now — try again shortly.`)
+      return res.status(200).send('OK')
+    }
+
+    const results = await processBatch(batch)
+    const seenEntries = results.map(r => [
+      normalizeForDedupe(r.url),
+      { status: r.status, email: r.email, checkedAt: new Date().toISOString() }
+    ])
+    await markSeenBatch(seenEntries)
+
+    const newRemaining = user.bonusLeadsRemaining - batch.length
+    await setUserFields(userId, { bonusLeadsRemaining: newRemaining })
+
+    const withEmail = results.filter(r => r.email !== 'no email')
+    let reply = `⭐ <b>Bonus leads:</b> ${results.length} checked, ${withEmail.length} have emails.`
+    withEmail.forEach((r, i) => {
+      reply += `\n\n<b>${i + 1}.</b> ${r.url}\n    📧 ${r.email}`
+    })
+
+    reply += newRemaining > 0
+      ? `\n\n────────\n${newRemaining} bonus leads left. Send /scout again to claim more.`
+      : `\n\n────────\nAll bonus leads claimed! Refer more friends (/invite) to earn more.`
+
+    await send(chatId, reply)
+    return res.status(200).send('OK')
+  }
+
   async function startScoutJob(chatId, userId, query, label) {
     await send(chatId, `🔍 Searching for fresh leads — "${label}"...`)
     const rawLinks = await scrapeUrlscan(query, 100)
@@ -538,7 +913,7 @@ module.exports = async (req, res) => {
     return await startBatchJob(chatId, userId, cleaned, label)
   }
 
-  async function startBatchJob(chatId, userId, rawLinks, sourceLabel) {
+  async function startBatchJob(chatId, userId, rawLinks, sourceLabel, poolSet) {
     if (!rawLinks.length) {
       await send(chatId, `No links found from ${sourceLabel}.`)
       return res.status(200).send('OK')
@@ -554,7 +929,10 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
 
-    const userQueue = { pending: newLinks, results: [], awaitingMessages: false, messages: [] }
+    const userQueue = {
+      pending: newLinks, results: [], awaitingMessages: false, messages: [],
+      poolUrls: poolSet ? [...poolSet] : []
+    }
     await saveUserQueue(userId, userQueue)
 
     await send(chatId,
@@ -581,17 +959,20 @@ module.exports = async (req, res) => {
 
     const withEmail = results.filter(r => r.email !== 'no email').length
     const remaining = userQueue.pending.length
+    const poolUrlSet = new Set(userQueue.poolUrls || [])
 
     let reply = `✓ <b>Batch done:</b> ${results.length} checked, ${withEmail} have emails.\n`
     let leadNum = 0
     results.forEach(r => {
       if (r.email !== 'no email') {
         leadNum++
+        const inPool = poolUrlSet.has(normalizeForDedupe(r.url))
+        const poolFlag = inPool ? `\n    🔒 <b>IN FREE POOL</b> — also shown to free users` : ''
         const genericNote = r.email_is_generic ? ' (generic)' : ''
         const contactNote = r.contact_page ? `\n    ↳ contact: ${r.contact_page}` : ''
         const socialsList = Object.entries(r.socials || {}).map(([k,v]) => `${k}: ${v}`).join('\n              ')
         const socialsNote  = socialsList ? `\n    ↳ social: ${socialsList}` : ''
-        reply += `\n\n<b>${leadNum}.</b> ${r.store_name || r.url}\n    📧 ${r.email}${genericNote}${contactNote}${socialsNote}`
+        reply += `\n\n<b>${leadNum}.</b> ${r.store_name || r.url}\n    📧 ${r.email}${genericNote}${contactNote}${socialsNote}${poolFlag}`
       }
     })
 
