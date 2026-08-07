@@ -957,30 +957,33 @@ module.exports = async (req, res) => {
     await markSeenBatch(seenEntries)
     await saveUserQueue(userId, userQueue)
 
-    const withEmail = results.filter(r => r.email !== 'no email').length
+    const usable = results.filter(r => r.status === 'OK' && (r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length))
     const remaining = userQueue.pending.length
     const poolUrlSet = new Set(userQueue.poolUrls || [])
 
-    let reply = `✓ <b>Batch done:</b> ${results.length} checked, ${withEmail} have emails.\n`
+    let reply = `✓ <b>Batch done:</b> ${results.length} checked, ${usable.length} reachable.\n`
     let leadNum = 0
-    results.forEach(r => {
-      if (r.email !== 'no email') {
-        leadNum++
-        const inPool = poolUrlSet.has(normalizeForDedupe(r.url))
-        const poolFlag = inPool ? `\n    🔒 <b>IN FREE POOL</b> — also shown to free users` : ''
-        const genericNote = r.email_is_generic ? ' (generic)' : ''
-        const contactNote = r.contact_page ? `\n    ↳ contact: ${r.contact_page}` : ''
-        const socialsList = Object.entries(r.socials || {}).map(([k,v]) => `${k}: ${v}`).join('\n              ')
-        const socialsNote  = socialsList ? `\n    ↳ social: ${socialsList}` : ''
-        reply += `\n\n<b>${leadNum}.</b> ${r.store_name || r.url}\n    📧 ${r.email}${genericNote}${contactNote}${socialsNote}${poolFlag}`
-      }
+    usable.forEach(r => {
+      leadNum++
+      const inPool = poolUrlSet.has(normalizeForDedupe(r.url))
+      const poolFlag = inPool ? `\n    🔒 <b>IN FREE POOL</b> — also shown to free users` : ''
+
+      const socialsList = Object.entries(r.socials || {}).map(([k, v]) => `${k}: ${v}`).join('\n              ')
+      const socialsNote = socialsList ? `\n    💬 social: ${socialsList}` : ''
+
+      const contactNote = r.contact_page ? `\n    🌐 contact page: ${r.contact_page}` : ''
+
+      const genericNote = r.email_is_generic ? ' (generic)' : ''
+      const emailNote = r.email !== 'no email' ? `\n    📧 ${r.email}${genericNote} (in case)` : ''
+
+      reply += `\n\n<b>${leadNum}.</b> ${r.store_name || r.url}${socialsNote}${contactNote}${emailNote}${poolFlag}`
     })
 
     if (remaining > 0) {
       reply += `\n\n────────\n${remaining} links remaining. Send anything to continue.`
     } else {
-      const totalWithEmail = userQueue.results.filter(r => r.email !== 'no email').length
-      reply += `\n\n────────\n✓ ALL DONE! ${userQueue.results.length} total processed, ${totalWithEmail} have emails.\n` +
+      const totalUsable = userQueue.results.filter(r => r.status === 'OK' && (r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length)).length
+      reply += `\n\n────────\n✓ ALL DONE! ${userQueue.results.length} total processed, ${totalUsable} reachable.\n` +
                `Send anything to move to the message-writing step.`
     }
 
