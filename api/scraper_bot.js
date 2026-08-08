@@ -245,6 +245,9 @@ module.exports = async (req, res) => {
     const results = []
     let searchAfter = null
     const perPage = 100
+    let total = null
+    let newestScanTime = null
+    let oldestScanTime = null
 
     while (results.length < maxResults) {
       let apiUrl = `https://urlscan.io/api/v1/search/?q=${encodeURIComponent(query)}&size=${perPage}`
@@ -261,12 +264,20 @@ module.exports = async (req, res) => {
         break
       }
 
+      if (total === null && typeof data.total === 'number') total = data.total
+
       if (!data.results || !data.results.length) break
 
       for (const item of data.results) {
         const domain = item.page?.domain
         const url    = domain ? `https://${domain}` : (item.page?.url || item.task?.url)
         if (url) results.push(url)
+
+        const scanTime = item.task?.time || item.page?.time
+        if (scanTime) {
+          if (!newestScanTime || scanTime > newestScanTime) newestScanTime = scanTime
+          if (!oldestScanTime || scanTime < oldestScanTime) oldestScanTime = scanTime
+        }
       }
 
       const last = data.results[data.results.length - 1]
@@ -277,7 +288,7 @@ module.exports = async (req, res) => {
       if (results.length >= maxResults) break
     }
 
-    return results
+    return { urls: results, total, newestScanTime, oldestScanTime }
   }
 
   // ── URL fixing / dedupe / filtering ──
@@ -314,6 +325,17 @@ module.exports = async (req, res) => {
   function looksLikeValidLead(url) {
     const u = url.toLowerCase()
     return !NEVER_LEADS.some(d => u.includes(d))
+  }
+
+  // Splits fixed/deduped links into valid leads vs blacklisted ones (github,
+  // facebook, wikipedia, etc.) — the blacklisted ones used to just vanish;
+  // now they're returned too so they can be shown as clickable links for
+  // manual review, in case the filter ever tosses something worth checking.
+  function partitionLeads(rawLinks) {
+    const fixed = [...new Set(rawLinks.map(fixUrl).filter(Boolean))]
+    const cleaned = fixed.filter(looksLikeValidLead)
+    const filteredOut = fixed.filter(u => !looksLikeValidLead(u))
+    return { cleaned, filteredOut }
   }
 
   function extractAndCleanLinks(rawText) {
@@ -779,6 +801,15 @@ module.exports = async (req, res) => {
   //  HELPERS
   // ══════════════════════════════════════════════
 
+  function timeAgo(isoString) {
+    if (!isoString) return 'unknown'
+    const diffMs = Date.now() - new Date(isoString).getTime()
+    const hours = diffMs / (1000 * 60 * 60)
+    if (hours < 1) return 'less than an hour ago'
+    if (hours < 24) return `${Math.floor(hours)}h ago`
+    return `${Math.floor(hours / 24)}d ago`
+  }
+
   // Admin's FIRST /scout of the day also fills the shared free pool with up
   // to 30 leads — but admin still sees the FULL list either way, just with
   // whichever of those links are (still) sitting in today's pool flagged.
@@ -787,8 +818,27 @@ module.exports = async (req, res) => {
     const { result: filledDate } = await redis('GET', 'poolFilledDate')
 
     await send(chatId, `🔍 Searching for fresh leads — "${label}"...`)
-    const rawLinks = await scrapeUrlscan(query, 100)
-    const cleaned  = [...new Set(rawLinks.map(fixUrl).filter(Boolean).filter(looksLikeValidLead))]
+    const { urls: rawLinks, total, newestScanTime } = await scrapeUrlscan(query, 100)
+
+    if (total !== null) {
+      const exhausted = total <= rawLinks.length
+      await send(chatId,
+        `📊 ${rawLinks.length} of ${total} total matches on URLScan for this query.` +
+        (exhausted ? ` That's everything currently indexed for this niche — more appears as new sites get scanned.` : '') +
+        (newestScanTime ? `\nMost recent scan: ${timeAgo(newestScanTime)}.` : '')
+      )
+    }
+
+    const { cleaned, filteredOut } = partitionLeads(rawLinks)
+
+    if (filteredOut.length) {
+      const shown = filteredOut.slice(0, 20)
+      const more = filteredOut.length > shown.length ? `\n…and ${filteredOut.length - shown.length} more` : ''
+      await send(chatId,
+        `🚫 <b>Filtered out</b> (blacklisted domains) — ${filteredOut.length} link(s), tap to check manually:\n\n` +
+        shown.join('\n') + more
+      )
+    }
 
     if (filledDate !== date) {
       const dedupeKeys = cleaned.map(normalizeForDedupe)
@@ -869,7 +919,7 @@ module.exports = async (req, res) => {
     const want = Math.min(BATCH_SIZE, user.bonusLeadsRemaining)
     await send(chatId, `🔍 Pulling your bonus leads...`)
 
-    const rawLinks = await scrapeUrlscan(SAVED_SEARCHES['1'].query, 100)
+    const { urls: rawLinks } = await scrapeUrlscan(SAVED_SEARCHES['1'].query, 100)
     let cleaned = [...new Set(rawLinks.map(fixUrl).filter(Boolean).filter(looksLikeValidLead))]
 
     const dedupeKeys = cleaned.map(normalizeForDedupe)
@@ -908,8 +958,28 @@ module.exports = async (req, res) => {
 
   async function startScoutJob(chatId, userId, query, label) {
     await send(chatId, `🔍 Searching for fresh leads — "${label}"...`)
-    const rawLinks = await scrapeUrlscan(query, 100)
-    const cleaned  = [...new Set(rawLinks.map(fixUrl).filter(Boolean).filter(looksLikeValidLead))]
+    const { urls: rawLinks, total, newestScanTime } = await scrapeUrlscan(query, 100)
+
+    if (total !== null) {
+      const exhausted = total <= rawLinks.length
+      await send(chatId,
+        `📊 ${rawLinks.length} of ${total} total matches on URLScan for this query.` +
+        (exhausted ? ` That's everything currently indexed for this niche.` : '') +
+        (newestScanTime ? `\nMost recent scan: ${timeAgo(newestScanTime)}.` : '')
+      )
+    }
+
+    const { cleaned, filteredOut } = partitionLeads(rawLinks)
+
+    if (filteredOut.length) {
+      const shown = filteredOut.slice(0, 20)
+      const more = filteredOut.length > shown.length ? `\n…and ${filteredOut.length - shown.length} more` : ''
+      await send(chatId,
+        `🚫 <b>Filtered out</b> (blacklisted domains) — ${filteredOut.length} link(s), tap to check manually:\n\n` +
+        shown.join('\n') + more
+      )
+    }
+
     return await startBatchJob(chatId, userId, cleaned, label)
   }
 
