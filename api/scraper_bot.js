@@ -241,54 +241,81 @@ module.exports = async (req, res) => {
   //  Handles "load more" automatically via pagination cursor
   // ══════════════════════════════════════════════
 
-  async function scrapeUrlscan(query, maxResults = 100) {
-    const results = []
+  async function fetchUrlscanPage(query, searchAfter) {
+    let apiUrl = `https://urlscan.io/api/v1/search/?q=${encodeURIComponent(query)}&size=100`
+    if (searchAfter) apiUrl += `&search_after=${searchAfter}`
+    try {
+      const controller = new AbortController()
+      const t = setTimeout(() => controller.abort(), 5000)
+      const r = await fetch(apiUrl, { signal: controller.signal })
+      clearTimeout(t)
+      return await r.json()
+    } catch (e) {
+      return null
+    }
+  }
+
+  // Keeps paging DEEPER into URLScan's results (not just page 1) until it
+  // collects `wantCount` genuinely new (never-seen, non-blacklisted) leads,
+  // or runs out of pages, or hits maxPages — a safety cap so this can't
+  // blow past Vercel's execution time limit on a query with huge totals.
+  async function scrapeUntilUnseen(query, wantCount, maxPages = 4) {
+    const unseenUrls = []
+    const filteredOut = []
+    const scanTimes = {}
+    const seenThisRun = new Set()
     let searchAfter = null
-    const perPage = 100
     let total = null
     let newestScanTime = null
-    let oldestScanTime = null
+    let pagesUsed = 0
+    let exhausted = false
 
-    while (results.length < maxResults) {
-      let apiUrl = `https://urlscan.io/api/v1/search/?q=${encodeURIComponent(query)}&size=${perPage}`
-      if (searchAfter) apiUrl += `&search_after=${searchAfter}`
-
-      let data
-      try {
-        const controller = new AbortController()
-        const t = setTimeout(() => controller.abort(), 6000)
-        const r = await fetch(apiUrl, { signal: controller.signal })
-        clearTimeout(t)
-        data = await r.json()
-      } catch (e) {
-        break
-      }
-
+    for (let page = 0; page < maxPages && unseenUrls.length < wantCount; page++) {
+      const data = await fetchUrlscanPage(query, searchAfter)
+      if (!data) break
       if (total === null && typeof data.total === 'number') total = data.total
+      if (!data.results || !data.results.length) { exhausted = true; break }
+      pagesUsed++
 
-      if (!data.results || !data.results.length) break
-
+      const pageUrls = []
       for (const item of data.results) {
         const domain = item.page?.domain
         const url    = domain ? `https://${domain}` : (item.page?.url || item.task?.url)
-        if (url) results.push(url)
-
         const scanTime = item.task?.time || item.page?.time
-        if (scanTime) {
-          if (!newestScanTime || scanTime > newestScanTime) newestScanTime = scanTime
-          if (!oldestScanTime || scanTime < oldestScanTime) oldestScanTime = scanTime
+        if (url) {
+          pageUrls.push(url)
+          if (scanTime) scanTimes[url] = scanTime
+          if (scanTime && (!newestScanTime || scanTime > newestScanTime)) newestScanTime = scanTime
+        }
+      }
+
+      const { cleaned, filteredOut: pageFiltered } = partitionLeads(pageUrls)
+      filteredOut.push(...pageFiltered)
+
+      const dedupeKeys = cleaned.map(normalizeForDedupe)
+      const seenMap = await getSeenBatch(dedupeKeys)
+      for (let i = 0; i < cleaned.length; i++) {
+        const key = dedupeKeys[i]
+        if (!seenMap[key] && !seenThisRun.has(key)) {
+          seenThisRun.add(key)
+          unseenUrls.push(cleaned[i])
+          if (unseenUrls.length >= wantCount) break
         }
       }
 
       const last = data.results[data.results.length - 1]
       if (last?.sort) searchAfter = last.sort.join(',')
-      else break
+      else { exhausted = true; break }
 
-      if (data.results.length < perPage) break  // no more pages ("load more" exhausted)
-      if (results.length >= maxResults) break
+      if (data.results.length < 100) { exhausted = true; break }  // URLScan itself has no more
     }
 
-    return { urls: results, total, newestScanTime, oldestScanTime }
+    return {
+      urls: unseenUrls.slice(0, wantCount), filteredOut, scanTimes,
+      total, newestScanTime, pagesUsed,
+      gotEnough: unseenUrls.length >= wantCount,
+      exhaustedSource: exhausted
+    }
   }
 
   // ── URL fixing / dedupe / filtering ──
@@ -524,9 +551,10 @@ module.exports = async (req, res) => {
     if (!cbLocked) return res.status(200).send('OK')
 
     try {
-      // ── ADMIN — unchanged saved-search / custom, but the FIRST scout of
-      // the day also splits the batch: 50 into the shared free pool, the
-      // rest stays admin's own (see adminScoutAndFillPoolIfNeeded).
+      // ── ADMIN — picking a search now asks how many NEW leads to fetch,
+      // instead of always grabbing a fixed 100 and re-hitting the same
+      // already-seen results. The FIRST scout of the day also splits the
+      // batch into the shared free pool (see adminScoutAndFillPoolIfNeeded).
       if (cbUserId === ADMIN_ID) {
         if (data === 'scout_custom') {
           await send(cbChatId, 'Send your custom search query now (e.g. myshopify.com AND candles).')
@@ -539,23 +567,29 @@ module.exports = async (req, res) => {
           const key = data.replace('scout_', '')
           const search = SAVED_SEARCHES[key]
           if (!search) return res.status(200).send('OK')
-          return await adminScoutAndFillPoolIfNeeded(cbChatId, cbUserId, search.query, search.label)
+          const q = await getUserQueue(cbUserId)
+          q.pendingSearch = { query: search.query, label: search.label, isPremium: false }
+          q.awaitingLeadCount = true
+          await saveUserQueue(cbUserId, q)
+          await send(cbChatId, `How many NEW (never-seen) leads do you want? Reply with a number, e.g. 30. Max 300.`)
+          return res.status(200).send('OK')
         }
         return res.status(200).send('OK')
       }
 
-      // ── PREMIUM (Stars-purchased) — same live-search flow as admin,
-      // minus one paid credit. Full detail, same as admin gets. ──
+      // ── PREMIUM (Stars-purchased) — same live-search flow as admin, full
+      // detail. Credit is only spent once the scrape actually runs (after
+      // the count is given), not the moment the button's tapped. ──
       if (data === 'pscout_custom') {
         const user = await getUser(cbUserId)
         if (user.premiumScrapesRemaining <= 0) {
           await send(cbChatId, 'No premium scrapes left. Buy one for 2 Stars via /scout.')
           return res.status(200).send('OK')
         }
-        await setUserFields(cbUserId, { premiumScrapesRemaining: user.premiumScrapesRemaining - 1 })
         await send(cbChatId, 'Send your custom search query now.')
         const q = await getUserQueue(cbUserId)
         q.awaitingCustomQuery = true
+        q.customQueryIsPremium = true
         await saveUserQueue(cbUserId, q)
         return res.status(200).send('OK')
       }
@@ -568,8 +602,12 @@ module.exports = async (req, res) => {
           await send(cbChatId, 'No premium scrapes left. Buy one for 2 Stars via /scout.')
           return res.status(200).send('OK')
         }
-        await setUserFields(cbUserId, { premiumScrapesRemaining: user.premiumScrapesRemaining - 1 })
-        return await startScoutJob(cbChatId, cbUserId, search.query, search.label)
+        const q = await getUserQueue(cbUserId)
+        q.pendingSearch = { query: search.query, label: search.label, isPremium: true }
+        q.awaitingLeadCount = true
+        await saveUserQueue(cbUserId, q)
+        await send(cbChatId, `How many NEW (never-seen) leads do you want? Reply with a number, e.g. 30. Max 300.`)
+        return res.status(200).send('OK')
       }
 
       // ── Everyone else — restricted (link+email) claims only. Full-detail
@@ -724,11 +762,42 @@ module.exports = async (req, res) => {
   try {
     const userQueue = await getUserQueue(userId)
 
-    // ── Awaiting a custom URLScan query typed by the user ──
+    // ── Awaiting a custom search query typed by the user ──
     if (userQueue.awaitingCustomQuery) {
       userQueue.awaitingCustomQuery = false
+      userQueue.pendingSearch = { query: text, label: 'Custom search', isPremium: !!userQueue.customQueryIsPremium }
+      userQueue.customQueryIsPremium = false
+      userQueue.awaitingLeadCount = true
       await saveUserQueue(userId, userQueue)
-      return await startScoutJob(chatId, userId, text, 'Custom search')
+      await send(chatId, `How many NEW (never-seen) leads do you want? Reply with a number, e.g. 30. Max 300.`)
+      return res.status(200).send('OK')
+    }
+
+    // ── Awaiting how many NEW leads they want, for the search picked above ──
+    if (userQueue.awaitingLeadCount) {
+      const n = parseInt(text.replace(/[^0-9]/g, ''), 10)
+      if (!n || n < 1) {
+        await send(chatId, `Please reply with just a number, e.g. 30.`)
+        return res.status(200).send('OK')
+      }
+      const wantCount = Math.min(n, 300)  // safety cap so a huge ask can't blow past Vercel's time limit
+
+      const search = userQueue.pendingSearch
+      userQueue.awaitingLeadCount = false
+      userQueue.pendingSearch = null
+      await saveUserQueue(userId, userQueue)
+
+      if (search.isPremium) {
+        const user = await getUser(userId)
+        if (user.premiumScrapesRemaining <= 0) {
+          await send(chatId, `No premium scrapes left. Buy one for ${PREMIUM_STARS_PRICE} Stars via /scout.`)
+          return res.status(200).send('OK')
+        }
+        await setUserFields(userId, { premiumScrapesRemaining: user.premiumScrapesRemaining - 1 })
+        return await startScoutJob(chatId, userId, search.query, search.label, wantCount)
+      }
+
+      return await adminScoutAndFillPoolIfNeeded(chatId, userId, search.query, search.label, wantCount)
     }
 
     // ── File upload — admin, or a purchased premium scrape ──
@@ -813,23 +882,22 @@ module.exports = async (req, res) => {
   // Admin's FIRST /scout of the day also fills the shared free pool with up
   // to 30 leads — but admin still sees the FULL list either way, just with
   // whichever of those links are (still) sitting in today's pool flagged.
-  async function adminScoutAndFillPoolIfNeeded(chatId, userId, query, label) {
+  async function adminScoutAndFillPoolIfNeeded(chatId, userId, query, label, wantCount) {
     const date = today()
     const { result: filledDate } = await redis('GET', 'poolFilledDate')
 
-    await send(chatId, `🔍 Searching for fresh leads — "${label}"...`)
-    const { urls: rawLinks, total, newestScanTime } = await scrapeUrlscan(query, 100)
+    await send(chatId, `🔍 Searching for ${wantCount} fresh leads — "${label}"... (paging until found or exhausted)`)
+    const { urls: cleaned, filteredOut, scanTimes, total, newestScanTime, pagesUsed, gotEnough, exhaustedSource } =
+      await scrapeUntilUnseen(query, wantCount, 4)
 
     if (total !== null) {
-      const exhausted = total <= rawLinks.length
       await send(chatId,
-        `📊 ${rawLinks.length} of ${total} total matches on URLScan for this query.` +
-        (exhausted ? ` That's everything currently indexed for this niche — more appears as new sites get scanned.` : '') +
-        (newestScanTime ? `\nMost recent scan: ${timeAgo(newestScanTime)}.` : '')
+        `📊 Found ${cleaned.length} new of ${wantCount} requested (searched ${pagesUsed} page(s), ${total} total matches on URLScan).` +
+        (!gotEnough && exhaustedSource ? ` That's everything currently unseen for this niche — more appears as new sites get scanned.` : '') +
+        (!gotEnough && !exhaustedSource ? ` Stopped early to stay within processing limits — try again for more, or ask for a smaller number.` : '') +
+        (newestScanTime ? `\nMost recent scan seen: ${timeAgo(newestScanTime)}.` : '')
       )
     }
-
-    const { cleaned, filteredOut } = partitionLeads(rawLinks)
 
     if (filteredOut.length) {
       const shown = filteredOut.slice(0, 20)
@@ -841,10 +909,7 @@ module.exports = async (req, res) => {
     }
 
     if (filledDate !== date) {
-      const dedupeKeys = cleaned.map(normalizeForDedupe)
-      const seenMap = await getSeenBatch(dedupeKeys)
-      const eligible = cleaned.filter((u, i) => !seenMap[dedupeKeys[i]])
-      const forPool = eligible.slice(0, 30)
+      const forPool = cleaned.slice(0, 30)
 
       if (forPool.length) {
         await redis('RPUSH', `pool:${date}`, ...forPool)
@@ -861,7 +926,7 @@ module.exports = async (req, res) => {
     const { result: poolNow } = await redis('LRANGE', `pool:${date}`, '0', '-1')
     const poolSet = new Set((poolNow || []).map(normalizeForDedupe))
 
-    return await startBatchJob(chatId, userId, cleaned, label, poolSet)
+    return await startBatchJob(chatId, userId, cleaned, label, poolSet, scanTimes)
   }
 
   // Free users pull straight from today's shared pool — no live search
@@ -919,14 +984,8 @@ module.exports = async (req, res) => {
     const want = Math.min(BATCH_SIZE, user.bonusLeadsRemaining)
     await send(chatId, `🔍 Pulling your bonus leads...`)
 
-    const { urls: rawLinks } = await scrapeUrlscan(SAVED_SEARCHES['1'].query, 100)
-    let cleaned = [...new Set(rawLinks.map(fixUrl).filter(Boolean).filter(looksLikeValidLead))]
+    const { urls: batch } = await scrapeUntilUnseen(SAVED_SEARCHES['1'].query, want, 4)
 
-    const dedupeKeys = cleaned.map(normalizeForDedupe)
-    const seenMap = await getSeenBatch(dedupeKeys)
-    cleaned = cleaned.filter((u, i) => !seenMap[dedupeKeys[i]])
-
-    const batch = cleaned.slice(0, want)
     if (!batch.length) {
       await send(chatId, `Couldn't find any new leads right now — try again shortly.`)
       return res.status(200).send('OK')
@@ -956,20 +1015,19 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK')
   }
 
-  async function startScoutJob(chatId, userId, query, label) {
-    await send(chatId, `🔍 Searching for fresh leads — "${label}"...`)
-    const { urls: rawLinks, total, newestScanTime } = await scrapeUrlscan(query, 100)
+  async function startScoutJob(chatId, userId, query, label, wantCount) {
+    await send(chatId, `🔍 Searching for ${wantCount} fresh leads — "${label}"... (paging until found or exhausted)`)
+    const { urls: cleaned, filteredOut, scanTimes, total, newestScanTime, pagesUsed, gotEnough, exhaustedSource } =
+      await scrapeUntilUnseen(query, wantCount, 4)
 
     if (total !== null) {
-      const exhausted = total <= rawLinks.length
       await send(chatId,
-        `📊 ${rawLinks.length} of ${total} total matches on URLScan for this query.` +
-        (exhausted ? ` That's everything currently indexed for this niche.` : '') +
-        (newestScanTime ? `\nMost recent scan: ${timeAgo(newestScanTime)}.` : '')
+        `📊 Found ${cleaned.length} new of ${wantCount} requested (searched ${pagesUsed} page(s), ${total} total matches on URLScan).` +
+        (!gotEnough && exhaustedSource ? ` That's everything currently unseen for this niche.` : '') +
+        (!gotEnough && !exhaustedSource ? ` Stopped early to stay within processing limits — try again for more.` : '') +
+        (newestScanTime ? `\nMost recent scan seen: ${timeAgo(newestScanTime)}.` : '')
       )
     }
-
-    const { cleaned, filteredOut } = partitionLeads(rawLinks)
 
     if (filteredOut.length) {
       const shown = filteredOut.slice(0, 20)
@@ -980,10 +1038,10 @@ module.exports = async (req, res) => {
       )
     }
 
-    return await startBatchJob(chatId, userId, cleaned, label)
+    return await startBatchJob(chatId, userId, cleaned, label, null, scanTimes)
   }
 
-  async function startBatchJob(chatId, userId, rawLinks, sourceLabel, poolSet) {
+  async function startBatchJob(chatId, userId, rawLinks, sourceLabel, poolSet, scanTimes) {
     if (!rawLinks.length) {
       await send(chatId, `No links found from ${sourceLabel}.`)
       return res.status(200).send('OK')
@@ -1001,7 +1059,8 @@ module.exports = async (req, res) => {
 
     const userQueue = {
       pending: newLinks, results: [], awaitingMessages: false, messages: [],
-      poolUrls: poolSet ? [...poolSet] : []
+      poolUrls: poolSet ? [...poolSet] : [],
+      scanTimes: scanTimes || {}
     }
     await saveUserQueue(userId, userQueue)
 
@@ -1030,6 +1089,7 @@ module.exports = async (req, res) => {
     const usable = results.filter(r => r.status === 'OK' && (r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length))
     const remaining = userQueue.pending.length
     const poolUrlSet = new Set(userQueue.poolUrls || [])
+    const scanTimeMap = userQueue.scanTimes || {}
 
     let reply = `✓ <b>Batch done:</b> ${results.length} checked, ${usable.length} reachable.\n`
     let leadNum = 0
@@ -1046,7 +1106,10 @@ module.exports = async (req, res) => {
       const genericNote = r.email_is_generic ? ' (generic)' : ''
       const emailNote = r.email !== 'no email' ? `\n    📧 ${r.email}${genericNote} (in case)` : ''
 
-      reply += `\n\n<b>${leadNum}.</b> ${r.store_name || r.url}${socialsNote}${contactNote}${emailNote}${poolFlag}`
+      const scanTime = scanTimeMap[r.url]
+      const scanNote = scanTime ? `\n    🕐 site scanned: ${timeAgo(scanTime)}` : ''
+
+      reply += `\n\n<b>${leadNum}.</b> ${r.store_name || r.url}${socialsNote}${contactNote}${emailNote}${scanNote}${poolFlag}`
     })
 
     if (remaining > 0) {
