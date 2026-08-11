@@ -141,6 +141,19 @@ module.exports = async (req, res) => {
     await redis('SET', `queue:${userId}`, JSON.stringify(queue))
   }
 
+  // Filtered-out (blacklisted domain) links from the user's most recent
+  // scrape — kept separate from the pending/results queue since that queue
+  // gets fully overwritten each new scrape, but these should stick around
+  // for later retrieval via /others.
+  async function saveFilteredOut(userId, list) {
+    await redis('SET', `filtered:${userId}`, JSON.stringify(list))
+  }
+
+  async function getFilteredOut(userId) {
+    const { result } = await redis('GET', `filtered:${userId}`)
+    return result ? JSON.parse(result) : []
+  }
+
   // per-user lock — stops the SAME user's overlapping/double-tapped requests
   // from reading+writing their queue at the same time and clobbering each other.
   // Self-expires after 25s as a safety net in case a request errors/times out
@@ -270,6 +283,8 @@ module.exports = async (req, res) => {
     let pagesUsed = 0
     let exhausted = false
 
+    const extraBlacklistSet = await getExtraBlacklistSet()
+
     for (let page = 0; page < maxPages && unseenUrls.length < wantCount; page++) {
       const data = await fetchUrlscanPage(query, searchAfter)
       if (!data) break
@@ -289,7 +304,7 @@ module.exports = async (req, res) => {
         }
       }
 
-      const { cleaned, filteredOut: pageFiltered } = partitionLeads(pageUrls)
+      const { cleaned, filteredOut: pageFiltered } = partitionLeads(pageUrls, extraBlacklistSet)
       filteredOut.push(...pageFiltered)
 
       const dedupeKeys = cleaned.map(normalizeForDedupe)
@@ -349,25 +364,70 @@ module.exports = async (req, res) => {
     'microsoft.com','.gov','.edu','amazon.com','linkedin.com','tiktok.com','pinterest.com',
     'cloudflare.com','mozilla.org','w3.org','adobe.com']
 
-  function looksLikeValidLead(url) {
+  // Admin-grown blacklist (e.g. known fake-shop domain lists) stored in
+  // Redis so it persists and can be extended via /black without a redeploy.
+  async function getExtraBlacklistSet() {
+    const { result } = await redis('SMEMBERS', 'blacklist:extra')
+    return new Set(result || [])
+  }
+
+  async function addToBlacklist(domains) {
+    if (!domains.length) return 0
+    await redis('SADD', 'blacklist:extra', ...domains)
+    return domains.length
+  }
+
+  // Parses common domain-blocklist formats defensively: plain domain-per-line,
+  // hosts-file format ("0.0.0.0 domain.com"), adblock ("||domain.com^"),
+  // and wildcard-prefixed ("*.domain.com") — since public blocklists vary
+  // in format and we don't want to hardcode assumptions about exactly which
+  // one a given URL uses.
+  function parseBlacklistText(text) {
+    const domains = new Set()
+    for (let raw of text.split('\n')) {
+      let line = raw.trim()
+      if (!line || line.startsWith('#') || line.startsWith('!') || line.startsWith(';')) continue
+      line = line.replace(/^\|\|/, '').replace(/\^$/, '').replace(/^\*\./, '')
+      line = line.split(/\s+/).pop()  // last token handles "0.0.0.0 domain.com" hosts format
+      if (line && line.includes('.') && !line.includes('/') && !line.includes('*')) {
+        domains.add(line.toLowerCase().replace(/^www\./, ''))
+      }
+      if (domains.size >= 20000) break  // safety cap
+    }
+    return [...domains]
+  }
+
+  // Checks the hostname AND its parent domains against the extra blacklist
+  // Set (O(1) lookups, not a substring scan) so a list of thousands of
+  // domains doesn't slow down filtering — sub.scam.com correctly matches
+  // a blacklisted scam.com entry too.
+  function looksLikeValidLead(url, extraBlacklistSet) {
     const u = url.toLowerCase()
-    return !NEVER_LEADS.some(d => u.includes(d))
+    if (NEVER_LEADS.some(d => u.includes(d))) return false
+    if (extraBlacklistSet && extraBlacklistSet.size) {
+      const host = normalizeForDedupe(url)
+      const parts = host.split('.')
+      for (let i = 0; i < parts.length - 1; i++) {
+        if (extraBlacklistSet.has(parts.slice(i).join('.'))) return false
+      }
+    }
+    return true
   }
 
   // Splits fixed/deduped links into valid leads vs blacklisted ones (github,
-  // facebook, wikipedia, etc.) — the blacklisted ones used to just vanish;
-  // now they're returned too so they can be shown as clickable links for
-  // manual review, in case the filter ever tosses something worth checking.
-  function partitionLeads(rawLinks) {
+  // facebook, fake-shop lists, etc.) — the blacklisted ones used to just
+  // vanish; now they're returned too so they can be shown as clickable links
+  // for manual review, in case the filter ever tosses something worth checking.
+  function partitionLeads(rawLinks, extraBlacklistSet) {
     const fixed = [...new Set(rawLinks.map(fixUrl).filter(Boolean))]
-    const cleaned = fixed.filter(looksLikeValidLead)
-    const filteredOut = fixed.filter(u => !looksLikeValidLead(u))
+    const cleaned = fixed.filter(u => looksLikeValidLead(u, extraBlacklistSet))
+    const filteredOut = fixed.filter(u => !looksLikeValidLead(u, extraBlacklistSet))
     return { cleaned, filteredOut }
   }
 
-  function extractAndCleanLinks(rawText) {
+  function extractAndCleanLinks(rawText, extraBlacklistSet) {
     const found = rawText.match(LINK_PATTERN) || []
-    const fixed = found.map(fixUrl).filter(Boolean).filter(looksLikeValidLead)
+    const fixed = found.map(fixUrl).filter(Boolean).filter(u => looksLikeValidLead(u, extraBlacklistSet))
     const seenKeys = new Map()
     for (const u of fixed) {
       const key = normalizeForDedupe(u)
@@ -678,7 +738,10 @@ module.exports = async (req, res) => {
         `Works even when your PC is off.\n\n` +
         `<b>Two ways to feed it links:</b>\n` +
         `📄 Send a .txt/.csv file — I extract, dedupe, check it\n` +
-        `🔍 /scout — full search menu\n\n` +
+        `🔍 /scout — full search menu\n` +
+        `🚫 /others — see blacklisted links filtered from your last search\n` +
+        `🔒 /black &lt;url&gt; — grow the blacklist from any raw domain-list URL\n` +
+        `🕵️ /scoutlist &lt;url&gt; — scan any domain-list URL as leads directly\n\n` +
         `Already-checked links are never re-checked, ever.\n\n` +
         `When done, send your outreach messages separated by /\n` +
         `and I'll pair each one with an email for you to copy & send.`
@@ -711,6 +774,107 @@ module.exports = async (req, res) => {
       `Each friend who taps Start with your link gives you +10 bonus leads ` +
       `(link + email, from live search — not the shared pool). Max 2 per rolling 24h window.`
     )
+    return res.status(200).send('OK')
+  }
+
+  if (text === '/others') {
+    const filtered = await getFilteredOut(userId)
+    if (!filtered.length) {
+      await send(chatId, `No filtered links saved yet — these show up after a /scout run finds any blacklisted domains (github, facebook, etc).`)
+      return res.status(200).send('OK')
+    }
+    const shown = filtered.slice(0, 30)
+    const more = filtered.length > shown.length ? `\n…and ${filtered.length - shown.length} more` : ''
+    await send(chatId,
+      `🚫 <b>Filtered links from your last search</b> — ${filtered.length} total, tap to check manually:\n\n` +
+      shown.join('\n') + more
+    )
+    return res.status(200).send('OK')
+  }
+
+  // ── /black <url> — grow the persistent blacklist from a domain list ──
+  if (text.startsWith('/black')) {
+    if (userId !== ADMIN_ID) return res.status(200).send('OK')
+
+    const url = text.split(' ')[1]
+    if (!url || !url.startsWith('http')) {
+      await send(chatId, `Usage: /black <url to a raw domain-list file>\ne.g. /black https://example.com/list.txt`)
+      return res.status(200).send('OK')
+    }
+
+    await send(chatId, `📥 Fetching blacklist from that URL...`)
+    try {
+      const controller = new AbortController()
+      const t = setTimeout(() => controller.abort(), 8000)
+      const r = await fetch(url, { signal: controller.signal, headers: { 'User-Agent': 'Mozilla/5.0' } })
+      clearTimeout(t)
+      if (!r.ok) {
+        await send(chatId, `Fetch failed (HTTP ${r.status}) — make sure this is a direct raw-text link, not a webpage.`)
+        return res.status(200).send('OK')
+      }
+      const rawText = await r.text()
+      const domains = parseBlacklistText(rawText)
+      if (!domains.length) {
+        await send(chatId, `Fetched the URL but found no parseable domains in it — check the format.`)
+        return res.status(200).send('OK')
+      }
+      const added = await addToBlacklist(domains)
+      await send(chatId, `✓ Blacklist updated: ${added} domain(s) processed from the list (merged with existing, duplicates ignored). This applies to all future scrapes.`)
+    } catch (e) {
+      await send(chatId, `Couldn't fetch that URL — it may block automated requests, or isn't a direct raw-text link. Try downloading it and hosting it somewhere else (e.g. a GitHub Gist raw link), or paste the domains directly and I'll add a way to accept that instead.`)
+    }
+    return res.status(200).send('OK')
+  }
+
+  // ── /scoutlist <url> — scan any domain-list URL as leads (bypasses
+  // the blacklist entirely, since checking a blacklist-source list is
+  // exactly the point) ──
+  if (text.startsWith('/scoutlist')) {
+    let isPremiumRun = false
+    if (userId !== ADMIN_ID) {
+      const user = await getUser(userId)
+      if (user.premiumScrapesRemaining <= 0) {
+        await send(chatId, `Scanning a domain list needs a premium scrape. Buy one for ${PREMIUM_STARS_PRICE} Stars via /scout.`)
+        return res.status(200).send('OK')
+      }
+      isPremiumRun = true  // credit deducted after they confirm a count, not now
+    }
+
+    const url = text.split(' ')[1]
+    if (!url || !url.startsWith('http')) {
+      await send(chatId, `Usage: /scoutlist <url to a raw domain-list file>\ne.g. /scoutlist https://example.com/list.txt`)
+      return res.status(200).send('OK')
+    }
+
+    await send(chatId, `📥 Fetching domain list...`)
+    try {
+      const controller = new AbortController()
+      const t = setTimeout(() => controller.abort(), 8000)
+      const r = await fetch(url, { signal: controller.signal, headers: { 'User-Agent': 'Mozilla/5.0' } })
+      clearTimeout(t)
+      if (!r.ok) {
+        await send(chatId, `Fetch failed (HTTP ${r.status}) — make sure this is a direct raw-text link, not a webpage.`)
+        return res.status(200).send('OK')
+      }
+      const rawText = await r.text()
+      const domains = parseBlacklistText(rawText)
+      if (!domains.length) {
+        await send(chatId, `Fetched the URL but found no parseable domains in it — check the format.`)
+        return res.status(200).send('OK')
+      }
+      const rawLinks = domains.map(d => `https://${d}`)
+
+      const q = await getUserQueue(userId)
+      q.pendingSearch = { rawLinks, label: 'domain list', isPremium: isPremiumRun, isDirectList: true }
+      q.awaitingLeadCount = true
+      await saveUserQueue(userId, q)
+      await send(chatId,
+        `✓ Parsed ${rawLinks.length} domains from the list.\n` +
+        `How many do you want to check? Reply with a number, e.g. 30. Max 300 per request.`
+      )
+    } catch (e) {
+      await send(chatId, `Couldn't fetch that URL — it may block automated requests, or isn't a direct raw-text link.`)
+    }
     return res.status(200).send('OK')
   }
 
@@ -787,6 +951,22 @@ module.exports = async (req, res) => {
       userQueue.pendingSearch = null
       await saveUserQueue(userId, userQueue)
 
+      // Direct domain list (from /scoutlist) — already have concrete URLs,
+      // no URLScan pagination needed. Deliberately bypasses the blacklist,
+      // since scanning a blacklist-source list is the whole point.
+      if (search.isDirectList) {
+        if (search.isPremium) {
+          const user = await getUser(userId)
+          if (user.premiumScrapesRemaining <= 0) {
+            await send(chatId, `No premium scrapes left. Buy one for ${PREMIUM_STARS_PRICE} Stars via /scout.`)
+            return res.status(200).send('OK')
+          }
+          await setUserFields(userId, { premiumScrapesRemaining: user.premiumScrapesRemaining - 1 })
+        }
+        const batchLinks = search.rawLinks.slice(0, wantCount)
+        return await startBatchJob(chatId, userId, batchLinks, search.label)
+      }
+
       if (search.isPremium) {
         const user = await getUser(userId)
         if (user.premiumScrapesRemaining <= 0) {
@@ -812,7 +992,8 @@ module.exports = async (req, res) => {
       }
       await send(chatId, '📄 Reading file...')
       const content = await getFileContent(doc.file_id)
-      const rawLinks = extractAndCleanLinks(content)
+      const extraBlacklistSet = await getExtraBlacklistSet()
+      const rawLinks = extractAndCleanLinks(content, extraBlacklistSet)
       return await startBatchJob(chatId, userId, rawLinks, `file (${rawLinks.length} links)`)
     }
 
@@ -900,11 +1081,12 @@ module.exports = async (req, res) => {
     }
 
     if (filteredOut.length) {
+      await saveFilteredOut(userId, filteredOut)
       const shown = filteredOut.slice(0, 20)
       const more = filteredOut.length > shown.length ? `\n…and ${filteredOut.length - shown.length} more` : ''
       await send(chatId,
         `🚫 <b>Filtered out</b> (blacklisted domains) — ${filteredOut.length} link(s), tap to check manually:\n\n` +
-        shown.join('\n') + more
+        shown.join('\n') + more + `\n\nSaved — retrieve anytime with /others.`
       )
     }
 
@@ -1030,11 +1212,12 @@ module.exports = async (req, res) => {
     }
 
     if (filteredOut.length) {
+      await saveFilteredOut(userId, filteredOut)
       const shown = filteredOut.slice(0, 20)
       const more = filteredOut.length > shown.length ? `\n…and ${filteredOut.length - shown.length} more` : ''
       await send(chatId,
         `🚫 <b>Filtered out</b> (blacklisted domains) — ${filteredOut.length} link(s), tap to check manually:\n\n` +
-        shown.join('\n') + more
+        shown.join('\n') + more + `\n\nSaved — retrieve anytime with /others.`
       )
     }
 
