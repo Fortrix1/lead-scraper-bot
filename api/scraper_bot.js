@@ -12,7 +12,7 @@ module.exports = async (req, res) => {
   const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL   || ''
   const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || ''
 
-  const BATCH_SIZE  = 12   // links checked per message — stays under Vercel's time limit
+  const BATCH_SIZE  = 8    // links checked per message — reduced from 12 now that each lead also runs a PageSpeed check
   const CONCURRENCY = 4
 
   // Your saved URLScan search queries — pick a number instead of retyping
@@ -474,10 +474,76 @@ module.exports = async (req, res) => {
     return socials
   }
 
+  async function getSpeedIndexSeconds(url) {
+    try {
+      const psKey = process.env.PAGESPEED_API_KEY || ''
+      let apiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=mobile&category=performance`
+      if (psKey) apiUrl += `&key=${psKey}`
+      const controller = new AbortController()
+      const t = setTimeout(() => controller.abort(), 4500)
+      const r = await fetch(apiUrl, { signal: controller.signal })
+      clearTimeout(t)
+      const data = await r.json()
+      const ms = data?.lighthouseResult?.audits?.['speed-index']?.numericValue
+      return typeof ms === 'number' ? ms / 1000 : null
+    } catch (e) {
+      return null
+    }
+  }
+
+  // Scores real pain-point signals your bot actually has data for — adapted
+  // from the "no SSL / slow site / digitally active but neglected" idea,
+  // using SSL validity, PageSpeed load time, and social presence instead of
+  // data sources (Google ratings, Instagram post frequency) this bot doesn't
+  // collect. 70+ = worth prioritizing for outreach.
+  function scoreLead(r) {
+    if (r.status !== 'OK') return { score: 0, reasons: [] }
+    let score = 0
+    const reasons = []
+
+    if (r.sslValid === false) { score += 25; reasons.push('no SSL (http only)') }
+
+    if (typeof r.loadSeconds === 'number') {
+      if (r.loadSeconds >= 8) { score += 45; reasons.push(`very slow site (${r.loadSeconds.toFixed(1)}s load)`) }
+      else if (r.loadSeconds >= 5) { score += 30; reasons.push(`slow site (${r.loadSeconds.toFixed(1)}s load)`) }
+    }
+
+    const socialCount = Object.keys(r.socials || {}).length
+    if (socialCount >= 1) { score += 15; reasons.push('active on social media') }
+
+    if (r.email === 'no email' && (r.contact_page || socialCount)) {
+      score += 10; reasons.push('hard to reach directly — likely small/DIY setup')
+    }
+
+    return { score, reasons }
+  }
+
+  function auditHookLine(r) {
+    if (typeof r.loadSeconds === 'number') {
+      return `Your mobile site takes ${r.loadSeconds.toFixed(1)}s to load — most visitors leave after 3s.`
+    }
+    if (r.sslValid === false) {
+      return `Your site loads over plain HTTP — no SSL certificate, which browsers flag as "Not Secure."`
+    }
+    return null
+  }
+
+  // Personalized outreach message using only fields this bot can actually
+  // fill in honestly — no fake first-name guessing (Shopify scraping
+  // doesn't surface an owner's name), no fabricated "X spots left" claims.
+  function personalizedMessage(r, niche) {
+    const hook = auditHookLine(r) || `noticed a couple of quick technical wins on your site`
+    return `Hey! Love ${r.store_name || 'your store'} 👋\n\n` +
+      `Quick one — ${hook}\n\n` +
+      `I help ${niche} brands fix exactly that kind of thing. Running a free pilot for a couple of stores this week — want a 30-sec look?`
+  }
+
   async function checkOneStore(url) {
     const result = {
       url, store_name: '', email: 'no email', email_is_generic: false,
-      contact_page: '', store_type: '', socials: {}, status: 'dead'
+      contact_page: '', store_type: '', socials: {}, status: 'dead',
+      sslValid: null, loadSeconds: null, score: 0, scoreReasons: [],
+      isPasswordProtected: false
     }
     try {
       const controller = new AbortController()
@@ -490,6 +556,17 @@ module.exports = async (req, res) => {
       clearTimeout(t)
       if (![200,401,403].includes(r.status)) return result
       result.status = 'OK'
+      // SSL is free to determine here: this fetch already succeeded, and
+      // fetch() throws on invalid/self-signed certs — so if we got here AND
+      // the URL is https, the cert is valid. If it's plain http, there's no
+      // SSL at all. No extra network call needed for this one.
+      result.sslValid = url.startsWith('https://')
+
+      // Kick off the speed check now WITHOUT awaiting — it runs concurrently
+      // with the rest of this function's work below (parsing, fallback page
+      // checks) instead of adding fully sequential latency on top.
+      const speedPromise = getSpeedIndexSeconds(url)
+
       const html = await r.text()
 
       if (html.includes('myshopify.com') || html.includes('cdn.shopify.com')) result.store_type = 'Shopify'
@@ -501,6 +578,27 @@ module.exports = async (req, res) => {
 
       const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i)
       if (titleMatch) result.store_name = titleMatch[1].split(/[–|—]/)[0].trim().slice(0, 60)
+
+      // Password-protected / "coming soon" Shopify storefronts return HTTP
+      // 401 and serve a gate page instead of real content — no point trying
+      // to scrape emails/socials off that, since it's not the real site.
+      const finalUrl = r.url || url
+      result.isPasswordProtected = (
+        r.status === 401 ||
+        finalUrl.includes('/password') ||
+        html.includes('shopify-section-password') ||
+        /this (store|shop) (will be back soon|is currently password protected)/i.test(html) ||
+        /enter (using )?password/i.test(html) ||
+        /opening soon/i.test(html)
+      )
+
+      if (result.isPasswordProtected) {
+        result.socials = extractSocials(html)  // occasionally still present in the page header/footer
+        const { score, reasons } = scoreLead(result)
+        result.score = score
+        result.scoreReasons = reasons
+        return result  // don't waste calls scraping a page that isn't the real site
+      }
 
       result.socials = extractSocials(html)
 
@@ -557,7 +655,14 @@ module.exports = async (req, res) => {
           if (anyContactPage) result.contact_page = anyContactPage.pageUrl
         }
       }
+
+      result.loadSeconds = await speedPromise
     } catch (e) {}
+
+    const { score, reasons } = scoreLead(result)
+    result.score = score
+    result.scoreReasons = reasons
+
     return result
   }
 
@@ -611,6 +716,19 @@ module.exports = async (req, res) => {
     if (!cbLocked) return res.status(200).send('OK')
 
     try {
+      // ── Universal: answers the "include locked/password-protected
+      // stores?" prompt that follows every lead-count entry, regardless
+      // of role, then dispatches to the actual scrape. ──
+      if (data === 'lockedyes' || data === 'lockedno') {
+        const q = await getUserQueue(cbUserId)
+        const search = q.pendingSearch
+        q.awaitingLockedFilter = false
+        q.pendingSearch = null
+        await saveUserQueue(cbUserId, q)
+        if (!search) return res.status(200).send('OK')
+        return await executeSearch(cbChatId, cbUserId, search, data === 'lockedyes')
+      }
+
       // ── ADMIN — picking a search now asks how many NEW leads to fetch,
       // instead of always grabbing a fixed 100 and re-hitting the same
       // already-seen results. The FIRST scout of the day also splits the
@@ -741,7 +859,8 @@ module.exports = async (req, res) => {
         `🔍 /scout — full search menu\n` +
         `🚫 /others — see blacklisted links filtered from your last search\n` +
         `🔒 /black &lt;url&gt; — grow the blacklist from any raw domain-list URL\n` +
-        `🕵️ /scoutlist &lt;url&gt; — scan any domain-list URL as leads directly\n\n` +
+        `🕵️ /scoutlist &lt;url&gt; — scan any domain-list URL as leads directly\n` +
+        `⚡ /autopitch — auto-generate personalized messages for 70+ scored leads\n\n` +
         `Already-checked links are never re-checked, ever.\n\n` +
         `When done, send your outreach messages separated by /\n` +
         `and I'll pair each one with an email for you to copy & send.`
@@ -946,38 +1065,19 @@ module.exports = async (req, res) => {
       }
       const wantCount = Math.min(n, 300)  // safety cap so a huge ask can't blow past Vercel's time limit
 
-      const search = userQueue.pendingSearch
       userQueue.awaitingLeadCount = false
-      userQueue.pendingSearch = null
+      userQueue.pendingSearch.wantCount = wantCount
+      userQueue.awaitingLockedFilter = true
       await saveUserQueue(userId, userQueue)
 
-      // Direct domain list (from /scoutlist) — already have concrete URLs,
-      // no URLScan pagination needed. Deliberately bypasses the blacklist,
-      // since scanning a blacklist-source list is the whole point.
-      if (search.isDirectList) {
-        if (search.isPremium) {
-          const user = await getUser(userId)
-          if (user.premiumScrapesRemaining <= 0) {
-            await send(chatId, `No premium scrapes left. Buy one for ${PREMIUM_STARS_PRICE} Stars via /scout.`)
-            return res.status(200).send('OK')
-          }
-          await setUserFields(userId, { premiumScrapesRemaining: user.premiumScrapesRemaining - 1 })
-        }
-        const batchLinks = search.rawLinks.slice(0, wantCount)
-        return await startBatchJob(chatId, userId, batchLinks, search.label)
-      }
-
-      if (search.isPremium) {
-        const user = await getUser(userId)
-        if (user.premiumScrapesRemaining <= 0) {
-          await send(chatId, `No premium scrapes left. Buy one for ${PREMIUM_STARS_PRICE} Stars via /scout.`)
-          return res.status(200).send('OK')
-        }
-        await setUserFields(userId, { premiumScrapesRemaining: user.premiumScrapesRemaining - 1 })
-        return await startScoutJob(chatId, userId, search.query, search.label, wantCount)
-      }
-
-      return await adminScoutAndFillPoolIfNeeded(chatId, userId, search.query, search.label, wantCount)
+      await sendKeyboard(chatId,
+        `🔐 Include password-protected / "coming soon" stores in results? They won't have email/socials, but you'll get the name + link to search social media manually.`,
+        [
+          [{ text: '✅ Yes, show them', callback_data: 'lockedyes' }],
+          [{ text: '🚫 No, skip them', callback_data: 'lockedno' }]
+        ]
+      )
+      return res.status(200).send('OK')
     }
 
     // ── File upload — admin, or a purchased premium scrape ──
@@ -995,6 +1095,30 @@ module.exports = async (req, res) => {
       const extraBlacklistSet = await getExtraBlacklistSet()
       const rawLinks = extractAndCleanLinks(content, extraBlacklistSet)
       return await startBatchJob(chatId, userId, rawLinks, `file (${rawLinks.length} links)`)
+    }
+
+    // ── /autopitch — auto-generate personalized messages for hot (70+
+    // scored) leads instead of typing each one by hand ──
+    if (text === '/autopitch') {
+      const usable = userQueue.results.filter(r => r.status === 'OK' && r.email !== 'no email' && (r.score || 0) >= 70)
+      if (!usable.length) {
+        await send(chatId,
+          `No leads scoring 70+ with an email in your current results yet.\n` +
+          `Run /scout first — score is based on SSL, site speed, and social presence. ` +
+          `Quality filter is intentional: only the strongest pain-point matches get auto-pitched.`
+        )
+        return res.status(200).send('OK')
+      }
+      const niche = (userQueue.label || '').replace(/ niche$/i, '').toLowerCase() || 'ecommerce'
+      const messages = usable.map(r => personalizedMessage(r, niche))
+      await sendFinalPairs(chatId, usable, messages)
+
+      userQueue.awaitingMessages = false
+      userQueue.pending = []
+      userQueue.results = []
+      userQueue.messages = []
+      await saveUserQueue(userId, userQueue)
+      return res.status(200).send('OK')
     }
 
     // ── Awaiting outreach messages ──
@@ -1063,7 +1187,39 @@ module.exports = async (req, res) => {
   // Admin's FIRST /scout of the day also fills the shared free pool with up
   // to 30 leads — but admin still sees the FULL list either way, just with
   // whichever of those links are (still) sitting in today's pool flagged.
-  async function adminScoutAndFillPoolIfNeeded(chatId, userId, query, label, wantCount) {
+  // Dispatches a pendingSearch (built by /scout or /scoutlist) to the right
+  // execution path, once both the lead count AND the locked-store
+  // preference have been collected.
+  async function executeSearch(chatId, userId, search, includeLocked) {
+    const wantCount = search.wantCount
+
+    if (search.isDirectList) {
+      if (search.isPremium) {
+        const user = await getUser(userId)
+        if (user.premiumScrapesRemaining <= 0) {
+          await send(chatId, `No premium scrapes left. Buy one for ${PREMIUM_STARS_PRICE} Stars via /scout.`)
+          return res.status(200).send('OK')
+        }
+        await setUserFields(userId, { premiumScrapesRemaining: user.premiumScrapesRemaining - 1 })
+      }
+      const batchLinks = search.rawLinks.slice(0, wantCount)
+      return await startBatchJob(chatId, userId, batchLinks, search.label, null, null, includeLocked)
+    }
+
+    if (search.isPremium) {
+      const user = await getUser(userId)
+      if (user.premiumScrapesRemaining <= 0) {
+        await send(chatId, `No premium scrapes left. Buy one for ${PREMIUM_STARS_PRICE} Stars via /scout.`)
+        return res.status(200).send('OK')
+      }
+      await setUserFields(userId, { premiumScrapesRemaining: user.premiumScrapesRemaining - 1 })
+      return await startScoutJob(chatId, userId, search.query, search.label, wantCount, includeLocked)
+    }
+
+    return await adminScoutAndFillPoolIfNeeded(chatId, userId, search.query, search.label, wantCount, includeLocked)
+  }
+
+  async function adminScoutAndFillPoolIfNeeded(chatId, userId, query, label, wantCount, includeLocked) {
     const date = today()
     const { result: filledDate } = await redis('GET', 'poolFilledDate')
 
@@ -1108,7 +1264,7 @@ module.exports = async (req, res) => {
     const { result: poolNow } = await redis('LRANGE', `pool:${date}`, '0', '-1')
     const poolSet = new Set((poolNow || []).map(normalizeForDedupe))
 
-    return await startBatchJob(chatId, userId, cleaned, label, poolSet, scanTimes)
+    return await startBatchJob(chatId, userId, cleaned, label, poolSet, scanTimes, includeLocked)
   }
 
   // Free users pull straight from today's shared pool — no live search
@@ -1197,7 +1353,7 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK')
   }
 
-  async function startScoutJob(chatId, userId, query, label, wantCount) {
+  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked) {
     await send(chatId, `🔍 Searching for ${wantCount} fresh leads — "${label}"... (paging until found or exhausted)`)
     const { urls: cleaned, filteredOut, scanTimes, total, newestScanTime, pagesUsed, gotEnough, exhaustedSource } =
       await scrapeUntilUnseen(query, wantCount, 4)
@@ -1221,10 +1377,10 @@ module.exports = async (req, res) => {
       )
     }
 
-    return await startBatchJob(chatId, userId, cleaned, label, null, scanTimes)
+    return await startBatchJob(chatId, userId, cleaned, label, null, scanTimes, includeLocked)
   }
 
-  async function startBatchJob(chatId, userId, rawLinks, sourceLabel, poolSet, scanTimes) {
+  async function startBatchJob(chatId, userId, rawLinks, sourceLabel, poolSet, scanTimes, includeLocked) {
     if (!rawLinks.length) {
       await send(chatId, `No links found from ${sourceLabel}.`)
       return res.status(200).send('OK')
@@ -1243,7 +1399,9 @@ module.exports = async (req, res) => {
     const userQueue = {
       pending: newLinks, results: [], awaitingMessages: false, messages: [],
       poolUrls: poolSet ? [...poolSet] : [],
-      scanTimes: scanTimes || {}
+      scanTimes: scanTimes || {},
+      label: sourceLabel || '',
+      includeLocked: !!includeLocked
     }
     await saveUserQueue(userId, userQueue)
 
@@ -1269,17 +1427,36 @@ module.exports = async (req, res) => {
     await markSeenBatch(seenEntries)
     await saveUserQueue(userId, userQueue)
 
-    const usable = results.filter(r => r.status === 'OK' && (r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length))
+    const includeLocked = !!userQueue.includeLocked
+
+    const usable = results
+      .filter(r => r.status === 'OK' && (
+        r.isPasswordProtected
+          ? includeLocked
+          : (r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length)
+      ))
+      .sort((a, b) => (b.score || 0) - (a.score || 0))
     const remaining = userQueue.pending.length
     const poolUrlSet = new Set(userQueue.poolUrls || [])
     const scanTimeMap = userQueue.scanTimes || {}
 
-    let reply = `✓ <b>Batch done:</b> ${results.length} checked, ${usable.length} reachable.\n`
+    const lockedCount = usable.filter(r => r.isPasswordProtected).length
+    const hotCount = usable.filter(r => r.score >= 70).length
+    let reply = `✓ <b>Batch done:</b> ${results.length} checked, ${usable.length} reachable, ${hotCount} 🔥 hot (70+)` +
+      (lockedCount ? `, ${lockedCount} 🔐 locked` : '') + `.\n`
     let leadNum = 0
     usable.forEach(r => {
       leadNum++
       const inPool = poolUrlSet.has(normalizeForDedupe(r.url))
       const poolFlag = inPool ? `\n    🔒 <b>IN FREE POOL</b> — also shown to free users` : ''
+      const nameLine = r.store_name ? `${r.store_name}\n    🔗 ${r.url}` : `🔗 ${r.url}`
+      const scanTime = scanTimeMap[r.url]
+      const scanNote = scanTime ? `\n    🕐 site scanned: ${timeAgo(scanTime)}` : ''
+
+      if (r.isPasswordProtected) {
+        reply += `\n\n<b>${leadNum}.</b> ${nameLine}\n    🔐 <b>PASSWORD PROTECTED / NOT OPEN YET</b> — no email/socials from the site itself. Search "${r.store_name || 'this store'}" on social media manually.${scanNote}${poolFlag}`
+        return
+      }
 
       const socialsList = Object.entries(r.socials || {}).map(([k, v]) => `${k}: ${v}`).join('\n              ')
       const socialsNote = socialsList ? `\n    💬 social: ${socialsList}` : ''
@@ -1289,10 +1466,13 @@ module.exports = async (req, res) => {
       const genericNote = r.email_is_generic ? ' (generic)' : ''
       const emailNote = r.email !== 'no email' ? `\n    📧 ${r.email}${genericNote} (in case)` : ''
 
-      const scanTime = scanTimeMap[r.url]
-      const scanNote = scanTime ? `\n    🕐 site scanned: ${timeAgo(scanTime)}` : ''
+      const hotTag = r.score >= 70 ? ' 🔥' : ''
+      const scoreNote = `\n    📊 score: ${r.score}${hotTag}` + (r.scoreReasons?.length ? ` (${r.scoreReasons.join(', ')})` : '')
 
-      reply += `\n\n<b>${leadNum}.</b> ${r.store_name || r.url}${socialsNote}${contactNote}${emailNote}${scanNote}${poolFlag}`
+      const hook = auditHookLine(r)
+      const hookNote = hook ? `\n    💡 ${hook}` : ''
+
+      reply += `\n\n<b>${leadNum}.</b> ${nameLine}${scoreNote}${hookNote}${socialsNote}${contactNote}${emailNote}${scanNote}${poolFlag}`
     })
 
     if (remaining > 0) {
