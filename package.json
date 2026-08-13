@@ -1,5 +1,8 @@
 {
   "name": "karios-lead-scraper-bot",
-  "version": "1.0.0",
-  "private": true
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev"
+  }
 }
