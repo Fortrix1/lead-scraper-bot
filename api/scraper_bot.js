@@ -1,14 +1,12 @@
 // api/scraper_bot.js
 // Personal Telegram lead-scraper bot — hosted on Vercel
-// Stripped down: URLScan scraping + /find command that posts jobs to Redis
-// Maps scraping happens on your PC via maps_daemon.py
+// URLScan scraping + /find command that posts jobs to Redis for maps_daemon.py
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*')
   if (req.method === 'GET') return res.status(200).send('OK')
 
   const BOT_TOKEN = process.env.SCRAPER_BOT_TOKEN || ''
-  const ADMIN_ID  = process.env.SCRAPER_ADMIN_ID  || ''
   const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL   || ''
   const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || ''
 
@@ -33,23 +31,25 @@ module.exports = async (req, res) => {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ callback_query_id: callbackQueryId })
       })
-    } catch (e) {}
+    } catch (e) { console.error('answerCallback error:', e.message) }
   }
 
   async function send(chatId, text) {
     try {
-      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' })
       })
-    } catch (e) {}
+      const d = await r.json()
+      if (!d.ok) console.error('Telegram send failed:', d.description)
+    } catch (e) { console.error('Send error:', e.message) }
   }
 
   function sendKeyboard(chatId, text, keyboard) {
     return fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } })
-    }).catch(() => {})
+    }).catch(e => console.error('Keyboard error:', e.message))
   }
 
   async function getFileContent(fileId) {
@@ -61,8 +61,7 @@ module.exports = async (req, res) => {
     } catch { return '' }
   }
 
-  // ── Upstash Redis REST ──
-
+  // ── Redis ──
   async function redis(...args) {
     try {
       const r = await fetch(REDIS_URL, {
@@ -122,7 +121,6 @@ module.exports = async (req, res) => {
   }
 
   // ── URL fixing / dedupe / filtering ──
-
   const LINK_PATTERN = /https?:\/\/[^\s,"'<>]+|[a-zA-Z0-9\-]+\.myshopify\.com[^\s,"'<>]*/g
 
   function fixUrl(raw) {
@@ -212,7 +210,6 @@ module.exports = async (req, res) => {
   }
 
   // ── Email + contact + socials ──
-
   function cleanEmails(text) {
     const emailPat = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g
     const junk = ['example','domain','sentry','shopify','wixpress','schema','pixel',
@@ -398,10 +395,7 @@ module.exports = async (req, res) => {
     return `${Math.floor(hours / 24)}d ago`
   }
 
-  // ══════════════════════════════════════════════
-  //  URLSCAN.IO
-  // ══════════════════════════════════════════════
-
+  // ── URLSCAN.IO ──
   async function fetchUrlscanPage(query, searchAfter) {
     let apiUrl = `https://urlscan.io/api/v1/search/?q=${encodeURIComponent(query)}&size=100`
     if (searchAfter) apiUrl += `&search_after=${searchAfter}`
@@ -507,7 +501,7 @@ module.exports = async (req, res) => {
     const userQueue = { pending: newLinks, results: [], awaitingMessages: false, messages: [], awaitingCustomQuery: false, label: sourceLabel || '', includeLocked: !!includeLocked }
     await saveUserQueue(userId, userQueue)
 
-    await send(chatId, `✓ ${sourceLabel}: ${rawLinks.length} links (${alreadySeen} already seen, skipped).\n${newLinks.length} new to process.\n\nProcessing first batch of ${BATCH_SIZE}...`)
+    await send(chatId, `✓ ${sourceLabel}: found ${rawLinks.length} links (${alreadySeen} already seen, skipped).\n${newLinks.length} new to process.\n\nProcessing first batch of ${BATCH_SIZE}...`)
     return await runBatch(chatId, userId, userQueue)
   }
 
@@ -529,7 +523,6 @@ module.exports = async (req, res) => {
     const lockedCount = usable.filter(r => r.isPasswordProtected).length
     const hotCount = usable.filter(r => r.score >= 70).length
     let reply = `✓ <b>Batch done:</b> ${results.length} checked, ${usable.length} reachable, ${hotCount} 🔥 hot` + (lockedCount ? `, ${lockedCount} 🔐 locked` : '') + `.`
-
     let leadNum = 0
     usable.forEach(r => {
       leadNum++
@@ -606,7 +599,7 @@ module.exports = async (req, res) => {
         await send(cbChatId, 'Send your custom search query now.')
         const q = await getUserQueue(cbUserId)
         q.awaitingCustomQuery = true
-        await saveUserQueue(cbUserId, q)
+        await saveUserQueue(cbChatId, q)
         return res.status(200).send('OK')
       }
 
@@ -617,7 +610,7 @@ module.exports = async (req, res) => {
         const q = await getUserQueue(cbUserId)
         q.pendingSearch = { query: search.query, label: search.label }
         q.awaitingLeadCount = true
-        await saveUserQueue(cbUserId, q)
+        await saveUserQueue(cbChatId, q)
         await send(cbChatId, `How many NEW leads? Reply with a number (max 300).`)
         return res.status(200).send('OK')
       }
@@ -639,12 +632,6 @@ module.exports = async (req, res) => {
   const userId = String(msg.from?.id || '')
   const text   = (msg.text || '').trim()
   const doc    = msg.document
-
-  // Basic gate
-  if (ADMIN_ID && userId !== ADMIN_ID) {
-    await send(chatId, 'This bot is private.')
-    return res.status(200).send('OK')
-  }
 
   // ── /start ──
   if (text.startsWith('/start')) {
