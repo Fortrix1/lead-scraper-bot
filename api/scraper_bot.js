@@ -653,12 +653,23 @@ module.exports = async (req, res) => {
   if (text.startsWith('/find')) {
     const parts = text.split(' ').slice(1)
     if (parts.length < 2) {
-      await send(chatId, 'Usage: /find <city> <niche> [count]\nExample: /find Austin restaurant 20\n\nNiches: restaurant, food_truck, salon, gym, auto_repair, real_estate')
+      await send(chatId, 'Usage: /find <city> <niche> [count]\nExample: /find Austin restaurant 20\nExample: /find banana island lagos nigeria restaurants 30\n\nNiches: restaurant, food_truck, salon, gym, auto_repair, real_estate')
       return res.status(200).send('OK')
     }
-    const city  = parts[0]
-    const niche = parts[1]
-    const count = Math.min(parseInt(parts[2]) || 20, 50)
+    // [FIX] Parse from the end: last number = count, word before = niche, rest = city
+    let count = 20
+    let nicheIndex = parts.length - 1
+    const lastNum = parseInt(parts[parts.length - 1])
+    if (!isNaN(lastNum) && lastNum > 0) {
+      count = Math.min(lastNum, 50)
+      nicheIndex = parts.length - 2
+    }
+    if (nicheIndex < 1) {
+      await send(chatId, 'Usage: /find <city> <niche> [count]\nExample: /find Austin restaurant 20\nExample: /find banana island lagos nigeria restaurants 30')
+      return res.status(200).send('OK')
+    }
+    const niche = parts[nicheIndex]
+    const city = parts.slice(0, nicheIndex).join(' ')
 
     const job = JSON.stringify({ chat_id: chatId, city, niche, count })
     await redis('RPUSH', 'jobs:find', job)
