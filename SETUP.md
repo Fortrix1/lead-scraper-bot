@@ -26,6 +26,10 @@
 ## Step 3 — Deploy Bot to Vercel
 
 1. Create GitHub repo: `lead-scraper-bot`
+   **Make it Public** if you plan to use the GitHub Actions daemon option in
+   Step 5 below — free unlimited Actions minutes only apply to public repos.
+   (This is fine: the `.gitignore` in this project keeps your tokens and
+   cookies out of the repo. Never commit `gm_cookies.json` or `_env`.)
 2. Push this folder:
    ```bash
    cd Desktop\lead-scraper-bot
@@ -62,7 +66,7 @@ Should return `{"ok":true}`.
 
 ---
 
-## Step 4 — Setup PC Daemon
+## Step 4 — Run the PC Daemon (local option)
 
 Open terminal / PowerShell in the `local-sender` folder (or wherever you want):
 
@@ -73,16 +77,15 @@ pip install -r requirements.txt
 # 2. Install Playwright browser
 playwright install chromium
 
-# 3. Set environment variables (same as Vercel)
-# Windows PowerShell:
-$env:UPSTASH_REDIS_REST_URL = "your_url"
-$env:UPSTASH_REDIS_REST_TOKEN = "your_token"
-$env:SCRAPER_BOT_TOKEN = "your_bot_token"
-
-# Or create a .env file and load it with python-dotenv if you prefer
-
-# 4. Run the daemon
+# 3. Run the daemon — it automatically reads your .env file
 python maps_daemon.py
+```
+
+Your `.env` file (already in this folder) should contain:
+```
+UPSTASH_REDIS_REST_URL=your_url
+UPSTASH_REDIS_REST_TOKEN=your_token
+SCRAPER_BOT_TOKEN=your_bot_token
 ```
 
 The daemon will print:
@@ -92,6 +95,66 @@ Press Ctrl+C to exit
 ```
 
 **Leave it running.** It polls Redis every few seconds.
+
+---
+
+## Step 5 — Optional: Run the Daemon on GitHub Actions Instead of Your PC
+
+If you don't want to keep your PC on 24/7, you can have GitHub run the daemon
+for you, for free, on a schedule — no VPS, no card charges beyond what
+GitHub itself already asks for at signup (nothing, for public repos).
+
+**How it works:** every 10 minutes, GitHub spins up a temporary Linux machine,
+checks Redis for one waiting `/find` job, runs it if there is one, then throws
+the machine away. This replaces the always-on loop with a "wake up, check,
+maybe work, go back to sleep" pattern — functionally the same result for you,
+since jobs still get picked up and results still land in Telegram.
+
+### 5.1 — Make sure the repo is public
+Free, unlimited Actions minutes only apply to **public** repositories. If your
+repo is private, this still works but is capped at ~2,000 free minutes/month —
+fine for occasional use, but switch to public if you want zero limits.
+
+### 5.2 — Add your secrets to GitHub (never commit them)
+Repo → Settings → Secrets and variables → Actions → **New repository secret**.
+Add all four of these:
+
+| Secret name | Value |
+|---|---|
+| `UPSTASH_REDIS_REST_URL` | your Upstash REST URL |
+| `UPSTASH_REDIS_REST_TOKEN` | your Upstash REST token |
+| `SCRAPER_BOT_TOKEN` | your Telegram bot token |
+| `GM_COOKIES_JSON` | the full contents of your `gm_cookies.json` file, pasted as-is |
+
+### 5.3 — Push the workflow file
+Make sure `.github/workflows/daemon.yml` is committed and pushed. GitHub
+detects it automatically — check the **Actions** tab on your repo, you should
+see "Maps Daemon (scheduled)" listed there.
+
+### 5.4 — Test it manually first
+In the Actions tab, click "Maps Daemon (scheduled)" → **Run workflow** to
+trigger it by hand instead of waiting for the schedule. Watch the logs to
+confirm it installs cleanly and either finds/runs a job or reports "No job
+waiting."
+
+### 5.5 — Known limitation: cookies don't self-update remotely
+Locally, the daemon saves fresh cookies back to `gm_cookies.json` after every
+run, so it stays logged in over time. On GitHub Actions, each run is a
+brand-new throwaway machine — it can't write back to your `GM_COOKIES_JSON`
+secret automatically (and we deliberately don't commit cookies to a public
+repo, since that would expose live session data to anyone).
+
+In practice: if Google ever blocks a run or shows a CAPTCHA, the job will
+just come back empty. When that happens, run `python maps_daemon.py` locally
+once (this refreshes `gm_cookies.json` on your PC), then copy its new
+contents into the `GM_COOKIES_JSON` secret to refresh it. This should be
+rare, not something you need to do constantly.
+
+### 5.6 — You can run both at once
+The GitHub Actions workflow and your local PC daemon both just pop jobs off
+the same Redis queue — whichever one checks first gets the job. So you can
+leave GitHub Actions running as the default, and occasionally run the daemon
+locally too (e.g. to refresh cookies) without conflicts.
 
 ---
 
@@ -140,7 +203,10 @@ Send a `.txt` file with one URL per line. The bot extracts, dedupes, and checks 
 |---------|-------------|
 | `/start` | Show help |
 | `/scout` | URLScan.io search menu |
-| `/find <city> <niche> [count]` | Scrape Google Maps via PC daemon |
+| `/find <city> <niche> [count]` | Scrape Google Maps (asks for a review cap, then runs the daemon) |
+| `/campaigns` | List campaigns and how many leads each has |
+| `/leads <status>` | List leads by status: new, contacted, replied, interested, not_interested, do_not_contact, client |
+| `/mark <number> <status>` | Mark lead #N from your last /find report with a status |
 | `/others` | See blacklisted links from last search |
 | `/black <url>` | Add domains from a raw list to blacklist |
 | `/scoutlist <url>` | Scan any domain list as leads |
@@ -149,7 +215,14 @@ Send a `.txt` file with one URL per line. The bot extracts, dedupes, and checks 
 
 ## Notes
 
-- The daemon **must** be running on your PC for `/find` to work.
+- The daemon needs to be running **somewhere** for `/find` to work — either
+  on your PC (Step 4) or via the GitHub Actions schedule (Step 5). Both can
+  run at the same time without conflicting.
 - URLScan and file uploads work without the daemon (they run on Vercel).
-- Google Maps scraping is headless — no browser window pops up.
+- Google Maps scraping opens a real (non-headless) browser window on
+  purpose — it makes solving an occasional CAPTCHA possible. On GitHub
+  Actions this runs inside a virtual display (Xvfb) instead of a visible
+  window, since there's no screen on that machine.
 - Max 50 results per `/find` job (safety limit).
+- Never commit `gm_cookies.json` or `_env` — the `.gitignore` in this repo
+  blocks them, but double-check before pushing if you ever restructure files.

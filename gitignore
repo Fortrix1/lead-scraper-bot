@@ -1,0 +1,21 @@
+# [NEW] Never commit these — this repo is public.
+# Secrets belong in GitHub Secrets (Actions) or your local environment
+# variables, never in the code itself.
+
+gm_cookies.json
+_env
+.env
+*.env
+
+# Local scraper output — don't publish the leads you've collected
+exports/
+debug.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node (for the Vercel bot side, if this repo also holds that folder)
+node_modules/

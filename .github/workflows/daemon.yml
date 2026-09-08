@@ -1,0 +1,56 @@
+name: Maps Daemon (scheduled)
+
+# [NEW] Runs the daemon on GitHub's free compute instead of your PC or a paid server.
+# Free minutes are UNLIMITED on a public repo — that's why the repo needs to stay public.
+#
+# How it works: every 10 minutes, GitHub spins up a fresh temporary Linux machine,
+# checks Redis for one waiting /find job, runs it if there is one (which can take
+# several minutes for a big job), then throws the machine away. Nothing persists
+# between runs except what's stored in Redis and in GitHub Secrets.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes — GitHub may delay this under load, that's normal
+  workflow_dispatch: {}       # lets you trigger a run manually from the Actions tab, for testing
+
+# Only one run at a time — if a run is still going when the next trigger fires,
+# the new one waits in queue instead of starting a second browser in parallel.
+concurrency:
+  group: maps-daemon
+  cancel-in-progress: false
+
+jobs:
+  run-daemon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30   # safety cap so a stuck run doesn't burn free minutes forever
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Chromium + OS dependencies for Playwright
+        run: playwright install --with-deps chromium
+
+      - name: Install a virtual display (Xvfb)
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: Restore Google Maps cookies from secret
+        # This file is written fresh on every run and is NEVER committed —
+        # it only exists on this throwaway machine for the duration of the run.
+        run: echo '${{ secrets.GM_COOKIES_JSON }}' > gm_cookies.json
+
+      - name: Run the daemon (single pass)
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          SCRAPER_BOT_TOKEN: ${{ secrets.SCRAPER_BOT_TOKEN }}
+          RUN_MODE: once
+        run: xvfb-run --auto-servernum python3 maps_daemon.py
