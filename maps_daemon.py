@@ -5,6 +5,7 @@ import os
 import json
 import time
 import re
+import html
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -70,11 +71,14 @@ def make_session():
     return session
 
 # ── Telegram ──
-def send_telegram(chat_id, text):
+def send_telegram(chat_id, text, parse_mode=None):
     try:
+        payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            json=payload,
             timeout=15
         )
     except Exception as e:
@@ -870,43 +874,68 @@ def check_website(url):
 
 
 def format_lead(lead, num):
+    e = html.escape  # shorthand — escapes &, <, > so names/addresses can't break the HTML message
     hot = " 🔥" if lead.get("score", 0) >= 70 else ""
-    lines = [f"{num}. {lead['name']}{hot}"]
+    lines = [f"{num}. <b>{e(lead['name'])}</b>{hot}"]
+
     if lead.get("address"):
-        lines.append(f"   📍 {lead['address']}")
+        lines.append(f"   📍 {e(lead['address'])}")
+
     if lead.get("phone"):
-        lines.append(f"   📱 {lead['phone']}")
+        # tel: link — tapping it opens the phone dialer
+        tel = re.sub(r"[^\d+]", "", lead["phone"])
+        lines.append(f'   📱 <a href="tel:{tel}">{e(lead["phone"])}</a>')
+
     if lead.get("website"):
-        lines.append(f"   🔗 {lead['website']}")
+        lines.append(f'   🔗 <a href="{e(lead["website"])}">{e(lead["website"])}</a>')
+
     if lead.get("rating"):
         rev = lead.get("reviews", "")
-        lines.append(f"   ⭐ {lead['rating']}" + (f" ({rev} reviews)" if rev else ""))
+        lines.append(f"   ⭐ {e(str(lead['rating']))}" + (f" ({rev} reviews)" if rev else ""))
+
     if lead.get("email") and lead["email"] != "no email":
         g = " (generic)" if lead.get("email_is_generic") else ""
-        lines.append(f"   📧 {lead['email']}{g}")
+        lines.append(f'   📧 <a href="mailto:{e(lead["email"])}">{e(lead["email"])}</a>{g}')
+
     if lead.get("instagram_handle"):
-        lines.append(f"   📸 @{lead['instagram_handle']}")
+        ig_url = f"https://instagram.com/{lead['instagram_handle']}"
+        lines.append(f'   📸 <a href="{ig_url}">@{e(lead["instagram_handle"])}</a>')
+
     if lead.get("facebook_page"):
-        lines.append(f"   📘 {lead['facebook_page']}")
+        fb_url = lead["facebook_page"]
+        if not fb_url.startswith("http"):
+            fb_url = "https://" + fb_url
+        lines.append(f'   📘 <a href="{e(fb_url)}">Facebook</a>')
+
     dm = lead.get("decision_maker") or {}
     if dm.get("name"):
-        lines.append(f"   👤 {dm['name']} ({dm['title']}) — best guess, confirm manually")
+        lines.append(f"   👤 {e(dm['name'])} ({e(dm['title'])}) — best guess, confirm manually")
+
     channels = lead.get("contact_channels") or {}
     if channels.get("whatsapp"):
-        lines.append(f"   💬 WhatsApp: {channels['whatsapp']}")
+        lines.append(f'   💬 <a href="{e(channels["whatsapp"])}">WhatsApp</a>')
     if channels.get("messenger"):
-        lines.append(f"   💬 Messenger: {channels['messenger']}")
+        lines.append(f'   💬 <a href="{e(channels["messenger"])}">Messenger</a>')
+    if channels.get("linkedin"):
+        lines.append(f'   💼 <a href="{e(channels["linkedin"])}">LinkedIn</a>')
+    if channels.get("tiktok"):
+        lines.append(f'   🎵 <a href="{e(channels["tiktok"])}">TikTok</a>')
+
     tech = lead.get("tech_stack") or {}
     tech_flat = [t for tools in tech.values() for t in tools]
     if tech_flat:
-        lines.append(f"   🧩 Uses: {', '.join(tech_flat[:4])}")
+        lines.append(f"   🧩 Uses: {e(', '.join(tech_flat[:4]))}")
+
     if lead.get("score", 0) > 0:
         lines.append(f"   📊 Opportunity score: {lead['score']}/100{hot}")
+
     pain = lead.get("pain_points") or []
     for cat, desc in pain[:2]:
-        lines.append(f"   💡 [{cat}] {desc}")
+        lines.append(f"   💡 [{e(cat)}] {e(desc)}")
+
     if lead.get("why_contact"):
-        lines.append(f"   ✉️ Why: {lead['why_contact']}")
+        lines.append(f"   ✉️ Why: {e(lead['why_contact'])}")
+
     return "\n".join(lines)
 
 
@@ -1069,9 +1098,9 @@ def process_job(job):
     total = len(enriched)
     for i in range(0, total, batch_size):
         batch = enriched[i:i + batch_size]
-        msg = f"📍 {city.title()} {niche.title()} — {i+1}-{min(i+batch_size, total)} of {total}\n\n"
-        msg += "\n\n".join(format_lead(lead, i + j + 1) for j, lead in enumerate(batch))
-        send_telegram(chat_id, msg)
+        header = f"📍 {html.escape(city.title())} {html.escape(niche.title())} — {i+1}-{min(i+batch_size, total)} of {total}\n\n"
+        msg = header + "\n\n".join(format_lead(lead, i + j + 1) for j, lead in enumerate(batch))
+        send_telegram(chat_id, msg, parse_mode="HTML")
         time.sleep(1)
 
     with_email = sum(1 for e in enriched if e.get("email") and e["email"] != "no email")
