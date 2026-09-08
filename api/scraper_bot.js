@@ -20,6 +20,9 @@ module.exports = async (req, res) => {
     '5': { label: 'Fashion/clothing niche',             query: 'page.domain:myshopify.com AND page.title:(fashion OR clothing OR apparel)' },
   }
 
+  // [NEW] Lead lifecycle statuses — set with /mark, browsed with /leads
+  const LEAD_STATUSES = ['new', 'contacted', 'replied', 'interested', 'not_interested', 'do_not_contact', 'client']
+
   let body = req.body
   if (typeof body === 'string') { try { body = JSON.parse(body) } catch { return res.status(200).send('OK') } }
   if (!body) return res.status(200).send('OK')
@@ -93,7 +96,7 @@ module.exports = async (req, res) => {
 
   async function getUserQueue(userId) {
     const { result: v } = await redis('GET', `queue:${userId}`)
-    return v ? JSON.parse(v) : { pending: [], results: [], awaitingMessages: false, messages: [], awaitingCustomQuery: false }
+    return v ? JSON.parse(v) : { pending: [], results: [], awaitingMessages: false, messages: [], awaitingCustomQuery: false, awaitingReviewCap: false, pendingFindJob: null }
   }
 
   async function saveUserQueue(userId, queue) {
@@ -638,7 +641,10 @@ module.exports = async (req, res) => {
       `👋 Lead Scraper Bot\n\n` +
       `Commands:\n` +
       `🔍 /scout — search URLScan.io for Shopify leads\n` +
-      `🗺️ /find <city> <niche> [count] — scrape Google Maps (runs on your PC)\n` +
+      `🗺️ /find <city> <niche> [count] — scrape Google Maps (runs on your PC, sends a .txt report)\n` +
+      `📋 /campaigns — see all your campaigns (e.g. "Med Spa — Miami") and lead counts\n` +
+      `📂 /leads <status> — list leads by status: ${LEAD_STATUSES.join(', ')}\n` +
+      `✅ /mark <number> <status> — mark lead #N from your last report (e.g. /mark 3 contacted)\n` +
       `🚫 /others — blacklisted links from last search\n` +
       `🔒 /black <url> — grow blacklist from domain list\n` +
       `🕵️ /scoutlist <url> — scan any domain list as leads\n\n` +
@@ -671,14 +677,97 @@ module.exports = async (req, res) => {
     const niche = parts[nicheIndex]
     const city = parts.slice(0, nicheIndex).join(' ')
 
-    const job = JSON.stringify({ chat_id: chatId, city, niche, count })
-    await redis('RPUSH', 'jobs:find', job)
+    // [NEW] Don't post the job yet — ask for the review cap first instead of
+    // making the user edit REVIEW_THRESHOLD in the Python file.
+    const q = await getUserQueue(userId)
+    q.pendingFindJob = { city, niche, count }
+    q.awaitingReviewCap = true
+    await saveUserQueue(userId, q)
 
     await send(chatId,
-      `✅ Job posted: ${niche} in ${city} (max ${count})\n\n` +
-      `Make sure maps_daemon.py is running on your PC.\n` +
-      `Results will appear here automatically.`
+      `📍 ${niche} in ${city} (max ${count} results)\n\n` +
+      `What's the max review count you want to target?\n` +
+      `I'll skip any business with MORE reviews than this — lower numbers ` +
+      `bias toward newer/smaller businesses, higher numbers include more ` +
+      `established ones too.\n\n` +
+      `Reply with a number (e.g. 200), or "skip" for no limit.`
     )
+    return res.status(200).send('OK')
+  }
+
+  // ── [NEW] /campaigns — overview of every campaign the daemon has tagged leads under ──
+  if (text === '/campaigns') {
+    const { result: names } = await redis('SMEMBERS', 'campaigns:all')
+    if (!names || !names.length) {
+      await send(chatId, `No campaigns yet — they're created automatically the first time you run /find.`)
+      return res.status(200).send('OK')
+    }
+    const lines = []
+    for (const name of names) {
+      const { result: count } = await redis('SCARD', `campaign:${name}:leads`)
+      lines.push(`• ${name} — ${count || 0} lead(s)`)
+    }
+    await send(chatId, `📋 Campaigns:\n\n` + lines.join('\n'))
+    return res.status(200).send('OK')
+  }
+
+  // ── [NEW] /leads <status> — list leads currently in a given status ──
+  if (text.startsWith('/leads')) {
+    const status = text.split(' ')[1]
+    if (!status || !LEAD_STATUSES.includes(status)) {
+      await send(chatId, `Usage: /leads <status>\nStatuses: ${LEAD_STATUSES.join(', ')}`)
+      return res.status(200).send('OK')
+    }
+    const { result: ids } = await redis('SMEMBERS', `status:${status}`)
+    if (!ids || !ids.length) {
+      await send(chatId, `No leads with status "${status}" yet.`)
+      return res.status(200).send('OK')
+    }
+    const shown = ids.slice(0, 25)
+    const { result: recordsRaw } = await redis('HMGET', 'leads:status', ...shown)
+    const lines = shown.map((id, i) => {
+      try {
+        const r = JSON.parse(recordsRaw[i])
+        return `${i + 1}. ${r.name} — ${r.phone || 'no phone'} — ${r.email || 'no email'} (score ${r.score}, ${r.campaign})`
+      } catch { return `${i + 1}. (unreadable record)` }
+    })
+    const more = ids.length > shown.length ? `\n…and ${ids.length - shown.length} more` : ''
+    await send(chatId, `📋 ${status} (${ids.length} total):\n\n` + lines.join('\n') + more)
+    return res.status(200).send('OK')
+  }
+
+  // ── [NEW] /mark <number> <status> — update a lead's status from the last /find report ──
+  if (text.startsWith('/mark')) {
+    const parts = text.split(' ').slice(1)
+    const num = parseInt(parts[0], 10)
+    const status = parts[1]
+    if (!num || !status || !LEAD_STATUSES.includes(status)) {
+      await send(chatId, `Usage: /mark <number> <status>\nNumber = the [N] position from your last .txt report.\nStatuses: ${LEAD_STATUSES.join(', ')}`)
+      return res.status(200).send('OK')
+    }
+    const { result: lastRaw } = await redis('GET', `lastfind:${chatId}`)
+    if (!lastRaw) {
+      await send(chatId, `No recent /find report to reference — run /find first.`)
+      return res.status(200).send('OK')
+    }
+    let last
+    try { last = JSON.parse(lastRaw) } catch { last = [] }
+    const entry = last.find(e => e.index === num)
+    if (!entry || !entry.dedup_id) {
+      await send(chatId, `Couldn't find #${num} in your last report.`)
+      return res.status(200).send('OK')
+    }
+    const { result: existingRaw } = await redis('HGET', 'leads:status', entry.dedup_id)
+    let record = existingRaw ? JSON.parse(existingRaw) : { name: entry.name, phone: entry.phone, email: entry.email, score: entry.score, campaign: '' }
+    const oldStatus = record.status || 'new'
+    record.status = status
+    record.updated = new Date().toISOString().slice(0, 16).replace('T', ' ')
+    await redis('HSET', 'leads:status', entry.dedup_id, JSON.stringify(record))
+    if (oldStatus !== status) {
+      await redis('SREM', `status:${oldStatus}`, entry.dedup_id)
+      await redis('SADD', `status:${status}`, entry.dedup_id)
+    }
+    await send(chatId, `✓ ${entry.name} marked as "${status}".`)
     return res.status(200).send('OK')
   }
 
@@ -765,6 +854,40 @@ module.exports = async (req, res) => {
 
   try {
     const userQueue = await getUserQueue(userId)
+
+    // ── [NEW] Awaiting review cap for /find ──
+    if (userQueue.awaitingReviewCap) {
+      const raw = text.trim().toLowerCase()
+      let reviewCap = null
+      if (raw !== 'skip' && raw !== 'no' && raw !== 'none' && raw !== '0') {
+        const n = parseInt(raw.replace(/[^0-9]/g, ''), 10)
+        if (!n || n < 1) {
+          await send(chatId, `Reply with just a number (e.g. 200), or "skip" for no limit.`)
+          return res.status(200).send('OK')
+        }
+        reviewCap = n
+      }
+      const job = userQueue.pendingFindJob
+      userQueue.awaitingReviewCap = false
+      userQueue.pendingFindJob = null
+      await saveUserQueue(userId, userQueue)
+      if (!job) {
+        await send(chatId, `Something went wrong — run /find again.`)
+        return res.status(200).send('OK')
+      }
+      const jobPayload = JSON.stringify({
+        chat_id: chatId, city: job.city, niche: job.niche,
+        count: job.count, review_cap: reviewCap
+      })
+      await redis('RPUSH', 'jobs:find', jobPayload)
+      await send(chatId,
+        `✅ Job posted: ${job.niche} in ${job.city} (max ${job.count}` +
+        `${reviewCap ? `, review cap ${reviewCap}` : ', no review cap'})\n\n` +
+        `Make sure maps_daemon.py is running on your PC.\n` +
+        `Results will land here as they're found, plus a downloadable .txt report at the end.`
+      )
+      return res.status(200).send('OK')
+    }
 
     // ── Awaiting custom search query ──
     if (userQueue.awaitingCustomQuery) {
