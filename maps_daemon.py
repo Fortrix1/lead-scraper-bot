@@ -1034,6 +1034,85 @@ def export_txt(enriched, city, niche, review_cap, campaign):
     return filepath
 
 
+# [NEW] ── HTML version of the same report — actual clickable links, guaranteed
+# to work in any browser (unlike a .txt file, where clickability depends on
+# whatever app happens to open it). Open with your phone's browser, not Notes.
+def export_html(enriched, city, niche, review_cap, campaign):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    export_dir = os.path.join(script_dir, "exports")
+    os.makedirs(export_dir, exist_ok=True)
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    safe_city = re.sub(r"[^a-zA-Z0-9]+", "_", city).strip("_") or "city"
+    safe_niche = re.sub(r"[^a-zA-Z0-9]+", "_", niche).strip("_") or "niche"
+    filepath = os.path.join(export_dir, f"leads_{safe_niche}_{safe_city}_{ts}.html")
+
+    e = html.escape
+    cards = []
+    for i, lead in enumerate(enriched, 1):
+        hot = " 🔥" if lead.get("score", 0) >= 70 else ""
+        rows = []
+        if lead.get("address"):
+            rows.append(f"<div>📍 {e(lead['address'])}</div>")
+        if lead.get("phone"):
+            tel = re.sub(r"[^\d+]", "", lead["phone"])
+            rows.append(f'<div>📱 <a href="tel:{tel}">{e(lead["phone"])}</a></div>')
+        if lead.get("website"):
+            rows.append(f'<div>🔗 <a href="{e(lead["website"])}" target="_blank">{e(lead["website"])}</a></div>')
+        if lead.get("rating"):
+            rev = lead.get("reviews", "")
+            rows.append(f"<div>⭐ {e(str(lead['rating']))}" + (f" ({rev} reviews)" if rev else "") + "</div>")
+        if lead.get("email") and lead["email"] != "no email":
+            rows.append(f'<div>📧 <a href="mailto:{e(lead["email"])}">{e(lead["email"])}</a></div>')
+        channels = lead.get("contact_channels") or {}
+        for label, icon in [("whatsapp", "💬 WhatsApp"), ("messenger", "💬 Messenger"), ("linkedin", "💼 LinkedIn"), ("tiktok", "🎵 TikTok")]:
+            if channels.get(label):
+                rows.append(f'<div>{icon}: <a href="{e(channels[label])}" target="_blank">{e(channels[label])}</a></div>')
+        if lead.get("instagram_handle"):
+            rows.append(f'<div>📸 <a href="https://instagram.com/{e(lead["instagram_handle"])}" target="_blank">@{e(lead["instagram_handle"])}</a></div>')
+        if lead.get("facebook_page"):
+            fb = lead["facebook_page"] if lead["facebook_page"].startswith("http") else "https://" + lead["facebook_page"]
+            rows.append(f'<div>📘 <a href="{e(fb)}" target="_blank">Facebook</a></div>')
+        dm = lead.get("decision_maker") or {}
+        if dm.get("name"):
+            rows.append(f"<div>👤 {e(dm['name'])} ({e(dm['title'])}) — best guess, confirm manually</div>")
+        pain = lead.get("pain_points") or []
+        for cat, desc in pain:
+            rows.append(f"<div>💡 [{e(cat)}] {e(desc)}</div>")
+        if lead.get("why_contact"):
+            rows.append(f"<div>✉️ {e(lead['why_contact'])}</div>")
+
+        cards.append(f"""
+        <div class="card">
+          <h3>{i}. {e(lead.get('name',''))}{hot} <span class="score">{lead.get('score',0)}/100</span></h3>
+          {''.join(rows)}
+        </div>""")
+
+    doc = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{e(niche.title())} in {e(city.title())}</title>
+<style>
+  body {{ font-family: -apple-system, sans-serif; max-width: 700px; margin: 0 auto; padding: 16px; background: #f5f5f5; }}
+  h1 {{ font-size: 20px; }}
+  .meta {{ color: #666; font-size: 13px; margin-bottom: 20px; }}
+  .card {{ background: white; border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+  .card h3 {{ margin: 0 0 8px 0; font-size: 16px; }}
+  .score {{ float: right; font-size: 13px; color: #555; }}
+  .card div {{ margin: 4px 0; font-size: 14px; word-break: break-word; }}
+  a {{ color: #0a66c2; text-decoration: none; }}
+  a:active {{ opacity: 0.6; }}
+</style></head>
+<body>
+  <h1>{e(niche.title())} in {e(city.title())}</h1>
+  <div class="meta">Campaign: {e(campaign)} · {len(enriched)} leads · Review cap: {review_cap if review_cap is not None else 'none'} · {time.strftime('%Y-%m-%d %H:%M')}</div>
+  {''.join(cards)}
+</body></html>"""
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(doc)
+    return filepath
+
+
 # [NEW] ── Campaign + status tracking (so the Telegram bot can list/mark leads later) ──
 # Redis layout:
 #   leads:status            hash   dedup_id -> JSON {status, campaign, city, niche, name, phone, email, score, updated}
@@ -1143,14 +1222,22 @@ def process_job(job):
 
     save_lastfind(chat_id, enriched)  # [NEW] so /mark <n> <status> can find these leads
 
-    # [NEW] Full report as a downloadable .txt file, not CSV
+    # [NEW] Two versions of the report: .txt (plain, easy to copy/paste) and
+    # .html (real clickable links — open with your phone's browser, not Notes)
     try:
-        filepath = export_txt(enriched, city, niche, review_cap, campaign)
-        send_telegram_document(chat_id, filepath, caption=f"📄 Full report — {niche} in {city} ({total} leads)")
-        print(f"  ✅ Report saved and sent: {filepath}")
+        txt_path = export_txt(enriched, city, niche, review_cap, campaign)
+        send_telegram_document(chat_id, txt_path, caption=f"📄 Full report (.txt) — {niche} in {city} ({total} leads)")
+        print(f"  ✅ .txt report saved and sent: {txt_path}")
     except Exception as e:
-        print(f"  ⚠️ Export/send failed: {e}")
+        print(f"  ⚠️ .txt export/send failed: {e}")
         send_telegram(chat_id, "⚠️ Couldn't generate the .txt report — check the daemon logs.")
+
+    try:
+        html_path = export_html(enriched, city, niche, review_cap, campaign)
+        send_telegram_document(chat_id, html_path, caption=f"🔗 Full report (.html, clickable links) — open with your browser, not Notes")
+        print(f"  ✅ .html report saved and sent: {html_path}")
+    except Exception as e:
+        print(f"  ⚠️ .html export/send failed: {e}")
 
     print(f"\n✅ Complete: {total} leads, {with_email} with email, {hot} hot, {no_site} no-website")
 

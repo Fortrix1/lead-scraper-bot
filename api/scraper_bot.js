@@ -9,6 +9,14 @@ module.exports = async (req, res) => {
   const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL   || ''
   const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || ''
 
+  // [NEW] Optional — lets a /find job trigger the GitHub Actions daemon
+  // immediately instead of waiting for the next scheduled cron tick.
+  // Needs a PAT with "workflow" scope, added as a Vercel env var (see SETUP.md).
+  const GITHUB_DISPATCH_TOKEN = process.env.GITHUB_DISPATCH_TOKEN || ''
+  const GITHUB_OWNER = process.env.GITHUB_OWNER || ''
+  const GITHUB_REPO  = process.env.GITHUB_REPO  || ''
+  const GITHUB_WORKFLOW_FILE = process.env.GITHUB_WORKFLOW_FILE || 'daemon.yml'
+
   const BATCH_SIZE  = 8
   const CONCURRENCY = 4
 
@@ -64,6 +72,36 @@ module.exports = async (req, res) => {
   }
 
   // ── Redis ──
+  // [NEW] Tell GitHub "run the daemon now" instead of waiting for the next
+  // scheduled cron tick. Best-effort — if this fails or isn't configured,
+  // the scheduled run will still pick the job up eventually, just slower.
+  async function triggerGithubWorkflow() {
+    if (!GITHUB_DISPATCH_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) {
+      console.log('GitHub dispatch not configured — skipping, cron will catch it')
+      return false
+    }
+    try {
+      const r = await fetch(
+        `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/actions/workflows/${GITHUB_WORKFLOW_FILE}/dispatches`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${GITHUB_DISPATCH_TOKEN}`,
+            Accept: 'application/vnd.github+json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ ref: 'main' })
+        }
+      )
+      if (r.status === 204) return true
+      console.error('GitHub dispatch failed:', r.status, await r.text())
+      return false
+    } catch (e) {
+      console.error('GitHub dispatch error:', e.message)
+      return false
+    }
+  }
+
   async function redis(...args) {
     try {
       const r = await fetch(REDIS_URL, {
@@ -880,11 +918,14 @@ module.exports = async (req, res) => {
         count: job.count, review_cap: reviewCap
       })
       await redis('RPUSH', 'jobs:find', jobPayload)
+      const dispatched = await triggerGithubWorkflow()  // [NEW]
       await send(chatId,
         `✅ Job posted: ${job.niche} in ${job.city} (max ${job.count}` +
         `${reviewCap ? `, review cap ${reviewCap}` : ', no review cap'})\n\n` +
-        `Make sure maps_daemon.py is running on your PC.\n` +
-        `Results will land here as they're found, plus a downloadable .txt report at the end.`
+        (dispatched
+          ? `Triggered GitHub Actions immediately — should start within a minute or two.\n`
+          : `Make sure maps_daemon.py is running on your PC, or wait for the next scheduled GitHub Actions run.\n`) +
+        `Results will land here as they're found, plus downloadable .txt/.html reports at the end.`
       )
       return res.status(200).send('OK')
     }

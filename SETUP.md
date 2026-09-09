@@ -156,6 +156,29 @@ the same Redis queue — whichever one checks first gets the job. So you can
 leave GitHub Actions running as the default, and occasionally run the daemon
 locally too (e.g. to refresh cookies) without conflicts.
 
+### 5.7 — Optional: Skip the wait, trigger runs instantly
+By default, GitHub only checks for jobs every 10 minutes (Step 5.1), and
+that schedule can sometimes be delayed further under GitHub's own load.
+You can bypass this entirely: the bot can tell GitHub "run right now" the
+moment you post a `/find` job, instead of waiting on the schedule.
+
+1. Create a Personal Access Token at `github.com/settings/tokens` with the
+   **`workflow`** scope (same as Step 5's push permission — you can reuse
+   an existing token if it already has this scope, or make a new one).
+2. In your Vercel project → Settings → Environment Variables, add:
+
+   | Name | Value |
+   |---|---|
+   | `GITHUB_DISPATCH_TOKEN` | the token from step 1 |
+   | `GITHUB_OWNER` | your GitHub username (e.g. `Fortrix1`) |
+   | `GITHUB_REPO` | `lead-scraper-bot` |
+
+3. Redeploy on Vercel so the new environment variables take effect.
+
+That's it — every `/find` job now triggers GitHub Actions immediately.
+This is optional: if it's not configured, or the trigger call fails for any
+reason, the scheduled run still picks the job up on its own, just slower.
+
 ---
 
 ## How to Use
