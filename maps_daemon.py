@@ -149,14 +149,23 @@ def redis_get(key):
 def get_panel_name(page):
     """Get the business name currently shown in the detail panel h1."""
     junk_names = ["results", "google maps", "search", "", " "]
-    try:
-        el = page.query_selector("h1.DUwDvf, h1.fontHeadlineLarge")
-        if el:
-            name = el.inner_text().strip()
-            if name and len(name) > 1 and name.lower() not in junk_names and "result" not in name.lower():
-                return name
-    except:
-        pass
+    # [CHANGED] Try the known specific classes first, then fall back to any
+    # visible h1 in the main panel — Google's CSS class names occasionally
+    # differ for some listing types (ads, chains, limited-info entries),
+    # which was likely a real cause of "detail panel didn't load" skips.
+    selectors = [
+        "h1.DUwDvf", "h1.fontHeadlineLarge",
+        '[role="main"] h1', 'div[role="main"] h1',
+    ]
+    for sel in selectors:
+        try:
+            el = page.query_selector(sel)
+            if el:
+                name = el.inner_text().strip()
+                if name and len(name) > 1 and name.lower() not in junk_names and "result" not in name.lower():
+                    return name
+        except:
+            continue
     return None
 
 
@@ -201,6 +210,16 @@ def wait_for_new_panel_name(page, prev_name, max_wait=12):
             return name
         time.sleep(0.5)
     return None
+
+
+def safe_int(text, default=0):
+    """Parse a comma-stripped number, returning `default` instead of crashing
+    on edge cases like a regex match that captured only a stray comma."""
+    try:
+        cleaned = text.replace(",", "").strip()
+        return int(cleaned) if cleaned else default
+    except (ValueError, AttributeError):
+        return default
 
 
 # ── Google Maps Scraping ──
@@ -352,7 +371,7 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200):
         skipped_reasons = {
             "duplicate_name": 0, "duplicate_addr": 0, "junk_name": 0,
             "too_many_reviews": 0, "already_seen": 0, "click_fail": 0,
-            "panel_load_fail": 0
+            "panel_load_fail": 0, "parse_error": 0
         }
 
         last_panel_name = None
@@ -368,6 +387,10 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200):
             except:
                 pass
 
+            # [NEW] Small pacing delay — clicking cards back-to-back with zero
+            # gap likely contributes to the detail panel not keeping up.
+            time.sleep(0.4)
+
             # Robust click with fallbacks
             clicked = robust_click(card_link, page)
             if not clicked:
@@ -379,8 +402,10 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200):
             panel_name = wait_for_new_panel_name(page, last_panel_name, max_wait=12)
 
             if not panel_name:
-                time.sleep(3)
-                panel_name = wait_for_new_panel_name(page, last_panel_name, max_wait=10)
+                # [CHANGED] Longer, single retry instead of a short one — most
+                # slow-render cases just need more time, not another click.
+                time.sleep(2)
+                panel_name = wait_for_new_panel_name(page, last_panel_name, max_wait=15)
                 if not panel_name:
                     skipped_reasons["panel_load_fail"] += 1
                     print(f"    ⏭️  Card {idx} ({sidebar_name}): detail panel didn't load")
@@ -449,7 +474,7 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200):
                         aria = review_el.get_attribute("aria-label") or ""
                         m = re.search(r"([\d,]+)", aria)
                         if m:
-                            review_count = int(m.group(1).replace(",", ""))
+                            review_count = safe_int(m.group(1))
                             break
 
                 # Method 2: Look for text pattern like "4.4 (806)" or "4.4 · 806" in detail panel
@@ -468,7 +493,7 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200):
                             for pat in patterns:
                                 m = re.search(pat, panel_text)
                                 if m:
-                                    review_count = int(m.group(1).replace(",", ""))
+                                    review_count = safe_int(m.group(1))
                                     break
                     except:
                         pass
@@ -517,6 +542,7 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200):
                 print(f"    ✅ {len(results)}. {data['name']} — {data['website'] or 'no website'} — {data['reviews']} reviews")
 
             except Exception as e:
+                skipped_reasons["parse_error"] += 1
                 print(f"    ⚠️  Card {idx} ({sidebar_name}) error: {str(e)[:80]}")
                 continue
 
