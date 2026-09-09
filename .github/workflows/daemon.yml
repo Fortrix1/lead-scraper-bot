@@ -10,7 +10,10 @@ name: Maps Daemon (scheduled)
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 minutes — GitHub may delay this under load, that's normal
+    # [CHANGED] Offset from the round 10-minute marks (:00, :10, :20...) —
+    # those are GitHub's busiest moments and most prone to delay. Firing a
+    # few minutes off that beat tends to get picked up faster.
+    - cron: "4,14,24,34,44,54 * * * *"
   workflow_dispatch: {}       # lets you trigger a run manually from the Actions tab, for testing
 
 # Only one run at a time — if a run is still going when the next trigger fires,
