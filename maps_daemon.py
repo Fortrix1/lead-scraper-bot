@@ -234,6 +234,17 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200):
     # [FIX] GLOBAL dedup key — once a business is scraped, never show it again
     dedup_key = "seen_maps:global"
 
+    # [NEW] Hard time budget for the whole scrape. If Google is showing a
+    # CAPTCHA/block or the detail panel just won't load, the old code would
+    # grind through every card at ~29s each until GitHub Actions force-killed
+    # the whole job at 30 minutes (which is what caused the "cancelled" run).
+    # Now we just stop early and return whatever we already have.
+    scrape_start_time = time.time()
+    MAX_SCRAPE_SECONDS = 20 * 60  # leave headroom under the 30 min job timeout
+
+    def time_left():
+        return MAX_SCRAPE_SECONDS - (time.time() - scrape_start_time)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=False,
@@ -266,6 +277,30 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200):
         url = f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}"
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
         time.sleep(6)
+
+        # [NEW] Detect a CAPTCHA / "unusual traffic" block early. This is the
+        # #1 cause of runs that quietly burn the full 30-minute job timeout:
+        # the page loads, but every single card click fails to open a detail
+        # panel, so the old code just kept retrying card after card until
+        # GitHub Actions killed the job. Now we bail immediately and say why.
+        try:
+            page_text = page.inner_text("body").lower()
+        except Exception:
+            page_text = ""
+        block_signals = [
+            "unusual traffic", "detected unusual traffic", "recaptcha",
+            "our systems have detected", "captcha-form", "sorry/index",
+        ]
+        is_blocked = ("google.com/sorry" in page.url) or any(sig in page_text for sig in block_signals)
+        if is_blocked:
+            print("  🚫 Google is showing a CAPTCHA / block page — cookies are likely stale or this IP got flagged.")
+            try:
+                page.screenshot(path=os.path.join(script_dir, "debug_captcha.png"), full_page=True)
+                print("  Screenshot saved: debug_captcha.png")
+            except Exception:
+                pass
+            browser.close()
+            return results
 
         # Handle consent
         consent_buttons = ["Accept all", "I agree", "Reject all", "Accept", "Got it"]
@@ -311,6 +346,9 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200):
         target_buffer = max_results * 3  # Need 3x buffer because of dedup/filters
 
         for i in range(80):  # [FIX] was 40, now 80 scroll attempts
+            if time_left() <= 0:
+                print("  ⏱️ Time budget hit during scrolling, moving on with what we have")
+                break
             try:
                 feed.evaluate("el => el.scrollTop = el.scrollHeight")
             except:
@@ -379,6 +417,9 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200):
         # Click each unique card
         for idx, card_link in enumerate(card_links):
             if len(results) >= max_results:
+                break
+            if time_left() <= 0:
+                print(f"  ⏱️ Time budget hit, stopping early with {len(results)} results")
                 break
 
             sidebar_name = ""
@@ -1184,7 +1225,13 @@ def process_job(job):
     results = scrape_google_maps(city, niche, count, review_cap=review_cap)
 
     if not results:
-        send_telegram(chat_id, "❌ No results found. Try a different city or niche.\n\nTip: If Google shows a CAPTCHA, solve it in the browser window and cookies will save for next time.")
+        send_telegram(
+            chat_id,
+            "❌ No results found.\n\n"
+            "This is often Google showing a CAPTCHA/block on this run rather than a genuinely empty search "
+            "(check the Action logs for '🚫 Google is showing a CAPTCHA'). If so, the GM_COOKIES_JSON secret "
+            "likely needs refreshing. Otherwise, try a different city or niche."
+        )
         return
 
     send_telegram(chat_id, f"📍 Found {len(results)} businesses. Analyzing websites now...")
