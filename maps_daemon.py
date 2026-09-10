@@ -450,11 +450,23 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200):
                         data["website"] = href
                         break
 
-                # Phone
-                for btn in page.query_selector_all('button[data-tooltip*="phone"], button[data-item-id*="phone"]'):
-                    txt = btn.get_attribute("data-tooltip") or btn.inner_text().strip()
+                # [FIX] Phone — data-tooltip was often just "Copy phone number"
+                # (no digits), not the actual number. Check structured
+                # data-item-id first (format: "phone:tel:+1XXXXXXXXXX"),
+                # then the button's visible text, then aria-label as fallback.
+                for btn in page.query_selector_all('button[data-item-id*="phone"], button[data-tooltip*="phone"]'):
+                    item_id = btn.get_attribute("data-item-id") or ""
+                    m = re.search(r"phone:tel:([\d+\-\s()]+)", item_id)
+                    if m:
+                        data["phone"] = m.group(1).strip()
+                        break
+                    txt = btn.inner_text().strip()
                     if txt and any(c.isdigit() for c in txt):
                         data["phone"] = txt
+                        break
+                    aria = btn.get_attribute("aria-label") or ""
+                    if aria and any(c.isdigit() for c in aria):
+                        data["phone"] = re.sub(r"^phone:?\s*", "", aria, flags=re.IGNORECASE).strip()
                         break
 
                 # Rating
