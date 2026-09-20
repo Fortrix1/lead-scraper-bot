@@ -802,6 +802,71 @@ def detect_pain_points(sig, reviews):
     return unique[:3]
 
 
+# [NEW] ── Lead categorization into the three sample "products" ──
+# website_needed        = no site, or the site is dead/unreachable
+# website_opportunity   = has a working site but a real conversion/lead-response gap
+# fresh_prospect        = has a site with no obvious gap — just a general prospect
+CATEGORY_LABELS = {
+    "website_needed": "Website Needed",
+    "website_opportunity": "Website Opportunity",
+    "fresh_prospect": "Fresh Prospect",
+}
+
+def categorize_lead(lead):
+    if not lead.get("website") or lead.get("status") == "dead":
+        return "website_needed"
+    pain = lead.get("pain_points") or []
+    has_conversion_gap = any(cat in ("Conversion", "Lead-response") for cat, _ in pain)
+    return "website_opportunity" if has_conversion_gap else "fresh_prospect"
+
+
+# [NEW] ── Masking helpers for sample mode ──
+# Samples given to a prospective buyer should prove the data is real (name,
+# city, reviews, signals) without handing over the bulk contact info for free —
+# see SETUP.md "sample" notes. Keeps the digit count/shape so it still reads
+# like a real phone number, just not a usable one.
+def mask_phone(phone):
+    if not phone:
+        return phone
+    out, digit_count = [], 0
+    for ch in phone:
+        if ch.isdigit():
+            digit_count += 1
+            out.append(ch if digit_count <= 3 else "•")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+def mask_email(email):
+    if not email or email == "no email":
+        return email
+    local, sep, domain = email.partition("@")
+    if not sep:
+        return email
+    masked_local = local[0] + "•" * max(len(local) - 1, 3)
+    return f"{masked_local}@{domain}"
+
+def mask_lead_for_sample(lead):
+    """Shallow copy with contact-heavy fields hidden — used only for what
+    gets SENT OUT (Telegram batches + exports) in sample mode. The real,
+    unmasked lead stays in Redis / your internal record via record_lead_status,
+    which runs on the full data before this is ever applied."""
+    masked = dict(lead)
+    masked["_masked"] = True
+    if masked.get("phone"):
+        masked["phone"] = mask_phone(masked["phone"])
+    if masked.get("email") and masked["email"] != "no email":
+        masked["email"] = mask_email(masked["email"])
+    masked["decision_maker"] = {"name": "", "title": ""}
+    channels = dict(masked.get("contact_channels") or {})
+    channels.pop("email", None)
+    channels.pop("whatsapp", None)
+    channels.pop("messenger", None)
+    masked["contact_channels"] = channels
+    masked["tech_stack"] = {}
+    return masked
+
+
 def is_high_value_niche(niche):
     n = niche.lower()
     return any(k in n for k in HIGH_VALUE_NICHES)
@@ -952,75 +1017,108 @@ def check_website(url):
     return result
 
 
+# [CHANGED] Two-section "Prospect / Opportunity" layout. Contact links are
+# swapped for plain masked text when lead["_masked"] is set (sample mode) —
+# see mask_lead_for_sample(). Everything else about the lead (reviews, socials,
+# category, opportunity reasoning) still shows, since that's what proves the
+# data is real.
 def format_lead(lead, num):
     e = html.escape  # shorthand — escapes &, <, > so names/addresses can't break the HTML message
+    masked = bool(lead.get("_masked"))
     hot = " 🔥" if lead.get("score", 0) >= 70 else ""
-    lines = [f"{num}. <b>{e(lead['name'])}</b>{hot}"]
+    cat_label = CATEGORY_LABELS.get(lead.get("category"), "")
 
+    lines = [f"{num}. <b>{e(lead['name'])}</b>{hot}"]
+    if cat_label:
+        lines.append(f"   🏷️ {e(cat_label)}")
+
+    lines.append("   <u>Prospect</u>")
     if lead.get("address"):
         lines.append(f"   📍 {e(lead['address'])}")
-
-    if lead.get("phone"):
-        # tel: link — tapping it opens the phone dialer
-        tel = re.sub(r"[^\d+]", "", lead["phone"])
-        lines.append(f'   📱 <a href="tel:{tel}">{e(lead["phone"])}</a>')
-
-    if lead.get("website"):
-        lines.append(f'   🔗 <a href="{e(lead["website"])}">{e(lead["website"])}</a>')
-
-    if lead.get("rating"):
-        rev = lead.get("reviews", "")
-        lines.append(f"   ⭐ {e(str(lead['rating']))}" + (f" ({rev} reviews)" if rev else ""))
-
-    if lead.get("email") and lead["email"] != "no email":
-        g = " (generic)" if lead.get("email_is_generic") else ""
-        lines.append(f'   📧 <a href="mailto:{e(lead["email"])}">{e(lead["email"])}</a>{g}')
+    rev = lead.get("reviews", "")
+    if lead.get("rating") or rev:
+        stars = f"⭐ {e(str(lead.get('rating', '')))}" if lead.get("rating") else "⭐"
+        lines.append(f"   {stars}" + (f" ({rev} reviews)" if rev else ""))
+    lines.append(f"   🌐 Website: {'Yes' if lead.get('website') else 'No'}")
+    booking = (lead.get("signals") or {}).get("has_booking")
+    lines.append(f"   📅 Booking: {'Detected' if booking else 'Not detected'}")
 
     if lead.get("instagram_handle"):
         ig_url = f"https://instagram.com/{lead['instagram_handle']}"
-        lines.append(f'   📸 <a href="{ig_url}">@{e(lead["instagram_handle"])}</a>')
+        lines.append(f'   📸 Instagram: <a href="{ig_url}">@{e(lead["instagram_handle"])}</a>')
+    else:
+        lines.append("   📸 Instagram: No")
 
     if lead.get("facebook_page"):
         fb_url = lead["facebook_page"]
         if not fb_url.startswith("http"):
             fb_url = "https://" + fb_url
-        lines.append(f'   📘 <a href="{e(fb_url)}">Facebook</a>')
+        lines.append(f'   📘 Facebook: <a href="{e(fb_url)}">Yes</a>')
+    else:
+        lines.append("   📘 Facebook: No")
 
-    dm = lead.get("decision_maker") or {}
-    if dm.get("name"):
-        lines.append(f"   👤 {e(dm['name'])} ({e(dm['title'])}) — best guess, confirm manually")
+    if lead.get("phone"):
+        if masked:
+            lines.append(f"   📱 Phone: {e(lead['phone'])}")
+        else:
+            tel = re.sub(r"[^\d+]", "", lead["phone"])  # tel: link opens the dialer
+            lines.append(f'   📱 Phone: <a href="tel:{tel}">{e(lead["phone"])}</a>')
+    else:
+        lines.append("   📱 Phone: not publicly listed")
 
-    channels = lead.get("contact_channels") or {}
-    if channels.get("whatsapp"):
-        lines.append(f'   💬 <a href="{e(channels["whatsapp"])}">WhatsApp</a>')
-    if channels.get("messenger"):
-        lines.append(f'   💬 <a href="{e(channels["messenger"])}">Messenger</a>')
-    if channels.get("linkedin"):
-        lines.append(f'   💼 <a href="{e(channels["linkedin"])}">LinkedIn</a>')
-    if channels.get("tiktok"):
-        lines.append(f'   🎵 <a href="{e(channels["tiktok"])}">TikTok</a>')
+    if lead.get("email") and lead["email"] != "no email":
+        if masked:
+            lines.append(f"   📧 Email: {e(lead['email'])}")
+        else:
+            g = " (generic)" if lead.get("email_is_generic") else ""
+            lines.append(f'   📧 Email: <a href="mailto:{e(lead["email"])}">{e(lead["email"])}</a>{g}')
+    else:
+        lines.append("   📧 Email: not publicly available")
 
-    tech = lead.get("tech_stack") or {}
-    tech_flat = [t for tools in tech.values() for t in tools]
-    if tech_flat:
-        lines.append(f"   🧩 Uses: {e(', '.join(tech_flat[:4]))}")
+    if lead.get("website"):
+        lines.append(f'   🔗 <a href="{e(lead["website"])}">{e(lead["website"])}</a>')
 
+    lines.append("")
+    lines.append("   <u>Opportunity</u>")
+    lines.append(f"   Website present: {'Yes' if lead.get('website') else 'No'}")
+    pain = lead.get("pain_points") or []
+    opp_cats = sorted({cat for cat, _ in pain}) if pain else []
+    lines.append(f"   Potential opportunity: {e('/'.join(opp_cats)) if opp_cats else 'General prospecting'}")
+    if lead.get("why_contact"):
+        lines.append(f"   Reason: {e(lead['why_contact'])}")
     if lead.get("score", 0) > 0:
         lines.append(f"   📊 Opportunity score: {lead['score']}/100{hot}")
-
-    pain = lead.get("pain_points") or []
     for cat, desc in pain[:2]:
         lines.append(f"   💡 [{e(cat)}] {e(desc)}")
 
-    if lead.get("why_contact"):
-        lines.append(f"   ✉️ Why: {e(lead['why_contact'])}")
+    # Decision-maker guess, extra contact channels, and tech stack are the
+    # "bulk contact info" the doc says to hold back in a free sample.
+    if not masked:
+        dm = lead.get("decision_maker") or {}
+        if dm.get("name"):
+            lines.append(f"   👤 {e(dm['name'])} ({e(dm['title'])}) — best guess, confirm manually")
+
+        channels = lead.get("contact_channels") or {}
+        if channels.get("whatsapp"):
+            lines.append(f'   💬 <a href="{e(channels["whatsapp"])}">WhatsApp</a>')
+        if channels.get("messenger"):
+            lines.append(f'   💬 <a href="{e(channels["messenger"])}">Messenger</a>')
+        if channels.get("linkedin"):
+            lines.append(f'   💼 <a href="{e(channels["linkedin"])}">LinkedIn</a>')
+        if channels.get("tiktok"):
+            lines.append(f'   🎵 <a href="{e(channels["tiktok"])}">TikTok</a>')
+
+        tech = lead.get("tech_stack") or {}
+        tech_flat = [t for tools in tech.values() for t in tools]
+        if tech_flat:
+            lines.append(f"   🧩 Uses: {e(', '.join(tech_flat[:4]))}")
 
     return "\n".join(lines)
 
 
 # [NEW] ── Export the full enriched list to a .txt file (not CSV — easy to
 # open in any Notes/Docs app on a phone) and hand it back via Telegram ──
-def export_txt(enriched, city, niche, review_cap, campaign):
+def export_txt(enriched, city, niche, review_cap, campaign, sample_mode=False):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     export_dir = os.path.join(script_dir, "exports")
     os.makedirs(export_dir, exist_ok=True)
@@ -1028,53 +1126,74 @@ def export_txt(enriched, city, niche, review_cap, campaign):
     ts = time.strftime("%Y%m%d_%H%M%S")
     safe_city = re.sub(r"[^a-zA-Z0-9]+", "_", city).strip("_") or "city"
     safe_niche = re.sub(r"[^a-zA-Z0-9]+", "_", niche).strip("_") or "niche"
-    filepath = os.path.join(export_dir, f"leads_{safe_niche}_{safe_city}_{ts}.txt")
+    tag = "sample" if sample_mode else "full"
+    filepath = os.path.join(export_dir, f"leads_{safe_niche}_{safe_city}_{ts}_{tag}.txt")
 
     lines = []
-    lines.append(f"LEAD REPORT — {niche.title()} in {city.title()}")
+    lines.append(("SAMPLE — " if sample_mode else "") + f"LEAD REPORT — {niche.title()} in {city.title()}")
     lines.append(f"Campaign: {campaign}")
     lines.append(f"Generated: {time.strftime('%Y-%m-%d %H:%M')}")
     lines.append(f"Review cap: {review_cap if review_cap is not None else 'none'}")
     lines.append(f"Total leads: {len(enriched)}")
+    if sample_mode:
+        lines.append("Note: this is a limited sample — phone/email are partially hidden and shown in full in the paid batch.")
     lines.append("=" * 60)
     lines.append("")
 
     for i, lead in enumerate(enriched, 1):
-        lines.append(f"[{i}] {lead.get('name', '')}  —  Opportunity Score: {lead.get('score', 0)}/100")
+        masked = bool(lead.get("_masked"))
+        cat_label = CATEGORY_LABELS.get(lead.get("category"), "")
+        header = f"[{i}] {lead.get('name', '')}"
+        if cat_label:
+            header += f"  ({cat_label})"
+        header += f"  —  Opportunity Score: {lead.get('score', 0)}/100"
+        lines.append(header)
+        lines.append("    -- Prospect --")
         lines.append(f"    Address:   {lead.get('address', '')}")
         lines.append(f"    Phone:     {lead.get('phone', '')}")
         lines.append(f"    Website:   {lead.get('website') or 'NONE — opportunity'}")
+        booking = (lead.get("signals") or {}).get("has_booking")
+        lines.append(f"    Booking:   {'Detected' if booking else 'Not detected'}")
         lines.append(f"    Rating:    {lead.get('rating', '')} ({lead.get('reviews', 0)} reviews)")
         lines.append(f"    Email:     {lead.get('email', '')}")
         socials = lead.get("socials") or {}
         if socials:
             lines.append("    Socials:   " + ", ".join(f"{k}: {v}" for k, v in socials.items()))
-        channels = lead.get("contact_channels") or {}
-        if channels:
-            lines.append("    Contact channels:")
-            for k, v in channels.items():
-                lines.append(f"      - {k}: {v}")
-        tech = lead.get("tech_stack") or {}
-        if tech:
-            lines.append("    Tech stack detected:")
-            for category, tools in tech.items():
-                lines.append(f"      - {category.replace('_', ' ')}: {', '.join(tools)}")
-        dm = lead.get("decision_maker") or {}
-        if dm.get("name"):
-            lines.append(f"    Decision-maker (best guess, confirm manually): {dm['name']} — {dm['title']}")
-        else:
-            lines.append("    Decision-maker: not confidently identified")
-        breakdown = lead.get("score_breakdown") or {}
-        if breakdown:
-            b = ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in breakdown.items())
-            lines.append(f"    Score breakdown: {b}")
+
+        lines.append("    -- Opportunity --")
+        lines.append(f"    Website present: {'Yes' if lead.get('website') else 'No'}")
         pain = lead.get("pain_points") or []
+        opp_cats = sorted({cat for cat, _ in pain}) if pain else []
+        lines.append(f"    Potential opportunity: {'/'.join(opp_cats) if opp_cats else 'General prospecting'}")
+        if lead.get("why_contact"):
+            lines.append(f"    Reason: {lead['why_contact']}")
         if pain:
             lines.append("    Pain points:")
             for cat, desc in pain:
                 lines.append(f"      - [{cat}] {desc}")
-        if lead.get("why_contact"):
-            lines.append(f"    Why contact: {lead['why_contact']}")
+
+        # Decision-maker guess, contact channels, tech stack, score breakdown —
+        # held back for masked sample leads, same as the Telegram/HTML output.
+        if not masked:
+            channels = lead.get("contact_channels") or {}
+            if channels:
+                lines.append("    Contact channels:")
+                for k, v in channels.items():
+                    lines.append(f"      - {k}: {v}")
+            tech = lead.get("tech_stack") or {}
+            if tech:
+                lines.append("    Tech stack detected:")
+                for tcategory, tools in tech.items():
+                    lines.append(f"      - {tcategory.replace('_', ' ')}: {', '.join(tools)}")
+            dm = lead.get("decision_maker") or {}
+            if dm.get("name"):
+                lines.append(f"    Decision-maker (best guess, confirm manually): {dm['name']} — {dm['title']}")
+            else:
+                lines.append("    Decision-maker: not confidently identified")
+            breakdown = lead.get("score_breakdown") or {}
+            if breakdown:
+                b = ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in breakdown.items())
+                lines.append(f"    Score breakdown: {b}")
         lines.append("")
 
     lines.append("=" * 60)
@@ -1090,7 +1209,7 @@ def export_txt(enriched, city, niche, review_cap, campaign):
 # [NEW] ── HTML version of the same report — actual clickable links, guaranteed
 # to work in any browser (unlike a .txt file, where clickability depends on
 # whatever app happens to open it). Open with your phone's browser, not Notes.
-def export_html(enriched, city, niche, review_cap, campaign):
+def export_html(enriched, city, niche, review_cap, campaign, sample_mode=False):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     export_dir = os.path.join(script_dir, "exports")
     os.makedirs(export_dir, exist_ok=True)
@@ -1098,48 +1217,78 @@ def export_html(enriched, city, niche, review_cap, campaign):
     ts = time.strftime("%Y%m%d_%H%M%S")
     safe_city = re.sub(r"[^a-zA-Z0-9]+", "_", city).strip("_") or "city"
     safe_niche = re.sub(r"[^a-zA-Z0-9]+", "_", niche).strip("_") or "niche"
-    filepath = os.path.join(export_dir, f"leads_{safe_niche}_{safe_city}_{ts}.html")
+    tag = "sample" if sample_mode else "full"
+    filepath = os.path.join(export_dir, f"leads_{safe_niche}_{safe_city}_{ts}_{tag}.html")
 
     e = html.escape
     cards = []
     for i, lead in enumerate(enriched, 1):
+        masked = bool(lead.get("_masked"))
         hot = " 🔥" if lead.get("score", 0) >= 70 else ""
-        rows = []
+        cat_label = CATEGORY_LABELS.get(lead.get("category"), "")
+        rows = [f'<div class="section-label">Prospect</div>']
         if lead.get("address"):
             rows.append(f"<div>📍 {e(lead['address'])}</div>")
+        rows.append(f"<div>🌐 Website: {'Yes' if lead.get('website') else 'No'}</div>")
+        booking = (lead.get("signals") or {}).get("has_booking")
+        rows.append(f"<div>📅 Booking: {'Detected' if booking else 'Not detected'}</div>")
         if lead.get("phone"):
-            tel = re.sub(r"[^\d+]", "", lead["phone"])
-            rows.append(f'<div>📱 <a href="tel:{tel}">{e(lead["phone"])}</a></div>')
+            if masked:
+                rows.append(f"<div>📱 {e(lead['phone'])}</div>")
+            else:
+                tel = re.sub(r"[^\d+]", "", lead["phone"])
+                rows.append(f'<div>📱 <a href="tel:{tel}">{e(lead["phone"])}</a></div>')
+        else:
+            rows.append("<div>📱 not publicly listed</div>")
         if lead.get("website"):
             rows.append(f'<div>🔗 <a href="{e(lead["website"])}" target="_blank">{e(lead["website"])}</a></div>')
-        if lead.get("rating"):
+        if lead.get("rating") or lead.get("reviews"):
             rev = lead.get("reviews", "")
-            rows.append(f"<div>⭐ {e(str(lead['rating']))}" + (f" ({rev} reviews)" if rev else "") + "</div>")
+            rows.append(f"<div>⭐ {e(str(lead.get('rating','')))}" + (f" ({rev} reviews)" if rev else "") + "</div>")
         if lead.get("email") and lead["email"] != "no email":
-            rows.append(f'<div>📧 <a href="mailto:{e(lead["email"])}">{e(lead["email"])}</a></div>')
-        channels = lead.get("contact_channels") or {}
-        for label, icon in [("whatsapp", "💬 WhatsApp"), ("messenger", "💬 Messenger"), ("linkedin", "💼 LinkedIn"), ("tiktok", "🎵 TikTok")]:
-            if channels.get(label):
-                rows.append(f'<div>{icon}: <a href="{e(channels[label])}" target="_blank">{e(channels[label])}</a></div>')
+            if masked:
+                rows.append(f"<div>📧 {e(lead['email'])}</div>")
+            else:
+                rows.append(f'<div>📧 <a href="mailto:{e(lead["email"])}">{e(lead["email"])}</a></div>')
+        else:
+            rows.append("<div>📧 not publicly available</div>")
         if lead.get("instagram_handle"):
             rows.append(f'<div>📸 <a href="https://instagram.com/{e(lead["instagram_handle"])}" target="_blank">@{e(lead["instagram_handle"])}</a></div>')
         if lead.get("facebook_page"):
             fb = lead["facebook_page"] if lead["facebook_page"].startswith("http") else "https://" + lead["facebook_page"]
             rows.append(f'<div>📘 <a href="{e(fb)}" target="_blank">Facebook</a></div>')
-        dm = lead.get("decision_maker") or {}
-        if dm.get("name"):
-            rows.append(f"<div>👤 {e(dm['name'])} ({e(dm['title'])}) — best guess, confirm manually</div>")
+
+        rows.append('<div class="section-label">Opportunity</div>')
+        rows.append(f"<div>Website present: {'Yes' if lead.get('website') else 'No'}</div>")
         pain = lead.get("pain_points") or []
+        opp_cats = sorted({cat for cat, _ in pain}) if pain else []
+        rows.append(f"<div>Potential opportunity: {e('/'.join(opp_cats)) if opp_cats else 'General prospecting'}</div>")
+        if lead.get("why_contact"):
+            rows.append(f"<div>Reason: {e(lead['why_contact'])}</div>")
         for cat, desc in pain:
             rows.append(f"<div>💡 [{e(cat)}] {e(desc)}</div>")
-        if lead.get("why_contact"):
-            rows.append(f"<div>✉️ {e(lead['why_contact'])}</div>")
 
+        if not masked:
+            channels = lead.get("contact_channels") or {}
+            for label, icon in [("whatsapp", "💬 WhatsApp"), ("messenger", "💬 Messenger"), ("linkedin", "💼 LinkedIn"), ("tiktok", "🎵 TikTok")]:
+                if channels.get(label):
+                    rows.append(f'<div>{icon}: <a href="{e(channels[label])}" target="_blank">{e(channels[label])}</a></div>')
+            dm = lead.get("decision_maker") or {}
+            if dm.get("name"):
+                rows.append(f"<div>👤 {e(dm['name'])} ({e(dm['title'])}) — best guess, confirm manually</div>")
+
+        badge = f' <span class="badge">{e(cat_label)}</span>' if cat_label else ""
         cards.append(f"""
         <div class="card">
-          <h3>{i}. {e(lead.get('name',''))}{hot} <span class="score">{lead.get('score',0)}/100</span></h3>
+          <h3>{i}. {e(lead.get('name',''))}{hot}{badge} <span class="score">{lead.get('score',0)}/100</span></h3>
           {''.join(rows)}
         </div>""")
+
+    sample_banner = (
+        '<div class="sample-banner">SAMPLE — a limited preview. Contact details are partially hidden; '
+        'the full batch includes complete phone/email and decision-maker info.</div>'
+        if sample_mode else ""
+    )
 
     doc = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1148,8 +1297,11 @@ def export_html(enriched, city, niche, review_cap, campaign):
   body {{ font-family: -apple-system, sans-serif; max-width: 700px; margin: 0 auto; padding: 16px; background: #f5f5f5; }}
   h1 {{ font-size: 20px; }}
   .meta {{ color: #666; font-size: 13px; margin-bottom: 20px; }}
+  .sample-banner {{ background: #fff3cd; border: 1px solid #ffe08a; color: #7a5c00; padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; }}
   .card {{ background: white; border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
   .card h3 {{ margin: 0 0 8px 0; font-size: 16px; }}
+  .badge {{ font-size: 11px; background: #eef2ff; color: #3949ab; padding: 2px 8px; border-radius: 999px; }}
+  .section-label {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: #888; margin-top: 8px; }}
   .score {{ float: right; font-size: 13px; color: #555; }}
   .card div {{ margin: 4px 0; font-size: 14px; word-break: break-word; }}
   a {{ color: #0a66c2; text-decoration: none; }}
@@ -1158,6 +1310,7 @@ def export_html(enriched, city, niche, review_cap, campaign):
 <body>
   <h1>{e(niche.title())} in {e(city.title())}</h1>
   <div class="meta">Campaign: {e(campaign)} · {len(enriched)} leads · Review cap: {review_cap if review_cap is not None else 'none'} · {time.strftime('%Y-%m-%d %H:%M')}</div>
+  {sample_banner}
   {''.join(cards)}
 </body></html>"""
 
@@ -1216,10 +1369,20 @@ def process_job(job):
     # [NEW] campaign — lets you compare "Miami Med Spas" vs "Dallas Med Spas" etc.
     campaign = job.get("campaign") or f"{niche.title()} — {city.title()}"
 
+    # [NEW] Sample mode: cap the outgoing batch to 10-20 leads and mask
+    # phone/email/decision-maker so this run can be handed to a prospective
+    # buyer as a free sample. Internal recording (record_lead_status /
+    # save_lastfind) still sees the full, unmasked scrape — only what gets
+    # SENT (Telegram batches + exports) is capped/masked. Set via the bot
+    # with /find ... sample, which puts job["sample_mode"] = True.
+    sample_mode = bool(job.get("sample_mode"))
+    sample_size = min(max(int(job.get("sample_size", 15) or 15), 10), 20) if sample_mode else None
+
     cap_txt = f"max {review_cap} reviews" if review_cap is not None else "no review cap"
-    send_telegram(chat_id, f"✅ Scraping {niche} in {city} (target: {count}, {cap_txt})...\n\nThis takes a few minutes. A browser window will open.")
+    mode_txt = f", SAMPLE mode ({sample_size} leads, contact info partially hidden)" if sample_mode else ""
+    send_telegram(chat_id, f"✅ Scraping {niche} in {city} (target: {count}, {cap_txt}{mode_txt})...\n\nThis takes a few minutes. A browser window will open.")
     print(f"\n{'='*50}")
-    print(f"JOB: {niche} in {city} (max {count}, review_cap={review_cap})")
+    print(f"JOB: {niche} in {city} (max {count}, review_cap={review_cap}, sample_mode={sample_mode})")
     print(f"{'='*50}")
 
     results = scrape_google_maps(city, niche, count, review_cap=review_cap)
@@ -1252,53 +1415,71 @@ def process_job(job):
             r["score"] = 40
             r["score_breakdown"] = {"no_website_opportunity": 40}
             r["why_contact"] = generate_why_contact(r, niche, r["pain_points"])
+        r["category"] = categorize_lead(r)  # [NEW] Website Needed / Website Opportunity / Fresh Prospect
         enriched.append(r)
-        record_lead_status(r, campaign, city, niche)  # [NEW]
+        record_lead_status(r, campaign, city, niche)  # [NEW] records the FULL unmasked lead, regardless of sample_mode
         time.sleep(0.5)
 
     enriched.sort(key=lambda x: x.get("score", 0), reverse=True)
+    save_lastfind(chat_id, enriched)  # [NEW] so /mark <n> <status> can find these leads — always the full set
+
+    # [NEW] What actually gets SENT (Telegram + exports) — the full sorted
+    # list normally, or a capped + masked subset in sample mode.
+    if sample_mode:
+        outgoing = [mask_lead_for_sample(lead) for lead in enriched[:sample_size]]
+    else:
+        outgoing = enriched
 
     batch_size = 5
-    total = len(enriched)
+    total = len(outgoing)
     for i in range(0, total, batch_size):
-        batch = enriched[i:i + batch_size]
-        header = f"📍 {html.escape(city.title())} {html.escape(niche.title())} — {i+1}-{min(i+batch_size, total)} of {total}\n\n"
+        batch = outgoing[i:i + batch_size]
+        header = f"📍 {html.escape(city.title())} {html.escape(niche.title())} — {i+1}-{min(i+batch_size, total)} of {total}"
+        header += " (SAMPLE)" if sample_mode else ""
+        header += "\n\n"
         msg = header + "\n\n".join(format_lead(lead, i + j + 1) for j, lead in enumerate(batch))
         send_telegram(chat_id, msg, parse_mode="HTML")
         time.sleep(1)
 
-    with_email = sum(1 for e in enriched if e.get("email") and e["email"] != "no email")
-    hot = sum(1 for e in enriched if e.get("score", 0) >= 70)
-    no_site = sum(1 for e in enriched if not e.get("website"))
+    with_email = sum(1 for e in outgoing if e.get("email") and e["email"] != "no email")
+    hot = sum(1 for e in outgoing if e.get("score", 0) >= 70)
+    by_category = {}
+    for lead in outgoing:
+        by_category[lead.get("category")] = by_category.get(lead.get("category"), 0) + 1
+    cat_summary = "\n".join(
+        f"   🏷️ {CATEGORY_LABELS.get(k, k)}: {v}" for k, v in by_category.items()
+    )
+    sample_note = f"\n   (Sample of {sample_size} from {len(enriched)} total scraped — full batch has complete contact info)" if sample_mode else ""
     summary = (
-        f"✅ Done! {total} leads checked — campaign: {campaign}\n"
+        f"✅ Done! {total} leads {'sent (sample)' if sample_mode else 'checked'} — campaign: {campaign}\n"
+        f"{cat_summary}\n"
         f"   📧 {with_email} have emails\n"
-        f"   🔥 {hot} scored 70+ (hot leads)\n"
-        f"   🌐 {no_site} have no website (opportunities!)\n\n"
+        f"   🔥 {hot} scored 70+ (hot leads){sample_note}\n\n"
         f"Sending your .txt report now..."
     )
     send_telegram(chat_id, summary)
 
-    save_lastfind(chat_id, enriched)  # [NEW] so /mark <n> <status> can find these leads
-
     # [NEW] Two versions of the report: .txt (plain, easy to copy/paste) and
-    # .html (real clickable links — open with your phone's browser, not Notes)
+    # .html (real clickable links — open with your phone's browser, not Notes).
+    # Both are built from `outgoing`, so sample mode caps/masks them too.
     try:
-        txt_path = export_txt(enriched, city, niche, review_cap, campaign)
-        send_telegram_document(chat_id, txt_path, caption=f"📄 Full report (.txt) — {niche} in {city} ({total} leads)")
+        txt_path = export_txt(outgoing, city, niche, review_cap, campaign, sample_mode=sample_mode)
+        cap = f"📄 {'Sample' if sample_mode else 'Full'} report (.txt) — {niche} in {city} ({total} leads)"
+        send_telegram_document(chat_id, txt_path, caption=cap)
         print(f"  ✅ .txt report saved and sent: {txt_path}")
     except Exception as e:
         print(f"  ⚠️ .txt export/send failed: {e}")
         send_telegram(chat_id, "⚠️ Couldn't generate the .txt report — check the daemon logs.")
 
     try:
-        html_path = export_html(enriched, city, niche, review_cap, campaign)
-        send_telegram_document(chat_id, html_path, caption=f"🔗 Full report (.html, clickable links) — open with your browser, not Notes")
+        html_path = export_html(outgoing, city, niche, review_cap, campaign, sample_mode=sample_mode)
+        cap = f"🔗 {'Sample' if sample_mode else 'Full'} report (.html, clickable links) — open with your browser, not Notes"
+        send_telegram_document(chat_id, html_path, caption=cap)
         print(f"  ✅ .html report saved and sent: {html_path}")
     except Exception as e:
         print(f"  ⚠️ .html export/send failed: {e}")
 
-    print(f"\n✅ Complete: {total} leads, {with_email} with email, {hot} hot, {no_site} no-website")
+    print(f"\n✅ Complete: {total} sent, {with_email} with email, {hot} hot ({len(enriched)} scraped total)")
 
 
 def main():

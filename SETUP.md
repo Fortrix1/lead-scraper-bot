@@ -190,6 +190,24 @@ In Telegram, send:
 /find Austin restaurant 20
 ```
 
+Every lead is now tagged with a category:
+- **Website Needed** — no website, or the website is dead/unreachable
+- **Website Opportunity** — has a working website but a real conversion or lead-response gap (no booking, no contact form, etc.)
+- **Fresh Prospect** — has a website with no obvious gap detected; a general prospect
+
+**Sample mode** — add `sample` to the end of `/find` to get a capped, privacy-safe run:
+```
+/find Austin restaurant 20 sample
+```
+This caps the outgoing batch to 10–20 leads (by score) and hides phone/email
+behind a partial mask (e.g. `(512) •••-••••`, `j•••@domain.com`), and holds
+back the decision-maker guess and extra contact channels. Everything else —
+name, city, reviews, website/booking status, socials, category, and the
+opportunity reasoning — is shown in full, since that's what proves the data
+is real. The full unmasked scrape is still recorded internally (`/leads`,
+`/campaigns`, `/mark`) regardless of sample mode; only what gets sent to
+Telegram and exported to .txt/.html is capped and masked.
+
 The bot posts the job to Redis. Your PC daemon picks it up, scrapes Google Maps headlessly, visits each website, and sends results back to Telegram in batches:
 
 ```

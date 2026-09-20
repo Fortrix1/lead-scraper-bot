@@ -693,11 +693,21 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK')
   }
 
-  // ── /find <city> <niche> [count] ──
+  // ── /find <city> <niche> [count] [sample] ──
   if (text.startsWith('/find')) {
-    const parts = text.split(' ').slice(1)
+    let parts = text.split(' ').slice(1)
     if (parts.length < 2) {
-      await send(chatId, 'Usage: /find <city> <niche> [count]\nExample: /find Austin restaurant 20\nExample: /find banana island lagos nigeria restaurants 30\n\nNiches: restaurant, food_truck, salon, gym, auto_repair, real_estate')
+      await send(chatId, 'Usage: /find <city> <niche> [count] [sample]\nExample: /find Austin restaurant 20\nExample: /find Austin restaurant 20 sample\nExample: /find banana island lagos nigeria restaurants 30\n\nNiches: restaurant, food_truck, salon, gym, auto_repair, real_estate\n\nAdd "sample" at the end for a capped, contact-info-masked run (10-20 leads) suitable to hand to a prospective buyer.')
+      return res.status(200).send('OK')
+    }
+    // [NEW] Trailing "sample" keyword — strip it off before parsing count/niche/city
+    let sampleMode = false
+    if (parts[parts.length - 1].toLowerCase() === 'sample') {
+      sampleMode = true
+      parts = parts.slice(0, -1)
+    }
+    if (parts.length < 2) {
+      await send(chatId, 'Usage: /find <city> <niche> [count] [sample]')
       return res.status(200).send('OK')
     }
     // [FIX] Parse from the end: last number = count, word before = niche, rest = city
@@ -709,7 +719,7 @@ module.exports = async (req, res) => {
       nicheIndex = parts.length - 2
     }
     if (nicheIndex < 1) {
-      await send(chatId, 'Usage: /find <city> <niche> [count]\nExample: /find Austin restaurant 20\nExample: /find banana island lagos nigeria restaurants 30')
+      await send(chatId, 'Usage: /find <city> <niche> [count] [sample]\nExample: /find Austin restaurant 20\nExample: /find banana island lagos nigeria restaurants 30')
       return res.status(200).send('OK')
     }
     const niche = parts[nicheIndex]
@@ -718,12 +728,12 @@ module.exports = async (req, res) => {
     // [NEW] Don't post the job yet — ask for the review cap first instead of
     // making the user edit REVIEW_THRESHOLD in the Python file.
     const q = await getUserQueue(userId)
-    q.pendingFindJob = { city, niche, count }
+    q.pendingFindJob = { city, niche, count, sampleMode }
     q.awaitingReviewCap = true
     await saveUserQueue(userId, q)
 
     await send(chatId,
-      `📍 ${niche} in ${city} (max ${count} results)\n\n` +
+      `📍 ${niche} in ${city} (max ${count} results${sampleMode ? ', SAMPLE mode' : ''})\n\n` +
       `What's the max review count you want to target?\n` +
       `I'll skip any business with MORE reviews than this — lower numbers ` +
       `bias toward newer/smaller businesses, higher numbers include more ` +
@@ -915,13 +925,15 @@ module.exports = async (req, res) => {
       }
       const jobPayload = JSON.stringify({
         chat_id: chatId, city: job.city, niche: job.niche,
-        count: job.count, review_cap: reviewCap
+        count: job.count, review_cap: reviewCap,
+        sample_mode: !!job.sampleMode  // [NEW] daemon caps to 10-20 + masks phone/email when true
       })
       await redis('RPUSH', 'jobs:find', jobPayload)
       const dispatched = await triggerGithubWorkflow()  // [NEW]
       await send(chatId,
         `✅ Job posted: ${job.niche} in ${job.city} (max ${job.count}` +
-        `${reviewCap ? `, review cap ${reviewCap}` : ', no review cap'})\n\n` +
+        `${reviewCap ? `, review cap ${reviewCap}` : ', no review cap'}` +
+        `${job.sampleMode ? ', SAMPLE mode' : ''})\n\n` +
         (dispatched
           ? `Triggered GitHub Actions immediately — should start within a minute or two.\n`
           : `Make sure maps_daemon.py is running on your PC, or wait for the next scheduled GitHub Actions run.\n`) +
