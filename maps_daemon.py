@@ -224,14 +224,17 @@ def safe_int(text, default=0):
 
 # ── Google Maps Scraping ──
 
-def scrape_google_maps(city, niche, max_results=30, review_cap=200):
+def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen=False):
     search_query = f"{niche} in {city}"
     results = []
     seen_names = set()
     seen_addresses = set()
     script_dir = os.path.dirname(os.path.abspath(__file__))
     cookie_path = os.path.join(script_dir, "gm_cookies.json")
-    # [FIX] GLOBAL dedup key — once a business is scraped, never show it again
+    # [FIX] GLOBAL dedup key — once a business is scraped, never show it again...
+    # [CHANGED] ...unless include_seen=True for this run (job["include_seen"]).
+    # The set is still updated either way, so a normal (non-include_seen) run
+    # right after will go back to skipping these.
     dedup_key = "seen_maps:global"
 
     # [NEW] Hard time budget for the whole scrape. If Google is showing a
@@ -577,14 +580,17 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200):
                     print(f"    ⏭️  High reviews: {data['name']} ({data['reviews']})")
                     continue
 
-                # [FIX] GLOBAL cross-search dedup — check Redis before adding
+                # [FIX] GLOBAL cross-search dedup — check Redis before adding,
+                # unless this run was told to include previously-seen leads.
                 dedup_id = f"{data['name'].lower().strip()}|{addr_key}"
-                if redis_sismember(dedup_key, dedup_id):
+                already_seen = redis_sismember(dedup_key, dedup_id)
+                if already_seen and not include_seen:
                     skipped_reasons["already_seen"] += 1
                     print(f"    ⏭️  Already seen (global): {data['name']}")
                     continue
 
                 data["dedup_id"] = dedup_id  # [NEW] carried through for status tracking
+                data["previously_seen"] = bool(already_seen)  # [NEW] so output can flag repeats
 
                 redis_sadd(dedup_key, dedup_id)
                 seen_names.add(data["name"].lower())
@@ -816,8 +822,14 @@ def categorize_lead(lead):
     if not lead.get("website") or lead.get("status") == "dead":
         return "website_needed"
     pain = lead.get("pain_points") or []
-    has_conversion_gap = any(cat in ("Conversion", "Lead-response") for cat, _ in pain)
-    return "website_opportunity" if has_conversion_gap else "fresh_prospect"
+    relevant = [cat for cat, _ in pain if cat in ("Conversion", "Lead-response")]
+    reviews = lead.get("reviews") or 0
+    # A single missing feature (e.g. just "no online booking") is normal for
+    # most small business sites, not a real opportunity signal. Only count it
+    # once there's a cluster of gaps, or real proven customer volume (reviews)
+    # sitting on top of a gap — that's what makes it worth pitching.
+    is_opportunity = len(relevant) >= 2 or (reviews >= 50 and len(relevant) >= 1)
+    return "website_opportunity" if is_opportunity else "fresh_prospect"
 
 
 # [NEW] ── Masking helpers for sample mode ──
@@ -1031,6 +1043,8 @@ def format_lead(lead, num):
     lines = [f"{num}. <b>{e(lead['name'])}</b>{hot}"]
     if cat_label:
         lines.append(f"   🏷️ {e(cat_label)}")
+    if lead.get("previously_seen"):
+        lines.append("   ♻️ Previously scraped")
 
     lines.append("   <u>Prospect</u>")
     if lead.get("address"):
@@ -1377,15 +1391,20 @@ def process_job(job):
     # with /find ... sample, which puts job["sample_mode"] = True.
     sample_mode = bool(job.get("sample_mode"))
     sample_size = min(max(int(job.get("sample_size", 15) or 15), 10), 20) if sample_mode else None
+    # [NEW] By default a run skips anything already in the global "seen"
+    # registry (seen_maps:global), so you always get a fresh set. Set via the
+    # bot with /find ... rescan to also include leads you've scraped before.
+    include_seen = bool(job.get("include_seen"))
 
     cap_txt = f"max {review_cap} reviews" if review_cap is not None else "no review cap"
     mode_txt = f", SAMPLE mode ({sample_size} leads, contact info partially hidden)" if sample_mode else ""
-    send_telegram(chat_id, f"✅ Scraping {niche} in {city} (target: {count}, {cap_txt}{mode_txt})...\n\nThis takes a few minutes. A browser window will open.")
+    seen_txt = ", including previously-seen businesses" if include_seen else ""
+    send_telegram(chat_id, f"✅ Scraping {niche} in {city} (target: {count}, {cap_txt}{mode_txt}{seen_txt})...\n\nThis takes a few minutes. A browser window will open.")
     print(f"\n{'='*50}")
-    print(f"JOB: {niche} in {city} (max {count}, review_cap={review_cap}, sample_mode={sample_mode})")
+    print(f"JOB: {niche} in {city} (max {count}, review_cap={review_cap}, sample_mode={sample_mode}, include_seen={include_seen})")
     print(f"{'='*50}")
 
-    results = scrape_google_maps(city, niche, count, review_cap=review_cap)
+    results = scrape_google_maps(city, niche, count, review_cap=review_cap, include_seen=include_seen)
 
     if not results:
         send_telegram(

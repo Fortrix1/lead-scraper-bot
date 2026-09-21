@@ -192,8 +192,14 @@ In Telegram, send:
 
 Every lead is now tagged with a category:
 - **Website Needed** — no website, or the website is dead/unreachable
-- **Website Opportunity** — has a working website but a real conversion or lead-response gap (no booking, no contact form, etc.)
-- **Fresh Prospect** — has a website with no obvious gap detected; a general prospect
+- **Website Opportunity** — has a website but a *real* gap: 2+ distinct issues detected (e.g. missing booking AND no contact form), or 50+ reviews (proven customer demand) plus at least one issue. A single missing feature like "no online booking" on its own isn't enough — that's normal for most small business sites, not a real signal.
+- **Fresh Prospect** — has a website with no significant gap detected; a general prospect
+
+**Fresh vs. repeat runs** — by default, `/find` never shows you a business you've already scraped before (tracked globally in Redis, across all cities/niches/campaigns). Add `rescan` to the end of the command to include previously-seen businesses in this run too:
+```
+/find Austin restaurant 20 rescan
+```
+Repeats are marked "♻️ Previously scraped" in the output so you can tell them apart. You can combine both flags in either order: `/find Austin restaurant 20 sample rescan`.
 
 **Sample mode** — add `sample` to the end of `/find` to get a capped, privacy-safe run:
 ```

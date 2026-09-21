@@ -693,21 +693,23 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK')
   }
 
-  // ── /find <city> <niche> [count] [sample] ──
+  // ── /find <city> <niche> [count] [sample] [rescan] ──
   if (text.startsWith('/find')) {
     let parts = text.split(' ').slice(1)
     if (parts.length < 2) {
-      await send(chatId, 'Usage: /find <city> <niche> [count] [sample]\nExample: /find Austin restaurant 20\nExample: /find Austin restaurant 20 sample\nExample: /find banana island lagos nigeria restaurants 30\n\nNiches: restaurant, food_truck, salon, gym, auto_repair, real_estate\n\nAdd "sample" at the end for a capped, contact-info-masked run (10-20 leads) suitable to hand to a prospective buyer.')
+      await send(chatId, 'Usage: /find <city> <niche> [count] [sample] [rescan]\nExample: /find Austin restaurant 20\nExample: /find Austin restaurant 20 sample\nExample: /find Austin restaurant 20 rescan\nExample: /find banana island lagos nigeria restaurants 30\n\nNiches: restaurant, food_truck, salon, gym, auto_repair, real_estate\n\n"sample" = capped, contact-info-masked run (10-20 leads) suitable to hand to a prospective buyer.\n"rescan" = also include businesses you\'ve already scraped before (normally skipped so every run is fresh).')
       return res.status(200).send('OK')
     }
-    // [NEW] Trailing "sample" keyword — strip it off before parsing count/niche/city
+    // [NEW] Trailing "sample"/"rescan" keywords, in any order — strip them off before parsing count/niche/city
     let sampleMode = false
-    if (parts[parts.length - 1].toLowerCase() === 'sample') {
-      sampleMode = true
-      parts = parts.slice(0, -1)
+    let includeSeen = false
+    while (parts.length && ['sample', 'rescan'].includes(parts[parts.length - 1].toLowerCase())) {
+      const flag = parts.pop().toLowerCase()
+      if (flag === 'sample') sampleMode = true
+      if (flag === 'rescan') includeSeen = true
     }
     if (parts.length < 2) {
-      await send(chatId, 'Usage: /find <city> <niche> [count] [sample]')
+      await send(chatId, 'Usage: /find <city> <niche> [count] [sample] [rescan]')
       return res.status(200).send('OK')
     }
     // [FIX] Parse from the end: last number = count, word before = niche, rest = city
@@ -719,7 +721,7 @@ module.exports = async (req, res) => {
       nicheIndex = parts.length - 2
     }
     if (nicheIndex < 1) {
-      await send(chatId, 'Usage: /find <city> <niche> [count] [sample]\nExample: /find Austin restaurant 20\nExample: /find banana island lagos nigeria restaurants 30')
+      await send(chatId, 'Usage: /find <city> <niche> [count] [sample] [rescan]\nExample: /find Austin restaurant 20\nExample: /find banana island lagos nigeria restaurants 30')
       return res.status(200).send('OK')
     }
     const niche = parts[nicheIndex]
@@ -728,12 +730,13 @@ module.exports = async (req, res) => {
     // [NEW] Don't post the job yet — ask for the review cap first instead of
     // making the user edit REVIEW_THRESHOLD in the Python file.
     const q = await getUserQueue(userId)
-    q.pendingFindJob = { city, niche, count, sampleMode }
+    q.pendingFindJob = { city, niche, count, sampleMode, includeSeen }
     q.awaitingReviewCap = true
     await saveUserQueue(userId, q)
 
+    const flagsTxt = [sampleMode ? 'SAMPLE mode' : null, includeSeen ? 'including previously-seen' : null].filter(Boolean).join(', ')
     await send(chatId,
-      `📍 ${niche} in ${city} (max ${count} results${sampleMode ? ', SAMPLE mode' : ''})\n\n` +
+      `📍 ${niche} in ${city} (max ${count} results${flagsTxt ? ', ' + flagsTxt : ''})\n\n` +
       `What's the max review count you want to target?\n` +
       `I'll skip any business with MORE reviews than this — lower numbers ` +
       `bias toward newer/smaller businesses, higher numbers include more ` +
@@ -926,14 +929,16 @@ module.exports = async (req, res) => {
       const jobPayload = JSON.stringify({
         chat_id: chatId, city: job.city, niche: job.niche,
         count: job.count, review_cap: reviewCap,
-        sample_mode: !!job.sampleMode  // [NEW] daemon caps to 10-20 + masks phone/email when true
+        sample_mode: !!job.sampleMode,   // [NEW] daemon caps to 10-20 + masks phone/email when true
+        include_seen: !!job.includeSeen  // [NEW] daemon includes previously-scraped businesses when true
       })
       await redis('RPUSH', 'jobs:find', jobPayload)
       const dispatched = await triggerGithubWorkflow()  // [NEW]
       await send(chatId,
         `✅ Job posted: ${job.niche} in ${job.city} (max ${job.count}` +
         `${reviewCap ? `, review cap ${reviewCap}` : ', no review cap'}` +
-        `${job.sampleMode ? ', SAMPLE mode' : ''})\n\n` +
+        `${job.sampleMode ? ', SAMPLE mode' : ''}` +
+        `${job.includeSeen ? ', including previously-seen' : ''})\n\n` +
         (dispatched
           ? `Triggered GitHub Actions immediately — should start within a minute or two.\n`
           : `Make sure maps_daemon.py is running on your PC, or wait for the next scheduled GitHub Actions run.\n`) +
