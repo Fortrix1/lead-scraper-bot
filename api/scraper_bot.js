@@ -299,12 +299,50 @@ module.exports = async (req, res) => {
     } catch (e) { return null }
   }
 
+  // [NEW] A store's real age = its EARLIEST certificate ever (including
+  // expired ones), not the "Not Before" of whichever cert crt.sh shows you
+  // first — that date is just when THAT cert renewed, which happens every
+  // ~90 days and has nothing to do with when the store launched. Only
+  // myshopify.com hosts qualify (age is meaningless for custom domains
+  // here), and since a store's birthday never changes, we cache it in
+  // Redis forever after the first lookup.
+  async function getStoreAgeDays(url) {
+    const host = url.replace(/^https?:\/\//, '').split('/')[0].toLowerCase()
+    if (!host.endsWith('.myshopify.com')) return null
+    const cacheKey = `age:${host}`
+    const { result: cached } = await redis('GET', cacheKey)
+    if (cached !== null && cached !== undefined) return JSON.parse(cached)
+    try {
+      const controller = new AbortController()
+      const t = setTimeout(() => controller.abort(), 6000)
+      const r = await fetch(`https://crt.sh/json?q=${encodeURIComponent(host)}`, {
+        signal: controller.signal, headers: { 'User-Agent': 'Mozilla/5.0' }
+      })
+      clearTimeout(t)
+      if (!r.ok) return null
+      const rows = await r.json()
+      let earliest = null
+      for (const row of rows || []) {
+        const nb = row.not_before ? Date.parse(row.not_before) : NaN
+        if (!isNaN(nb) && (earliest === null || nb < earliest)) earliest = nb
+      }
+      const age = earliest ? Math.floor((Date.now() - earliest) / 86400000) : null
+      if (age !== null) await redis('SET', cacheKey, JSON.stringify(age))
+      return age
+    } catch { return null }
+  }
+
   function scoreLead(r) {
     if (r.status !== 'OK') return { score: 0, reasons: [] }
     let score = 0
     const reasons = []
 
     if (r.sslValid === false) { score += 25; reasons.push('no SSL (http only)') }
+
+    if (typeof r.ageDays === 'number') {
+      if (r.ageDays <= 30) { score += 20; reasons.push(`brand-new store (${r.ageDays}d old)`) }
+      else if (r.ageDays <= 90) { score += 10; reasons.push(`new store (${r.ageDays}d old)`) }
+    }
 
     if (typeof r.loadSeconds === 'number') {
       if (r.loadSeconds >= 8) { score += 45; reasons.push(`very slow site (${r.loadSeconds.toFixed(1)}s load)`) }
@@ -342,7 +380,7 @@ module.exports = async (req, res) => {
     const result = {
       url, store_name: '', email: 'no email', email_is_generic: false,
       contact_page: '', store_type: '', socials: {}, status: 'dead',
-      sslValid: null, loadSeconds: null, score: 0, scoreReasons: [],
+      sslValid: null, loadSeconds: null, ageDays: null, score: 0, scoreReasons: [],
       isPasswordProtected: false
     }
     try {
@@ -357,6 +395,7 @@ module.exports = async (req, res) => {
       result.status = 'OK'
       result.sslValid = url.startsWith('https://')
       const speedPromise = getSpeedIndexSeconds(url)
+      const agePromise = getStoreAgeDays(url)
       const html = await r.text()
 
       if (html.includes('myshopify.com') || html.includes('cdn.shopify.com')) result.store_type = 'Shopify'
@@ -408,6 +447,7 @@ module.exports = async (req, res) => {
       }
 
       result.loadSeconds = await speedPromise
+      result.ageDays = await agePromise
     } catch (e) {}
 
     const { score, reasons } = scoreLead(result)
@@ -574,9 +614,10 @@ module.exports = async (req, res) => {
       const emailNote = r.email !== 'no email' ? `\n    📧 ${r.email}${genericNote}` : ''
       const hotTag = r.score >= 70 ? ' 🔥' : ''
       const scoreNote = `\n    📊 score: ${r.score}${hotTag}` + (r.scoreReasons?.length ? ` (${r.scoreReasons.join(', ')})` : '')
+      const ageNote = (typeof r.ageDays === 'number') ? `\n    🎂 age: ${r.ageDays}d${r.ageDays <= 30 ? ' 🔥' : ''}` : ''
       const hook = auditHookLine(r)
       const hookNote = hook ? `\n    💡 ${hook}` : ''
-      reply += `\n\n${leadNum}. ${nameLine}${scoreNote}${hookNote}${socialsNote}${contactNote}${emailNote}`
+      reply += `\n\n${leadNum}. ${nameLine}${scoreNote}${ageNote}${hookNote}${socialsNote}${contactNote}${emailNote}`
     })
 
     if (remaining > 0) {
@@ -680,6 +721,7 @@ module.exports = async (req, res) => {
       `Commands:\n` +
       `🔍 /scout — search URLScan.io for Shopify leads\n` +
       `🗺️ /find <city> <niche> [count] — scrape Google Maps (runs on your PC, sends a .txt report)\n` +
+      `🌱 /fresh [age_days] [count] — brand-new Shopify stores from crt.sh (default: ≤30 days, top 15)\n` +
       `📋 /campaigns — see all your campaigns (e.g. "Med Spa — Miami") and lead counts\n` +
       `📂 /leads <status> — list leads by status: ${LEAD_STATUSES.join(', ')}\n` +
       `✅ /mark <number> <status> — mark lead #N from your last report (e.g. /mark 3 contacted)\n` +
@@ -743,6 +785,24 @@ module.exports = async (req, res) => {
       `established ones too.\n\n` +
       `Reply with a number (e.g. 200), or "skip" for no limit.`
     )
+    return res.status(200).send('OK')
+  }
+
+  // ── [NEW] /fresh [age_days] [count] — brand-new Shopify stores from crt.sh ──
+  // Runs in the daemon (Python), because crt.sh sweeps are heavy and Vercel's
+  // timeout would kill them. Unlike browsing crt.sh directly, this dedupes
+  // every cert down to one row per store and only reports stores whose
+  // FIRST-EVER certificate is recent — not just a renewed one.
+  if (text.startsWith('/fresh')) {
+    const nums = text.split(' ').slice(1).map(p => parseInt(p)).filter(n => !isNaN(n) && n > 0)
+    const maxAge = Math.min(nums[0] || 30, 90)
+    const count  = Math.min(nums[1] || 15, 30)
+    await redis('RPUSH', 'jobs:find', JSON.stringify({ type: 'fresh', chat_id: chatId, max_age_days: maxAge, count }))
+    const dispatched = await triggerGithubWorkflow()
+    await send(chatId,
+      `🌱 Fresh-store job posted: stores whose FIRST-EVER certificate is ≤ ${maxAge} days old, top ${count} reported.\n` +
+      (dispatched ? 'Triggered GitHub Actions — starting within a minute or two.' : 'Waiting for the next scheduled daemon run (or run maps_daemon.py locally).') +
+      `\n\nThis dedupes everything and only shows genuinely NEW stores — unlike the crt.sh website, which shows every cert renewal of every old store.`)
     return res.status(200).send('OK')
   }
 

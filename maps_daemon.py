@@ -6,6 +6,8 @@ import json
 import time
 import re
 import html
+import random
+from datetime import datetime, timezone
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -1501,6 +1503,187 @@ def process_job(job):
     print(f"\n✅ Complete: {total} sent, {with_email} with email, {hot} hot ({len(enriched)} scraped total)")
 
 
+# ══════════════════════════════════════════════════════════════
+#  FRESH SHOPIFY STORES via crt.sh
+#  Sweeps crt.sh for *.myshopify.com certs, then for each candidate
+#  domain pulls its FULL cert history (expired included) to find the
+#  true first-ever certificate — that's the store's real birthday,
+#  since a single cert renewal (which happens every ~90 days) is not
+#  a reliable signal of a new store on its own.
+# ══════════════════════════════════════════════════════════════
+
+CRTSH_INFRA_LABELS = {
+    "shops", "shops-gclb", "shops-glb", "app-proxy-internal", "app-proxy",
+    "admin", "api", "app", "www", "cdn", "cdn2", "static", "assets",
+    "email", "help", "status", "widgets", "accounts", "auth", "monorail",
+}
+STORE_DOMAIN_RE = re.compile(r"^([a-z0-9][a-z0-9-]{0,61})\.myshopify\.com$")
+
+def extract_store_domains(name_value):
+    out = set()
+    for raw in str(name_value or "").split("\n"):
+        d = raw.strip().lower().lstrip("*").lstrip(".")
+        m = STORE_DOMAIN_RE.match(d)
+        if m and m.group(1) not in CRTSH_INFRA_LABELS:
+            out.add(d)
+    return out
+
+def crtsh_json(session, params, timeout=90, tries=3):
+    # 504s/timeouts are NORMAL on crt.sh — retry with backoff, skip if dead
+    for i in range(tries):
+        try:
+            r = session.get("https://crt.sh/json", params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        time.sleep(8 * (i + 1))
+    return None
+
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def sweep_candidates(session, max_sweep_seconds=480):
+    """Letter-sliced sweep with exclude=expired (keeps responses survivable).
+    Returns candidate stores — a MIX of new stores and old stores that
+    recently renewed. True age gets checked separately."""
+    letters = list("abcdefghijklmnopqrstuvwxyz0123456789")
+    random.shuffle(letters)
+    candidates = set()
+    t0 = time.time()
+    for ch in letters:
+        if time.time() - t0 > max_sweep_seconds:
+            print(f"  ⏱️ Sweep budget hit at letter '{ch}'")
+            break
+        data = crtsh_json(session, {"q": f"{ch}%.myshopify.com", "exclude": "expired"})
+        if not data:
+            print(f"  crt.sh: '{ch}' slice failed — skipping")
+            continue
+        for row in data:
+            candidates.update(extract_store_domains(row.get("name_value", "")))
+        print(f"  letter '{ch}': {len(candidates)} candidates so far")
+        time.sleep(3)
+    return sorted(candidates)
+
+def store_first_cert(session, domain):
+    """Earliest cert EVER for this exact domain (expired included) = true birthday."""
+    data = crtsh_json(session, {"q": domain}, timeout=45, tries=2)
+    earliest = None
+    for row in (data or []):
+        t = parse_ts(row.get("not_before", ""))
+        if t and (earliest is None or t < earliest):
+            earliest = t
+    return earliest
+
+def quick_store_check(domain):
+    """Live store / locked 'coming soon' / dead? Also catches the custom
+    domain most stores point to within days of launching."""
+    out = {"status": "dead", "custom_domain": "", "title": "", "email": "", "socials": {}}
+    try:
+        r = requests.get(f"https://{domain}",
+                         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                         timeout=12, allow_redirects=True)
+        final_host = r.url.split("/")[2].lower() if "://" in r.url else ""
+        if final_host and final_host != domain and not final_host.endswith(".myshopify.com"):
+            out["custom_domain"] = final_host
+        text = r.text
+        if r.status_code in (401, 403) or "/password" in r.url or \
+           "shopify-section-password" in text or "opening soon" in text.lower() or \
+           re.search(r"this store (is currently|will be back)", text, re.I):
+            out["status"] = "locked"
+            return out
+        if r.status_code == 200:
+            out["status"] = "live"
+            m = re.search(r"<title[^>]*>([^<]+)</title>", text, re.I)
+            if m:
+                out["title"] = html.unescape(m.group(1)).split("|")[0].split("–")[0].strip()[:60]
+            emails = clean_emails(text)
+            if emails:
+                out["email"] = best_email(emails)
+            out["socials"] = extract_socials(text)
+    except Exception as e:
+        print(f"    check failed: {e}")
+    return out
+
+def run_fresh_stores(job):
+    chat_id = str(job.get("chat_id", ""))
+    max_age = int(job.get("max_age_days", 30))
+    want = int(job.get("count", 15))
+    MAX_AGE_CHECKS = 200   # hard cap so the run always fits the 30-min Actions window
+
+    send_telegram(chat_id,
+        f"🌱 Fresh-store job started — sweeping crt.sh, then checking each store's "
+        f"FIRST-EVER certificate (true age ≤ {max_age} days).\n"
+        f"This takes 15–25 minutes. Results land here in batches.")
+
+    session = make_session()
+    candidates = sweep_candidates(session)
+    send_telegram(chat_id, f"🔎 Sweep done: {len(candidates)} candidates to age-check.")
+    if not candidates:
+        return
+
+    fresh, checks = [], 0
+    for d in candidates:
+        if len(fresh) >= want * 3 or checks >= MAX_AGE_CHECKS:
+            break
+        if redis_sismember("fresh:processed", d):
+            continue
+        checks += 1
+        first = store_first_cert(session, d)
+        redis_sadd("fresh:processed", d)   # never age-check the same store twice
+        if first:
+            age_days = (datetime.now(timezone.utc) - first).days
+            if age_days <= max_age:
+                info = quick_store_check(d)
+                info.update({"domain": d, "age_days": age_days,
+                             "first_cert": first.strftime("%Y-%m-%d")})
+                fresh.append(info)
+                print(f"  🌱 {d} — {age_days}d old — {info['status']}")
+        time.sleep(2)
+
+    if not fresh:
+        send_telegram(chat_id,
+            f"Checked {checks} candidates — none ≤ {max_age} days old this run. "
+            f"New certs appear daily; try again tomorrow, or raise the age: /fresh 60")
+        return
+
+    for bstart in range(0, len(fresh), 10):
+        chunk = fresh[bstart:bstart + 10]
+        lines = [f"🌱 FRESH SHOPIFY STORES — batch {bstart // 10 + 1}"]
+        for i, s in enumerate(chunk, 1):
+            icon = {"live": "🟢", "locked": "🔒", "dead": "💀"}.get(s["status"], "❔")
+            lines.append(f"\n{i}. {s['domain']} {icon}")
+            lines.append(f"   🎂 First cert: {s['first_cert']} ({s['age_days']} days old)")
+            if s.get("custom_domain"):
+                lines.append(f"   🌐 Custom domain: {s['custom_domain']}")
+            if s.get("title"):
+                lines.append(f"   🏷️ {s['title']}")
+            if s.get("socials"):
+                lines.append("   📱 " + ", ".join(f"{k}: {v}" for k, v in list(s["socials"].items())[:3]))
+            if s.get("email"):
+                lines.append(f"   📧 {s['email']}")
+            lines.append(f"   🔗 https://{s['domain']}")
+            if s["status"] == "locked":
+                lines.append("   💡 'Coming soon' store — pitch them at launch")
+        send_telegram(chat_id, "\n".join(lines))
+
+    send_telegram(chat_id, "Next: run the 🟢/🔒 ones through FB Ad Library — new store + active ads = has budget.")
+
+
+# [NEW] Dispatches a job popped off Redis to the right handler based on
+# its "type" field. Jobs with no "type" (or type == "find") are the
+# existing Google-Maps /find flow; type == "fresh" is the new crt.sh sweep.
+def handle_job(job):
+    job_type = job.get("type", "find")
+    if job_type == "fresh":
+        run_fresh_stores(job)
+    else:
+        process_job(job)
+
+
 def main():
     print("╔═══════════════════════════════════════╗")
     print("║     Maps Daemon — Karios Agency       ║")
@@ -1516,7 +1699,7 @@ def main():
             result = redis("LPOP", "jobs:find")
             if result:
                 job = json.loads(result)
-                process_job(job)
+                handle_job(job)
             else:
                 print("No job waiting. Exiting.")
         except Exception as e:
@@ -1532,7 +1715,7 @@ def main():
             result = redis("LPOP", "jobs:find")
             if result:
                 job = json.loads(result)
-                process_job(job)
+                handle_job(job)
             else:
                 time.sleep(3)
         except KeyboardInterrupt:

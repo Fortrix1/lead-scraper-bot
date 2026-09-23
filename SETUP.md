@@ -232,6 +232,20 @@ The bot posts the job to Redis. Your PC daemon picks it up, scrapes Google Maps 
 2. ...
 ```
 
+### Fresh Shopify Stores (crt.sh)
+
+In Telegram, send:
+```
+/fresh 30 15
+```
+`30` = max store age in days (default 30, capped at 90), `15` = how many to report (default 15, capped at 30).
+
+This sweeps crt.sh for every `*.myshopify.com` certificate, then for each candidate domain pulls its **full certificate history** (expired included) to find the store's true first-ever certificate — that's its real birthday. A single renewed cert (which happens every ~90 days via Let's Encrypt) is not treated as a new store; only stores whose *earliest* cert is within the age window get reported. Runs in the daemon, not on Vercel — a full sweep takes 15–25 minutes, so it's a slow command, not an instant one.
+
+Each store is age-checked once ever (`fresh:processed` in Redis), so re-running `/fresh` daily gets progressively faster and never re-checks the same domain twice. Results include status (🟢 live / 🔒 locked "coming soon" / 💀 dead), the store's custom domain if it's moved off `*.myshopify.com`, title, socials, and email when available.
+
+Separately, `/scout` results are now tagged with store age too (`🎂 age: 12d 🔥`), pulled from the same crt.sh lookup and cached forever per domain, so you don't need to run `/fresh` just to see how old a store you already found is.
+
 ### URLScan Scraping
 
 Send `/scout` in Telegram → pick a search → reply with how many leads → choose whether to include locked stores.
@@ -251,6 +265,7 @@ Send a `.txt` file with one URL per line. The bot extracts, dedupes, and checks 
 | `/start` | Show help |
 | `/scout` | URLScan.io search menu |
 | `/find <city> <niche> [count]` | Scrape Google Maps (asks for a review cap, then runs the daemon) |
+| `/fresh [age_days] [count]` | Brand-new Shopify stores via crt.sh (default: ≤30 days, top 15) |
 | `/campaigns` | List campaigns and how many leads each has |
 | `/leads <status>` | List leads by status: new, contacted, replied, interested, not_interested, do_not_contact, client |
 | `/mark <number> <status>` | Mark lead #N from your last /find report with a status |
