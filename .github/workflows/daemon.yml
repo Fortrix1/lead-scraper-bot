@@ -1,23 +1,18 @@
 name: Maps Daemon (scheduled)
 
-# [NEW] Runs the daemon on GitHub's free compute instead of your PC or a paid server.
-# Free minutes are UNLIMITED on a public repo — that's why the repo needs to stay public.
-#
-# How it works: every 10 minutes, GitHub spins up a fresh temporary Linux machine,
-# checks Redis for one waiting /find job, runs it if there is one (which can take
-# several minutes for a big job), then throws the machine away. Nothing persists
-# between runs except what's stored in Redis and in GitHub Secrets.
+# Runs the daemon on GitHub's free compute. Every 10 minutes a fresh
+# throwaway machine: checks Redis for one /find job — if none, it may
+# run ONE fresh-store "tick" (one crt.sh letter-slice + a batch of
+# age-checks). Nothing persists between runs except Redis.
 
 on:
   schedule:
-    # [CHANGED] Offset from the round 10-minute marks (:00, :10, :20...) —
-    # those are GitHub's busiest moments and most prone to delay. Firing a
-    # few minutes off that beat tends to get picked up faster.
+    # Offset from the round 10-minute marks — those are GitHub's busiest
+    # moments and most prone to delay.
     - cron: "4,14,24,34,44,54 * * * *"
-  workflow_dispatch: {}       # lets you trigger a run manually from the Actions tab, for testing
+  workflow_dispatch: {}       # manual trigger from the Actions tab, for testing
 
-# Only one run at a time — if a run is still going when the next trigger fires,
-# the new one waits in queue instead of starting a second browser in parallel.
+# Only one run at a time.
 concurrency:
   group: maps-daemon
   cancel-in-progress: false
@@ -25,11 +20,18 @@ concurrency:
 jobs:
   run-daemon:
     runs-on: ubuntu-latest
-    timeout-minutes: 30   # safety cap so a stuck run doesn't burn free minutes forever
+    timeout-minutes: 30   # safety cap
 
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+
+      # One-line verdict on whether crt.sh answers this run's IP at all.
+      # 200 = fine. 504/timeout = heavy load, retries will cope.
+      # 403 = hard IP block -> add a CRTSH_RELAY_URL secret (Cloudflare
+      # Worker relay) and everything routes through it automatically.
+      - name: Probe crt.sh from this IP
+        run: curl -s -o /dev/null -w "crt.sh says HTTP %{http_code}\n" --max-time 25 "https://crt.sh/json?q=shops.myshopify.com"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -46,8 +48,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
       - name: Restore Google Maps cookies from secret
-        # This file is written fresh on every run and is NEVER committed —
-        # it only exists on this throwaway machine for the duration of the run.
+        # Written fresh every run, never committed.
         run: echo '${{ secrets.GM_COOKIES_JSON }}' > gm_cookies.json
 
       - name: Run the daemon (single pass)
@@ -55,5 +56,8 @@ jobs:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
           SCRAPER_BOT_TOKEN: ${{ secrets.SCRAPER_BOT_TOKEN }}
+          # Optional: only needed if the probe above shows 403.
+          # When set, ALL crt.sh traffic goes through your relay instead.
+          CRTSH_RELAY_URL: ${{ secrets.CRTSH_RELAY_URL }}
           RUN_MODE: once
         run: xvfb-run --auto-servernum python3 maps_daemon.py
