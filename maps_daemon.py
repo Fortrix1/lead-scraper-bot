@@ -1376,14 +1376,18 @@ def maybe_fresh_tick():
     25 minutes, driven by the config /fresh sets in Redis."""
     cfg_raw = redis_get("fresh:config")
     if not cfg_raw:
+        print("  fresh:config not set in Redis — send /fresh <age_days> <count> in Telegram to turn monitoring on.")
         return
     try:
         cfg = json.loads(cfg_raw)
-    except Exception:
+    except Exception as e:
+        print(f"  fresh:config exists but isn't valid JSON ({e}) — send /fresh again to reset it.")
         return
     got = redis("SET", "fresh:tick:lock", "1", "NX", "EX", "1500")
     if not got or got != "OK":
+        print("  A fresh-store tick already ran in the last 25 minutes — skipping this run (lock held).")
         return
+    print(f"  fresh:config found: max_age_days={cfg.get('max_age_days')}, count={cfg.get('count')}, chat_id={cfg.get('chat_id')} — running tick...")
     try:
         run_fresh_tick(cfg)
     except Exception as e:
