@@ -1,5 +1,6 @@
 // api/scraper_bot.js
 // Personal Telegram lead-scraper bot — hosted on Vercel
+// v4: admin lock, audit log, /fresh as automatic tick switch, relay-aware age lookups
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*')
@@ -9,9 +10,13 @@ module.exports = async (req, res) => {
   const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL   || ''
   const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || ''
 
-  // [NEW] Optional — lets a /find job trigger the GitHub Actions daemon
-  // immediately instead of waiting for the next scheduled cron tick.
-  // Needs a PAT with "workflow" scope, added as a Vercel env var (see SETUP.md).
+  // Only this Telegram user ID may use the bot. Set SCRAPER_ADMIN_ID in Vercel.
+  const ADMIN_ID = process.env.SCRAPER_ADMIN_ID || ''
+
+  // Optional crt.sh relay (Cloudflare Worker) for when Vercel's IPs get blocked.
+  const CRTSH_BASE = process.env.CRTSH_RELAY_URL || 'https://crt.sh/json'
+
+  // Optional — lets a /find job trigger the GitHub Actions daemon immediately.
   const GITHUB_DISPATCH_TOKEN = process.env.GITHUB_DISPATCH_TOKEN || ''
   const GITHUB_OWNER = process.env.GITHUB_OWNER || ''
   const GITHUB_REPO  = process.env.GITHUB_REPO  || ''
@@ -28,7 +33,6 @@ module.exports = async (req, res) => {
     '5': { label: 'Fashion/clothing niche',             query: 'page.domain:myshopify.com AND page.title:(fashion OR clothing OR apparel)' },
   }
 
-  // [NEW] Lead lifecycle statuses — set with /mark, browsed with /leads
   const LEAD_STATUSES = ['new', 'contacted', 'replied', 'interested', 'not_interested', 'do_not_contact', 'client']
 
   let body = req.body
@@ -72,9 +76,6 @@ module.exports = async (req, res) => {
   }
 
   // ── Redis ──
-  // [NEW] Tell GitHub "run the daemon now" instead of waiting for the next
-  // scheduled cron tick. Best-effort — if this fails or isn't configured,
-  // the scheduled run will still pick the job up eventually, just slower.
   async function triggerGithubWorkflow() {
     if (!GITHUB_DISPATCH_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) {
       console.log('GitHub dispatch not configured — skipping, cron will catch it')
@@ -299,35 +300,38 @@ module.exports = async (req, res) => {
     } catch (e) { return null }
   }
 
-  // [NEW] A store's real age = its EARLIEST certificate ever (including
-  // expired ones), not the "Not Before" of whichever cert crt.sh shows you
-  // first — that date is just when THAT cert renewed, which happens every
-  // ~90 days and has nothing to do with when the store launched. Only
-  // myshopify.com hosts qualify (age is meaningless for custom domains
-  // here), and since a store's birthday never changes, we cache it in
-  // Redis forever after the first lookup.
+  // A store's real age = its EARLIEST certificate ever (including expired
+  // ones) — not the "Not Before" of whichever cert crt.sh shows first, which
+  // is just the latest ~90-day renewal. Only myshopify.com hosts qualify,
+  // and since a store's birthday never changes we cache it in Redis forever.
+  // Failures are cached for 6h (-1) so a flaky crt.sh doesn't stall every
+  // future batch on the same domain. Uses CRTSH_RELAY_URL when set.
   async function getStoreAgeDays(url) {
     const host = url.replace(/^https?:\/\//, '').split('/')[0].toLowerCase()
     if (!host.endsWith('.myshopify.com')) return null
     const cacheKey = `age:${host}`
     const { result: cached } = await redis('GET', cacheKey)
-    if (cached !== null && cached !== undefined) return JSON.parse(cached)
+    if (cached !== null && cached !== undefined) {
+      const v = JSON.parse(cached)
+      return v === -1 ? null : v
+    }
     try {
       const controller = new AbortController()
       const t = setTimeout(() => controller.abort(), 6000)
-      const r = await fetch(`https://crt.sh/json?q=${encodeURIComponent(host)}`, {
+      const r = await fetch(`${CRTSH_BASE}?q=${encodeURIComponent(host)}`, {
         signal: controller.signal, headers: { 'User-Agent': 'Mozilla/5.0' }
       })
       clearTimeout(t)
-      if (!r.ok) return null
+      if (!r.ok) { await redis('SET', cacheKey, '-1', 'EX', 21600); return null }
       const rows = await r.json()
       let earliest = null
       for (const row of rows || []) {
         const nb = row.not_before ? Date.parse(row.not_before) : NaN
         if (!isNaN(nb) && (earliest === null || nb < earliest)) earliest = nb
       }
-      const age = earliest ? Math.floor((Date.now() - earliest) / 86400000) : null
-      if (age !== null) await redis('SET', cacheKey, JSON.stringify(age))
+      if (earliest === null) { await redis('SET', cacheKey, '-1', 'EX', 21600); return null }
+      const age = Math.floor((Date.now() - earliest) / 86400000)
+      await redis('SET', cacheKey, JSON.stringify(age))
       return age
     } catch { return null }
   }
@@ -657,6 +661,16 @@ module.exports = async (req, res) => {
 
     await answerCallback(cbId)
 
+    // Audit log
+    await redis('RPUSH', 'audit:commands', JSON.stringify({ ts: new Date().toISOString(), user: cbUserId, text: '/cb ' + data.slice(0, 90) }))
+    await redis('LTRIM', 'audit:commands', 0, 499)
+
+    // Admin lock
+    if (ADMIN_ID && cbUserId !== ADMIN_ID) {
+      await send(cbChatId, 'Private bot.')
+      return res.status(200).send('OK')
+    }
+
     const cbLocked = await acquireLock(cbUserId)
     if (!cbLocked) return res.status(200).send('OK')
 
@@ -714,6 +728,16 @@ module.exports = async (req, res) => {
   const text   = (msg.text || '').trim()
   const doc    = msg.document
 
+  // Audit log — every command ever sent, who sent it, when.
+  await redis('RPUSH', 'audit:commands', JSON.stringify({ ts: new Date().toISOString(), user: userId, text: text.slice(0, 100) }))
+  await redis('LTRIM', 'audit:commands', 0, 499)
+
+  // Admin lock — strangers get nothing.
+  if (ADMIN_ID && userId !== ADMIN_ID) {
+    await send(chatId, 'Private bot.')
+    return res.status(200).send('OK')
+  }
+
   // ── /start ──
   if (text.startsWith('/start')) {
     await send(chatId,
@@ -721,7 +745,8 @@ module.exports = async (req, res) => {
       `Commands:\n` +
       `🔍 /scout — search URLScan.io for Shopify leads\n` +
       `🗺️ /find <city> <niche> [count] — scrape Google Maps (runs on your PC, sends a .txt report)\n` +
-      `🌱 /fresh [age_days] [count] — brand-new Shopify stores from crt.sh (default: ≤30 days, top 15)\n` +
+      `🌱 /fresh [age_days] [count] — turn ON new-Shopify-store monitoring via crt.sh (automatic ticks)\n` +
+      `🛑 /freshoff — stop fresh-store monitoring\n` +
       `📋 /campaigns — see all your campaigns (e.g. "Med Spa — Miami") and lead counts\n` +
       `📂 /leads <status> — list leads by status: ${LEAD_STATUSES.join(', ')}\n` +
       `✅ /mark <number> <status> — mark lead #N from your last report (e.g. /mark 3 contacted)\n` +
@@ -742,7 +767,6 @@ module.exports = async (req, res) => {
       await send(chatId, 'Usage: /find <city> <niche> [count] [sample] [rescan]\nExample: /find Austin restaurant 20\nExample: /find Austin restaurant 20 sample\nExample: /find Austin restaurant 20 rescan\nExample: /find banana island lagos nigeria restaurants 30\n\nNiches: restaurant, food_truck, salon, gym, auto_repair, real_estate\n\n"sample" = capped, contact-info-masked run (10-20 leads) suitable to hand to a prospective buyer.\n"rescan" = also include businesses you\'ve already scraped before (normally skipped so every run is fresh).')
       return res.status(200).send('OK')
     }
-    // [NEW] Trailing "sample"/"rescan" keywords, in any order — strip them off before parsing count/niche/city
     let sampleMode = false
     let includeSeen = false
     while (parts.length && ['sample', 'rescan'].includes(parts[parts.length - 1].toLowerCase())) {
@@ -754,7 +778,6 @@ module.exports = async (req, res) => {
       await send(chatId, 'Usage: /find <city> <niche> [count] [sample] [rescan]')
       return res.status(200).send('OK')
     }
-    // [FIX] Parse from the end: last number = count, word before = niche, rest = city
     let count = 20
     let nicheIndex = parts.length - 1
     const lastNum = parseInt(parts[parts.length - 1])
@@ -769,8 +792,6 @@ module.exports = async (req, res) => {
     const niche = parts[nicheIndex]
     const city = parts.slice(0, nicheIndex).join(' ')
 
-    // [NEW] Don't post the job yet — ask for the review cap first instead of
-    // making the user edit REVIEW_THRESHOLD in the Python file.
     const q = await getUserQueue(userId)
     q.pendingFindJob = { city, niche, count, sampleMode, includeSeen }
     q.awaitingReviewCap = true
@@ -788,25 +809,32 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK')
   }
 
-  // ── [NEW] /fresh [age_days] [count] — brand-new Shopify stores from crt.sh ──
-  // Runs in the daemon (Python), because crt.sh sweeps are heavy and Vercel's
-  // timeout would kill them. Unlike browsing crt.sh directly, this dedupes
-  // every cert down to one row per store and only reports stores whose
-  // FIRST-EVER certificate is recent — not just a renewed one.
+  // ── /fresh [age_days] [count] — turn ON fresh-store monitoring ──
+  // No job is posted. It sets a config in Redis; every daemon run with an
+  // empty queue runs one "tick": one crt.sh letter-slice + a batch of
+  // age-checks. Full alphabet covered in about a day, all deduped, all
+  // spread across cron runs so no single run looks like a burst to crt.sh.
   if (text.startsWith('/fresh')) {
     const nums = text.split(' ').slice(1).map(p => parseInt(p)).filter(n => !isNaN(n) && n > 0)
     const maxAge = Math.min(nums[0] || 30, 90)
     const count  = Math.min(nums[1] || 15, 30)
-    await redis('RPUSH', 'jobs:find', JSON.stringify({ type: 'fresh', chat_id: chatId, max_age_days: maxAge, count }))
+    await redis('SET', 'fresh:config', JSON.stringify({ chat_id: String(chatId), max_age_days: maxAge, count }), 'EX', 14 * 86400)
     const dispatched = await triggerGithubWorkflow()
     await send(chatId,
-      `🌱 Fresh-store job posted: stores whose FIRST-EVER certificate is ≤ ${maxAge} days old, top ${count} reported.\n` +
-      (dispatched ? 'Triggered GitHub Actions — starting within a minute or two.' : 'Waiting for the next scheduled daemon run (or run maps_daemon.py locally).') +
-      `\n\nThis dedupes everything and only shows genuinely NEW stores — unlike the crt.sh website, which shows every cert renewal of every old store.`)
+      `🌱 Fresh-store monitoring ON for 14 days: crt.sh stores ≤ ${maxAge}d old, up to ${count} reported per tick.\n` +
+      (dispatched ? 'First tick starting within a minute or two. ' : 'Ticks run on the cron schedule. ') +
+      `Each run sweeps one more letter of the alphabet and age-checks a batch — the pool fills over the next day, results arrive after each tick.\n\n` +
+      `Send /freshoff anytime to stop.`)
     return res.status(200).send('OK')
   }
 
-  // ── [NEW] /campaigns — overview of every campaign the daemon has tagged leads under ──
+  if (text === '/freshoff') {
+    await redis('DEL', 'fresh:config')
+    await send(chatId, '🛑 Fresh-store monitoring stopped.')
+    return res.status(200).send('OK')
+  }
+
+  // ── /campaigns ──
   if (text === '/campaigns') {
     const { result: names } = await redis('SMEMBERS', 'campaigns:all')
     if (!names || !names.length) {
@@ -822,7 +850,7 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK')
   }
 
-  // ── [NEW] /leads <status> — list leads currently in a given status ──
+  // ── /leads <status> ──
   if (text.startsWith('/leads')) {
     const status = text.split(' ')[1]
     if (!status || !LEAD_STATUSES.includes(status)) {
@@ -847,7 +875,7 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK')
   }
 
-  // ── [NEW] /mark <number> <status> — update a lead's status from the last /find report ──
+  // ── /mark <number> <status> ──
   if (text.startsWith('/mark')) {
     const parts = text.split(' ').slice(1)
     const num = parseInt(parts[0], 10)
@@ -879,6 +907,18 @@ module.exports = async (req, res) => {
       await redis('SADD', `status:${status}`, entry.dedup_id)
     }
     await send(chatId, `✓ ${entry.name} marked as "${status}".`)
+    return res.status(200).send('OK')
+  }
+
+  // ── /audit — view the command audit log ──
+  if (text === '/audit') {
+    const { result: entries } = await redis('LRANGE', 'audit:commands', 0, 49)
+    if (!entries || !entries.length) {
+      await send(chatId, 'Audit log is empty.')
+      return res.status(200).send('OK')
+    }
+    const lines = entries.map(e => { try { const r = JSON.parse(e); return `${r.ts.slice(0, 16)} — ${r.user} — ${r.text}` } catch { return '(unreadable)' } })
+    await send(chatId, `🧾 Last ${lines.length} commands:\n\n` + lines.join('\n'))
     return res.status(200).send('OK')
   }
 
@@ -966,7 +1006,7 @@ module.exports = async (req, res) => {
   try {
     const userQueue = await getUserQueue(userId)
 
-    // ── [NEW] Awaiting review cap for /find ──
+    // ── Awaiting review cap for /find ──
     if (userQueue.awaitingReviewCap) {
       const raw = text.trim().toLowerCase()
       let reviewCap = null
@@ -989,11 +1029,11 @@ module.exports = async (req, res) => {
       const jobPayload = JSON.stringify({
         chat_id: chatId, city: job.city, niche: job.niche,
         count: job.count, review_cap: reviewCap,
-        sample_mode: !!job.sampleMode,   // [NEW] daemon caps to 10-20 + masks phone/email when true
-        include_seen: !!job.includeSeen  // [NEW] daemon includes previously-scraped businesses when true
+        sample_mode: !!job.sampleMode,
+        include_seen: !!job.includeSeen
       })
       await redis('RPUSH', 'jobs:find', jobPayload)
-      const dispatched = await triggerGithubWorkflow()  // [NEW]
+      const dispatched = await triggerGithubWorkflow()
       await send(chatId,
         `✅ Job posted: ${job.niche} in ${job.city} (max ${job.count}` +
         `${reviewCap ? `, review cap ${reviewCap}` : ', no review cap'}` +
@@ -1098,7 +1138,7 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
 
-    await send(chatId, 'Send a .txt file, use /scout for URLScan leads, or /find for Google Maps.')
+    await send(chatId, 'Send a .txt file, use /scout for URLScan leads, /find for Google Maps, or /fresh to monitor new Shopify stores.')
     return res.status(200).send('OK')
   } finally {
     await releaseLock(userId)

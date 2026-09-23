@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""maps_daemon.py - Scrapes Google Maps, checks websites, sends to Telegram."""
+"""maps_daemon.py - Scrapes Google Maps, checks websites, sends to Telegram.
+Also runs fresh-Shopify-store "ticks" against crt.sh when the job queue is empty."""
 
 import os
 import json
@@ -13,20 +14,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from playwright.sync_api import sync_playwright
 
-# [NEW] Auto-load a .env file if one exists next to this script (local PC use).
-# On GitHub Actions there's no .env file — secrets arrive as real environment
-# variables instead, so this simply does nothing there, harmlessly.
+# Auto-load a .env file if one exists next to this script (local PC use).
+# On GitHub Actions there's no .env — secrets arrive as real environment vars.
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# [CHANGED] Secrets now come from environment variables, not hardcoded in
-# the file. This is REQUIRED once this code lives in a public GitHub repo —
-# hardcoded tokens in a public repo are visible to anyone, forever (even
-# in old commits). Locally, set these before running (see SETUP.md);
-# on GitHub Actions, they come from encrypted repo Secrets.
 REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 BOT_TOKEN = os.environ.get("SCRAPER_BOT_TOKEN", "")
@@ -38,12 +33,9 @@ if not (REDIS_URL and REDIS_TOKEN and BOT_TOKEN):
         "before running (see SETUP.md)."
     )
 
-# [NEW] RUN_MODE controls whether this runs forever (local PC, default) or
-# checks Redis once and exits (used by the GitHub Actions scheduled workflow).
+# "loop" = run forever (local PC, default). "once" = check once and exit
+# (GitHub Actions scheduled workflow).
 RUN_MODE = os.environ.get("RUN_MODE", "loop")
-
-# [CHANGED] No more hardcoded REVIEW_THRESHOLD — the bot now asks for this
-# in Telegram each time you run /find, and it rides along on the job.
 
 HIGH_VALUE_NICHES = [
     "med spa", "medspa", "dentist", "dental", "orthodont", "cosmetic",
@@ -86,7 +78,6 @@ def send_telegram(chat_id, text, parse_mode=None):
     except Exception as e:
         print(f"  Telegram send failed: {e}")
 
-# [NEW] Send a file (the .txt report) straight to Telegram as a document
 def send_telegram_document(chat_id, filepath, caption=""):
     try:
         with open(filepath, "rb") as f:
@@ -151,10 +142,6 @@ def redis_get(key):
 def get_panel_name(page):
     """Get the business name currently shown in the detail panel h1."""
     junk_names = ["results", "google maps", "search", "", " "]
-    # [CHANGED] Try the known specific classes first, then fall back to any
-    # visible h1 in the main panel — Google's CSS class names occasionally
-    # differ for some listing types (ads, chains, limited-info entries),
-    # which was likely a real cause of "detail panel didn't load" skips.
     selectors = [
         "h1.DUwDvf", "h1.fontHeadlineLarge",
         '[role="main"] h1', 'div[role="main"] h1',
@@ -174,7 +161,6 @@ def get_panel_name(page):
 # ── Helper: robust click that tries multiple methods ──
 def robust_click(element, page):
     """Try multiple click strategies."""
-    # Strategy 1: Normal click with scroll
     try:
         element.scroll_into_view_if_needed()
         time.sleep(0.3)
@@ -182,15 +168,11 @@ def robust_click(element, page):
         return True
     except:
         pass
-
-    # Strategy 2: JavaScript click
     try:
         element.evaluate("el => el.click()")
         return True
     except:
         pass
-
-    # Strategy 3: Click via page mouse on bounding box center
     try:
         box = element.bounding_box()
         if box:
@@ -198,7 +180,6 @@ def robust_click(element, page):
             return True
     except:
         pass
-
     return False
 
 
@@ -215,8 +196,6 @@ def wait_for_new_panel_name(page, prev_name, max_wait=12):
 
 
 def safe_int(text, default=0):
-    """Parse a comma-stripped number, returning `default` instead of crashing
-    on edge cases like a regex match that captured only a stray comma."""
     try:
         cleaned = text.replace(",", "").strip()
         return int(cleaned) if cleaned else default
@@ -233,17 +212,8 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
     seen_addresses = set()
     script_dir = os.path.dirname(os.path.abspath(__file__))
     cookie_path = os.path.join(script_dir, "gm_cookies.json")
-    # [FIX] GLOBAL dedup key — once a business is scraped, never show it again...
-    # [CHANGED] ...unless include_seen=True for this run (job["include_seen"]).
-    # The set is still updated either way, so a normal (non-include_seen) run
-    # right after will go back to skipping these.
     dedup_key = "seen_maps:global"
 
-    # [NEW] Hard time budget for the whole scrape. If Google is showing a
-    # CAPTCHA/block or the detail panel just won't load, the old code would
-    # grind through every card at ~29s each until GitHub Actions force-killed
-    # the whole job at 30 minutes (which is what caused the "cancelled" run).
-    # Now we just stop early and return whatever we already have.
     scrape_start_time = time.time()
     MAX_SCRAPE_SECONDS = 20 * 60  # leave headroom under the 30 min job timeout
 
@@ -283,11 +253,7 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
         time.sleep(6)
 
-        # [NEW] Detect a CAPTCHA / "unusual traffic" block early. This is the
-        # #1 cause of runs that quietly burn the full 30-minute job timeout:
-        # the page loads, but every single card click fails to open a detail
-        # panel, so the old code just kept retrying card after card until
-        # GitHub Actions killed the job. Now we bail immediately and say why.
+        # Detect a CAPTCHA / "unusual traffic" block early.
         try:
             page_text = page.inner_text("body").lower()
         except Exception:
@@ -341,16 +307,15 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
             browser.close()
             return results
 
-        # Wait for cards to render
         time.sleep(3)
 
-        # [FIX] Aggressive scrolling — keep going until we have enough unique businesses
+        # Aggressive scrolling until enough unique businesses
         print("  Scrolling to load more cards...")
         last_count = 0
         stuck_scrolls = 0
-        target_buffer = max_results * 3  # Need 3x buffer because of dedup/filters
+        target_buffer = max_results * 3
 
-        for i in range(80):  # [FIX] was 40, now 80 scroll attempts
+        for i in range(80):
             if time_left() <= 0:
                 print("  ⏱️ Time budget hit during scrolling, moving on with what we have")
                 break
@@ -360,7 +325,6 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             time.sleep(1.5)
 
-            # Count unique sidebar names
             all_links = page.query_selector_all('div[role="feed"] a[href*="/maps/place"]')
             temp_names = set()
             for link in all_links:
@@ -374,7 +338,7 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
 
             if current_count == last_count:
                 stuck_scrolls += 1
-                if stuck_scrolls >= 8:  # [FIX] was 5, more patience
+                if stuck_scrolls >= 8:
                     print(f"  No new businesses after 8 scrolls, stopping at {current_count}")
                     break
             else:
@@ -388,7 +352,7 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
             if i % 10 == 0:
                 print(f"  ...scrolled {i} times, {current_count} unique cards so far")
 
-        # [FIX] Find all place links, dedupe by VISIBLE TEXT
+        # Find all place links, dedupe by VISIBLE TEXT
         all_links = page.query_selector_all('div[role="feed"] a[href*="/maps/place"]')
         print(f"  Found {len(all_links)} raw links in feed")
 
@@ -397,7 +361,6 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
         for link in all_links:
             try:
                 text = link.inner_text().strip()
-                # Only keep links with actual business name text
                 if text and len(text) > 2 and text.lower() not in seen_sidebar_names:
                     seen_sidebar_names.add(text.lower())
                     card_links.append(link)
@@ -419,7 +382,6 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
 
         last_panel_name = None
 
-        # Click each unique card
         for idx, card_link in enumerate(card_links):
             if len(results) >= max_results:
                 break
@@ -433,23 +395,17 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
             except:
                 pass
 
-            # [NEW] Small pacing delay — clicking cards back-to-back with zero
-            # gap likely contributes to the detail panel not keeping up.
             time.sleep(0.4)
 
-            # Robust click with fallbacks
             clicked = robust_click(card_link, page)
             if not clicked:
                 skipped_reasons["click_fail"] += 1
                 print(f"    ⏭️  Card {idx} ({sidebar_name}): could not click")
                 continue
 
-            # Wait for detail panel to show a NEW name
             panel_name = wait_for_new_panel_name(page, last_panel_name, max_wait=12)
 
             if not panel_name:
-                # [CHANGED] Longer, single retry instead of a short one — most
-                # slow-render cases just need more time, not another click.
                 time.sleep(2)
                 panel_name = wait_for_new_panel_name(page, last_panel_name, max_wait=15)
                 if not panel_name:
@@ -466,7 +422,6 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
                     "instagram_handle": "", "facebook_page": ""
                 }
 
-                # Skip junk/duplicate names
                 junk_names = ["results", "google maps", "search", "", " "]
                 if data["name"].lower() in junk_names or "result" in data["name"].lower():
                     skipped_reasons["junk_name"] += 1
@@ -496,10 +451,7 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
                         data["website"] = href
                         break
 
-                # [FIX] Phone — data-tooltip was often just "Copy phone number"
-                # (no digits), not the actual number. Check structured
-                # data-item-id first (format: "phone:tel:+1XXXXXXXXXX"),
-                # then the button's visible text, then aria-label as fallback.
+                # Phone
                 for btn in page.query_selector_all('button[data-item-id*="phone"], button[data-tooltip*="phone"]'):
                     item_id = btn.get_attribute("data-item-id") or ""
                     m = re.search(r"phone:tel:([\d+\-\s()]+)", item_id)
@@ -522,10 +474,9 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
                     if txt and any(c.isdigit() for c in txt):
                         data["rating"] = txt
 
-                # [FIX] Reviews - comprehensive extraction from detail panel
+                # Reviews
                 review_count = 0
 
-                # Method 1: aria-label on review button/span
                 for sel in ['button[aria-label*="review"]', 'button[aria-label*="Review"]', 'span[aria-label*="review"]', 'span[aria-label*="Review"]']:
                     review_el = page.query_selector(sel)
                     if review_el:
@@ -535,14 +486,11 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
                             review_count = safe_int(m.group(1))
                             break
 
-                # Method 2: Look for text pattern like "4.4 (806)" or "4.4 · 806" in detail panel
                 if review_count == 0 and data["rating"]:
                     try:
-                        # Get text from the main detail panel
                         panel = page.query_selector('div[role="main"]')
                         if panel:
                             panel_text = panel.inner_text()
-                            # Pattern: rating followed by reviews in parens or after dot
                             patterns = [
                                 re.escape(data["rating"]) + r"[^\d]*\(?([\d,]+)\)?",
                                 re.escape(data["rating"]) + r"[^\d]*·[^\d]*([\d,]+)",
@@ -556,19 +504,16 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
                     except:
                         pass
 
-                # Method 3: Find any standalone number > 10 near the rating area
                 if review_count == 0:
                     try:
-                        # Look for elements that contain just a number near the top of the panel
                         panel = page.query_selector('div[role="main"]')
                         if panel:
-                            # Get first few divs/spans which usually contain rating info
                             near_rating = panel.query_selector_all("span, div, button")
-                            for el in near_rating[:20]:  # Check first 20 elements
+                            for el in near_rating[:20]:
                                 txt = el.inner_text().strip()
                                 if txt and txt.replace(",", "").isdigit():
                                     num = int(txt.replace(",", ""))
-                                    if 10 < num < 100000:  # Reasonable review count range
+                                    if 10 < num < 100000:
                                         review_count = num
                                         break
                     except:
@@ -576,14 +521,12 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
 
                 data["reviews"] = review_count
 
-                # Skip high-review businesses (review_cap is None = no limit)
                 if review_cap is not None and data["reviews"] > review_cap:
                     skipped_reasons["too_many_reviews"] += 1
                     print(f"    ⏭️  High reviews: {data['name']} ({data['reviews']})")
                     continue
 
-                # [FIX] GLOBAL cross-search dedup — check Redis before adding,
-                # unless this run was told to include previously-seen leads.
+                # GLOBAL cross-search dedup via Redis
                 dedup_id = f"{data['name'].lower().strip()}|{addr_key}"
                 already_seen = redis_sismember(dedup_key, dedup_id)
                 if already_seen and not include_seen:
@@ -591,8 +534,8 @@ def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen
                     print(f"    ⏭️  Already seen (global): {data['name']}")
                     continue
 
-                data["dedup_id"] = dedup_id  # [NEW] carried through for status tracking
-                data["previously_seen"] = bool(already_seen)  # [NEW] so output can flag repeats
+                data["dedup_id"] = dedup_id
+                data["previously_seen"] = bool(already_seen)
 
                 redis_sadd(dedup_key, dedup_id)
                 seen_names.add(data["name"].lower())
@@ -661,7 +604,6 @@ def extract_facebook_page(text):
     m = re.search(r"facebook\.com/([a-zA-Z0-9.]+)", text)
     return m.group(0) if m else ""
 
-# [NEW] ── Website signal detection (booking, chat, WhatsApp, CTA, mobile) ──
 def detect_signals(html):
     h = html.lower()
     return {
@@ -685,9 +627,6 @@ def detect_signals(html):
     }
 
 
-# [NEW] ── Tech-stack / software fingerprinting from public page source ──
-# Same approach tools like Wappalyzer/BuiltWith use: known script/domain
-# signatures in the HTML. Can't see inside their CRM — only that it's there.
 TECH_SIGNATURES = {
     "cms": {
         "WordPress": ["wp-content", "wp-json", "wp-includes"],
@@ -740,7 +679,6 @@ def detect_tech_stack(html):
     return found
 
 
-# [NEW] ── Actual contact channel URLs (not just yes/no signals) ──
 def extract_contact_channels(html, result):
     channels = {}
     m = re.search(r"https?://wa\.me/[0-9]{6,15}", html)
@@ -759,9 +697,6 @@ def extract_contact_channels(html, result):
     return channels
 
 
-# [NEW] ── Best-effort decision-maker guess from page text ──
-# This is a heuristic (regex around common title words), not a verified lookup —
-# treat hits as a starting point to confirm manually, not a guaranteed name.
 NAME_STOPWORDS = {
     "book", "now", "call", "get", "contact", "schedule", "shop", "buy",
     "sign", "request", "learn", "more", "click", "here", "today", "visit",
@@ -786,7 +721,6 @@ def guess_decision_maker(html):
     return {"name": "", "title": ""}
 
 
-# [NEW] ── Turn missing signals into human-readable pain points ──
 def detect_pain_points(sig, reviews):
     points = []
     if not sig.get("has_live_chat") and not sig.get("has_whatsapp"):
@@ -810,10 +744,6 @@ def detect_pain_points(sig, reviews):
     return unique[:3]
 
 
-# [NEW] ── Lead categorization into the three sample "products" ──
-# website_needed        = no site, or the site is dead/unreachable
-# website_opportunity   = has a working site but a real conversion/lead-response gap
-# fresh_prospect        = has a site with no obvious gap — just a general prospect
 CATEGORY_LABELS = {
     "website_needed": "Website Needed",
     "website_opportunity": "Website Opportunity",
@@ -826,19 +756,11 @@ def categorize_lead(lead):
     pain = lead.get("pain_points") or []
     relevant = [cat for cat, _ in pain if cat in ("Conversion", "Lead-response")]
     reviews = lead.get("reviews") or 0
-    # A single missing feature (e.g. just "no online booking") is normal for
-    # most small business sites, not a real opportunity signal. Only count it
-    # once there's a cluster of gaps, or real proven customer volume (reviews)
-    # sitting on top of a gap — that's what makes it worth pitching.
     is_opportunity = len(relevant) >= 2 or (reviews >= 50 and len(relevant) >= 1)
     return "website_opportunity" if is_opportunity else "fresh_prospect"
 
 
-# [NEW] ── Masking helpers for sample mode ──
-# Samples given to a prospective buyer should prove the data is real (name,
-# city, reviews, signals) without handing over the bulk contact info for free —
-# see SETUP.md "sample" notes. Keeps the digit count/shape so it still reads
-# like a real phone number, just not a usable one.
+# ── Masking helpers for sample mode ──
 def mask_phone(phone):
     if not phone:
         return phone
@@ -863,8 +785,7 @@ def mask_email(email):
 def mask_lead_for_sample(lead):
     """Shallow copy with contact-heavy fields hidden — used only for what
     gets SENT OUT (Telegram batches + exports) in sample mode. The real,
-    unmasked lead stays in Redis / your internal record via record_lead_status,
-    which runs on the full data before this is ever applied."""
+    unmasked lead stays recorded in Redis via record_lead_status."""
     masked = dict(lead)
     masked["_masked"] = True
     if masked.get("phone"):
@@ -886,7 +807,6 @@ def is_high_value_niche(niche):
     return any(k in n for k in HIGH_VALUE_NICHES)
 
 
-# [NEW] ── Weighted opportunity score (replaces the old flat scoring) ──
 def score_lead(data, sig, niche):
     reviews = data.get("reviews", 0) or 0
     b = {}
@@ -927,7 +847,6 @@ def score_lead(data, sig, niche):
     return min(sum(b.values()), 100), b
 
 
-# [NEW] ── Rule-based "why contact" line built from real evidence, not a generic template ──
 def generate_why_contact(data, niche, pain_points):
     biz = data.get("name", "This business")
     reviews = data.get("reviews", 0) or 0
@@ -951,7 +870,6 @@ def check_website(url):
         "socials": {}, "instagram_handle": "", "facebook_page": "",
         "ssl_valid": None, "load_seconds": None, "score": 0,
         "score_reasons": [], "status": "dead",
-        # [NEW] signal / intelligence fields
         "signals": {}, "decision_maker": {"name": "", "title": ""},
         "pain_points": [], "why_contact": "", "score_breakdown": {},
         "tech_stack": {}, "contact_channels": {},
@@ -988,7 +906,6 @@ def check_website(url):
         result["instagram_handle"] = extract_instagram_handle(html)
         result["facebook_page"] = extract_facebook_page(html)
 
-        # [NEW] Website intelligence signals + decision-maker guess (homepage)
         result["signals"] = detect_signals(html)
         result["decision_maker"] = guess_decision_maker(html)
         result["tech_stack"] = detect_tech_stack(html)
@@ -1018,9 +935,6 @@ def check_website(url):
                     print(f"    ⚠️ Fallback page failed: {e}")
                     continue
 
-        # NOTE: score/score_reasons are now filled in by score_lead() in
-        # process_job(), which also has the niche and pain points to work with.
-
         result["contact_channels"] = extract_contact_channels(html, result)
 
     except Exception as e:
@@ -1031,13 +945,8 @@ def check_website(url):
     return result
 
 
-# [CHANGED] Two-section "Prospect / Opportunity" layout. Contact links are
-# swapped for plain masked text when lead["_masked"] is set (sample mode) —
-# see mask_lead_for_sample(). Everything else about the lead (reviews, socials,
-# category, opportunity reasoning) still shows, since that's what proves the
-# data is real.
 def format_lead(lead, num):
-    e = html.escape  # shorthand — escapes &, <, > so names/addresses can't break the HTML message
+    e = html.escape
     masked = bool(lead.get("_masked"))
     hot = " 🔥" if lead.get("score", 0) >= 70 else ""
     cat_label = CATEGORY_LABELS.get(lead.get("category"), "")
@@ -1077,7 +986,7 @@ def format_lead(lead, num):
         if masked:
             lines.append(f"   📱 Phone: {e(lead['phone'])}")
         else:
-            tel = re.sub(r"[^\d+]", "", lead["phone"])  # tel: link opens the dialer
+            tel = re.sub(r"[^\d+]", "", lead["phone"])
             lines.append(f'   📱 Phone: <a href="tel:{tel}">{e(lead["phone"])}</a>')
     else:
         lines.append("   📱 Phone: not publicly listed")
@@ -1107,8 +1016,6 @@ def format_lead(lead, num):
     for cat, desc in pain[:2]:
         lines.append(f"   💡 [{e(cat)}] {e(desc)}")
 
-    # Decision-maker guess, extra contact channels, and tech stack are the
-    # "bulk contact info" the doc says to hold back in a free sample.
     if not masked:
         dm = lead.get("decision_maker") or {}
         if dm.get("name"):
@@ -1132,8 +1039,7 @@ def format_lead(lead, num):
     return "\n".join(lines)
 
 
-# [NEW] ── Export the full enriched list to a .txt file (not CSV — easy to
-# open in any Notes/Docs app on a phone) and hand it back via Telegram ──
+# ── Exports ──
 def export_txt(enriched, city, niche, review_cap, campaign, sample_mode=False):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     export_dir = os.path.join(script_dir, "exports")
@@ -1188,8 +1094,6 @@ def export_txt(enriched, city, niche, review_cap, campaign, sample_mode=False):
             for cat, desc in pain:
                 lines.append(f"      - [{cat}] {desc}")
 
-        # Decision-maker guess, contact channels, tech stack, score breakdown —
-        # held back for masked sample leads, same as the Telegram/HTML output.
         if not masked:
             channels = lead.get("contact_channels") or {}
             if channels:
@@ -1204,27 +1108,19 @@ def export_txt(enriched, city, niche, review_cap, campaign, sample_mode=False):
             dm = lead.get("decision_maker") or {}
             if dm.get("name"):
                 lines.append(f"    Decision-maker (best guess, confirm manually): {dm['name']} — {dm['title']}")
-            else:
-                lines.append("    Decision-maker: not confidently identified")
-            breakdown = lead.get("score_breakdown") or {}
-            if breakdown:
-                b = ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in breakdown.items())
-                lines.append(f"    Score breakdown: {b}")
-        lines.append("")
+            bd = lead.get("score_breakdown") or {}
+            if bd:
+                lines.append("    Score breakdown:")
+                for k, v in bd.items():
+                    lines.append(f"      - {k}: {v}")
 
-    lines.append("=" * 60)
-    lines.append("Decision-maker names are best-effort guesses from page text — confirm before outreach.")
-    lines.append(f"In Telegram: /leads new to see fresh leads, /mark <number> <status> to track outreach")
-    lines.append(f"(number = position [N] above, from THIS report only). /campaigns for an overview.")
+        lines.append("")
 
     with open(filepath, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return filepath
 
 
-# [NEW] ── HTML version of the same report — actual clickable links, guaranteed
-# to work in any browser (unlike a .txt file, where clickability depends on
-# whatever app happens to open it). Open with your phone's browser, not Notes.
 def export_html(enriched, city, niche, review_cap, campaign, sample_mode=False):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     export_dir = os.path.join(script_dir, "exports")
@@ -1236,123 +1132,33 @@ def export_html(enriched, city, niche, review_cap, campaign, sample_mode=False):
     tag = "sample" if sample_mode else "full"
     filepath = os.path.join(export_dir, f"leads_{safe_niche}_{safe_city}_{ts}_{tag}.html")
 
-    e = html.escape
-    cards = []
+    parts = [
+        "<html><head><meta charset='utf-8'>",
+        f"<title>{html.escape(campaign)}</title>",
+        "<style>body{font-family:sans-serif;max-width:900px;margin:2rem auto;}pre{white-space:pre-wrap;background:#f6f6f6;padding:1rem;border-radius:8px;}</style>",
+        "</head><body>",
+        f"<h2>{'SAMPLE — ' if sample_mode else ''}Lead Report — {html.escape(niche.title())} in {html.escape(city.title())}</h2>",
+        f"<p>Generated {time.strftime('%Y-%m-%d %H:%M')} · {len(enriched)} leads · review cap {review_cap if review_cap is not None else 'none'}</p>",
+    ]
     for i, lead in enumerate(enriched, 1):
-        masked = bool(lead.get("_masked"))
-        hot = " 🔥" if lead.get("score", 0) >= 70 else ""
-        cat_label = CATEGORY_LABELS.get(lead.get("category"), "")
-        rows = [f'<div class="section-label">Prospect</div>']
-        if lead.get("address"):
-            rows.append(f"<div>📍 {e(lead['address'])}</div>")
-        rows.append(f"<div>🌐 Website: {'Yes' if lead.get('website') else 'No'}</div>")
-        booking = (lead.get("signals") or {}).get("has_booking")
-        rows.append(f"<div>📅 Booking: {'Detected' if booking else 'Not detected'}</div>")
-        if lead.get("phone"):
-            if masked:
-                rows.append(f"<div>📱 {e(lead['phone'])}</div>")
-            else:
-                tel = re.sub(r"[^\d+]", "", lead["phone"])
-                rows.append(f'<div>📱 <a href="tel:{tel}">{e(lead["phone"])}</a></div>')
-        else:
-            rows.append("<div>📱 not publicly listed</div>")
-        if lead.get("website"):
-            rows.append(f'<div>🔗 <a href="{e(lead["website"])}" target="_blank">{e(lead["website"])}</a></div>')
-        if lead.get("rating") or lead.get("reviews"):
-            rev = lead.get("reviews", "")
-            rows.append(f"<div>⭐ {e(str(lead.get('rating','')))}" + (f" ({rev} reviews)" if rev else "") + "</div>")
-        if lead.get("email") and lead["email"] != "no email":
-            if masked:
-                rows.append(f"<div>📧 {e(lead['email'])}</div>")
-            else:
-                rows.append(f'<div>📧 <a href="mailto:{e(lead["email"])}">{e(lead["email"])}</a></div>')
-        else:
-            rows.append("<div>📧 not publicly available</div>")
-        if lead.get("instagram_handle"):
-            rows.append(f'<div>📸 <a href="https://instagram.com/{e(lead["instagram_handle"])}" target="_blank">@{e(lead["instagram_handle"])}</a></div>')
-        if lead.get("facebook_page"):
-            fb = lead["facebook_page"] if lead["facebook_page"].startswith("http") else "https://" + lead["facebook_page"]
-            rows.append(f'<div>📘 <a href="{e(fb)}" target="_blank">Facebook</a></div>')
-
-        rows.append('<div class="section-label">Opportunity</div>')
-        rows.append(f"<div>Website present: {'Yes' if lead.get('website') else 'No'}</div>")
-        pain = lead.get("pain_points") or []
-        opp_cats = sorted({cat for cat, _ in pain}) if pain else []
-        rows.append(f"<div>Potential opportunity: {e('/'.join(opp_cats)) if opp_cats else 'General prospecting'}</div>")
-        if lead.get("why_contact"):
-            rows.append(f"<div>Reason: {e(lead['why_contact'])}</div>")
-        for cat, desc in pain:
-            rows.append(f"<div>💡 [{e(cat)}] {e(desc)}</div>")
-
-        if not masked:
-            channels = lead.get("contact_channels") or {}
-            for label, icon in [("whatsapp", "💬 WhatsApp"), ("messenger", "💬 Messenger"), ("linkedin", "💼 LinkedIn"), ("tiktok", "🎵 TikTok")]:
-                if channels.get(label):
-                    rows.append(f'<div>{icon}: <a href="{e(channels[label])}" target="_blank">{e(channels[label])}</a></div>')
-            dm = lead.get("decision_maker") or {}
-            if dm.get("name"):
-                rows.append(f"<div>👤 {e(dm['name'])} ({e(dm['title'])}) — best guess, confirm manually</div>")
-
-        badge = f' <span class="badge">{e(cat_label)}</span>' if cat_label else ""
-        cards.append(f"""
-        <div class="card">
-          <h3>{i}. {e(lead.get('name',''))}{hot}{badge} <span class="score">{lead.get('score',0)}/100</span></h3>
-          {''.join(rows)}
-        </div>""")
-
-    sample_banner = (
-        '<div class="sample-banner">SAMPLE — a limited preview. Contact details are partially hidden; '
-        'the full batch includes complete phone/email and decision-maker info.</div>'
-        if sample_mode else ""
-    )
-
-    doc = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{e(niche.title())} in {e(city.title())}</title>
-<style>
-  body {{ font-family: -apple-system, sans-serif; max-width: 700px; margin: 0 auto; padding: 16px; background: #f5f5f5; }}
-  h1 {{ font-size: 20px; }}
-  .meta {{ color: #666; font-size: 13px; margin-bottom: 20px; }}
-  .sample-banner {{ background: #fff3cd; border: 1px solid #ffe08a; color: #7a5c00; padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; }}
-  .card {{ background: white; border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-  .card h3 {{ margin: 0 0 8px 0; font-size: 16px; }}
-  .badge {{ font-size: 11px; background: #eef2ff; color: #3949ab; padding: 2px 8px; border-radius: 999px; }}
-  .section-label {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: #888; margin-top: 8px; }}
-  .score {{ float: right; font-size: 13px; color: #555; }}
-  .card div {{ margin: 4px 0; font-size: 14px; word-break: break-word; }}
-  a {{ color: #0a66c2; text-decoration: none; }}
-  a:active {{ opacity: 0.6; }}
-</style></head>
-<body>
-  <h1>{e(niche.title())} in {e(city.title())}</h1>
-  <div class="meta">Campaign: {e(campaign)} · {len(enriched)} leads · Review cap: {review_cap if review_cap is not None else 'none'} · {time.strftime('%Y-%m-%d %H:%M')}</div>
-  {sample_banner}
-  {''.join(cards)}
-</body></html>"""
+        parts.append("<pre>" + format_lead(lead, i) + "</pre><hr>")
+    parts.append("</body></html>")
 
     with open(filepath, "w", encoding="utf-8") as f:
-        f.write(doc)
+        f.write("\n".join(parts))
     return filepath
 
 
-# [NEW] ── Campaign + status tracking (so the Telegram bot can list/mark leads later) ──
-# Redis layout:
-#   leads:status            hash   dedup_id -> JSON {status, campaign, city, niche, name, phone, email, score, updated}
-#   status:<status>         set    dedup_ids currently in that status
-#   campaign:<name>:leads   set    dedup_ids belonging to that campaign
-#   campaigns:all           set    all known campaign names
-def record_lead_status(lead, campaign, city, niche):
-    dedup_id = lead.get("dedup_id")
-    if not dedup_id:
-        return
-    # Don't clobber a status the user has already set from Telegram (e.g. "contacted")
-    existing = redis_hget("leads:status", dedup_id)
-    if existing:
-        return
+# ── Lead recording (feeds /campaigns, /leads, /mark) ──
+def record_lead_status(lead, campaign):
+    dedup_id = lead.get("dedup_id") or f"{lead.get('name','').lower().strip()}|"
     record = {
-        "status": "new", "campaign": campaign, "city": city, "niche": niche,
-        "name": lead.get("name", ""), "phone": lead.get("phone", ""),
-        "email": lead.get("email", ""), "score": lead.get("score", 0),
+        "name": lead.get("name", ""),
+        "phone": lead.get("phone", ""),
+        "email": lead.get("email", "") if lead.get("email") != "no email" else "",
+        "score": lead.get("score", 0),
+        "campaign": campaign,
+        "status": "new",
         "updated": time.strftime("%Y-%m-%d %H:%M"),
     }
     redis_hset("leads:status", dedup_id, json.dumps(record))
@@ -1361,156 +1167,116 @@ def record_lead_status(lead, campaign, city, niche):
     redis_sadd("campaigns:all", campaign)
 
 
-# [NEW] Save the last /find report for this chat so the bot can resolve
-# "/mark 3 contacted" back to a real dedup_id.
-def save_lastfind(chat_id, enriched):
-    entries = [{
-        "index": i + 1,
-        "dedup_id": lead.get("dedup_id", ""),
-        "name": lead.get("name", ""),
-        "phone": lead.get("phone", ""),
-        "email": lead.get("email", ""),
-        "score": lead.get("score", 0),
-    } for i, lead in enumerate(enriched)]
-    redis_set(f"lastfind:{chat_id}", json.dumps(entries))
+# ── Job processing: enrich + batch-send a /find result ──
+def process_job(data):
+    chat_id = str(data.get("chat_id", ""))
+    city = data.get("city", "")
+    niche = data.get("niche", "")
+    count = int(data.get("count", 20) or 20)
+    review_cap = data.get("review_cap")
+    if isinstance(review_cap, str):
+        review_cap = int(review_cap) if review_cap.strip().isdigit() else None
+    sample_mode = bool(data.get("sample_mode"))
+    include_seen = bool(data.get("include_seen"))
+    campaign = f"{niche.replace('_', ' ').title()} — {city.title()}"
 
+    print(f"  Job: {niche} in {city} (max {count}, cap {review_cap}, sample={sample_mode}, rescan={include_seen})")
+    send_telegram(chat_id, f"🗺️ Scraping Google Maps for {niche} in {city} — up to {count} leads. This takes a while...")
 
-def process_job(job):
-    chat_id = job["chat_id"]
-    city = job["city"]
-    niche = job["niche"]
-    count = min(job.get("count", 20), 50)
-    # [NEW] review cap now comes from the Telegram conversation, not a hardcoded constant
-    review_cap = job.get("review_cap", None)
-    # [NEW] campaign — lets you compare "Miami Med Spas" vs "Dallas Med Spas" etc.
-    campaign = job.get("campaign") or f"{niche.title()} — {city.title()}"
-
-    # [NEW] Sample mode: cap the outgoing batch to 10-20 leads and mask
-    # phone/email/decision-maker so this run can be handed to a prospective
-    # buyer as a free sample. Internal recording (record_lead_status /
-    # save_lastfind) still sees the full, unmasked scrape — only what gets
-    # SENT (Telegram batches + exports) is capped/masked. Set via the bot
-    # with /find ... sample, which puts job["sample_mode"] = True.
-    sample_mode = bool(job.get("sample_mode"))
-    sample_size = min(max(int(job.get("sample_size", 15) or 15), 10), 20) if sample_mode else None
-    # [NEW] By default a run skips anything already in the global "seen"
-    # registry (seen_maps:global), so you always get a fresh set. Set via the
-    # bot with /find ... rescan to also include leads you've scraped before.
-    include_seen = bool(job.get("include_seen"))
-
-    cap_txt = f"max {review_cap} reviews" if review_cap is not None else "no review cap"
-    mode_txt = f", SAMPLE mode ({sample_size} leads, contact info partially hidden)" if sample_mode else ""
-    seen_txt = ", including previously-seen businesses" if include_seen else ""
-    send_telegram(chat_id, f"✅ Scraping {niche} in {city} (target: {count}, {cap_txt}{mode_txt}{seen_txt})...\n\nThis takes a few minutes. A browser window will open.")
-    print(f"\n{'='*50}")
-    print(f"JOB: {niche} in {city} (max {count}, review_cap={review_cap}, sample_mode={sample_mode}, include_seen={include_seen})")
-    print(f"{'='*50}")
-
-    results = scrape_google_maps(city, niche, count, review_cap=review_cap, include_seen=include_seen)
-
-    if not results:
-        send_telegram(
-            chat_id,
-            "❌ No results found.\n\n"
-            "This is often Google showing a CAPTCHA/block on this run rather than a genuinely empty search "
-            "(check the Action logs for '🚫 Google is showing a CAPTCHA'). If so, the GM_COOKIES_JSON secret "
-            "likely needs refreshing. Otherwise, try a different city or niche."
-        )
+    raw = scrape_google_maps(city, niche, max_results=count, review_cap=review_cap, include_seen=include_seen)
+    if not raw:
+        send_telegram(chat_id,
+            f"No leads collected for {niche} in {city} — either blocked (check the Actions log for "
+            f"a CAPTCHA message) or everything in range was already scraped. Try again later, "
+            f"another city, or add 'rescan'.")
         return
 
-    send_telegram(chat_id, f"📍 Found {len(results)} businesses. Analyzing websites now...")
-
     enriched = []
-    for r in results:
-        if r.get("website"):
-            print(f"  🔍 Checking {r['website']}...")
-            r.update(check_website(r["website"]))
-            sig = r.get("signals", {})
-            r["pain_points"] = detect_pain_points(sig, r.get("reviews", 0))
-            r["score"], r["score_breakdown"] = score_lead(r, sig, niche)
-            r["why_contact"] = generate_why_contact(r, niche, r["pain_points"])
+    for lead in raw:
+        if lead.get("website"):
+            web = check_website(lead["website"])
         else:
-            # No website = its own kind of opportunity
-            r["signals"] = {}
-            r["pain_points"] = [("Website", "no website found at all")]
-            r["score"] = 40
-            r["score_breakdown"] = {"no_website_opportunity": 40}
-            r["why_contact"] = generate_why_contact(r, niche, r["pain_points"])
-        r["category"] = categorize_lead(r)  # [NEW] Website Needed / Website Opportunity / Fresh Prospect
-        enriched.append(r)
-        record_lead_status(r, campaign, city, niche)  # [NEW] records the FULL unmasked lead, regardless of sample_mode
-        time.sleep(0.5)
+            web = {"email": "no email", "email_is_generic": False, "contact_page": "",
+                   "socials": {}, "instagram_handle": "", "facebook_page": "",
+                   "ssl_valid": None, "load_seconds": None, "status": "dead",
+                   "signals": {}, "decision_maker": {"name": "", "title": ""},
+                   "tech_stack": {}, "contact_channels": {}}
+
+        lead.update({
+            "email": web.get("email", "no email"),
+            "email_is_generic": web.get("email_is_generic", False),
+            "contact_page": web.get("contact_page", ""),
+            "socials": web.get("socials", {}),
+            "instagram_handle": web.get("instagram_handle", ""),
+            "facebook_page": web.get("facebook_page", ""),
+            "ssl_valid": web.get("ssl_valid"),
+            "load_seconds": web.get("load_seconds"),
+            "status": web.get("status", "dead"),
+            "signals": web.get("signals", {}),
+            "decision_maker": web.get("decision_maker", {"name": "", "title": ""}),
+            "tech_stack": web.get("tech_stack", {}),
+            "contact_channels": web.get("contact_channels", {}),
+        })
+        pain = detect_pain_points(lead["signals"], lead.get("reviews", 0))
+        lead["pain_points"] = pain
+        score, breakdown = score_lead(lead, lead["signals"], niche)
+        lead["score"] = score
+        lead["score_breakdown"] = breakdown
+        lead["why_contact"] = generate_why_contact(lead, niche, pain)
+        lead["category"] = categorize_lead(lead)
+        record_lead_status(lead, campaign)
+        enriched.append(lead)
 
     enriched.sort(key=lambda x: x.get("score", 0), reverse=True)
-    save_lastfind(chat_id, enriched)  # [NEW] so /mark <n> <status> can find these leads — always the full set
 
-    # [NEW] What actually gets SENT (Telegram + exports) — the full sorted
-    # list normally, or a capped + masked subset in sample mode.
+    out = enriched
     if sample_mode:
-        outgoing = [mask_lead_for_sample(lead) for lead in enriched[:sample_size]]
-    else:
-        outgoing = enriched
+        out = [mask_lead_for_sample(l) for l in enriched[:20]]
 
-    batch_size = 5
-    total = len(outgoing)
-    for i in range(0, total, batch_size):
-        batch = outgoing[i:i + batch_size]
-        header = f"📍 {html.escape(city.title())} {html.escape(niche.title())} — {i+1}-{min(i+batch_size, total)} of {total}"
-        header += " (SAMPLE)" if sample_mode else ""
-        header += "\n\n"
-        msg = header + "\n\n".join(format_lead(lead, i + j + 1) for j, lead in enumerate(batch))
-        send_telegram(chat_id, msg, parse_mode="HTML")
+    # Store report index for /mark
+    lastfind = [{"index": i + 1, "dedup_id": l.get("dedup_id", ""), "name": l.get("name", ""),
+                 "phone": l.get("phone", ""), "email": l.get("email", ""), "score": l.get("score", 0)}
+                for i, l in enumerate(out)]
+    redis_set(f"lastfind:{chat_id}", json.dumps(lastfind))
+
+    total = len(out)
+    BATCH = 5
+    for start in range(0, total, BATCH):
+        chunk = out[start:start + BATCH]
+        header = f"📍 {niche.replace('_', ' ').title()} in {city.title()} — {start + 1}-{start + len(chunk)} of {total}"
+        body = "\n\n".join(format_lead(l, start + 1 + i) for i, l in enumerate(chunk))
+        send_telegram(chat_id, header + "\n\n" + body, parse_mode="HTML")
         time.sleep(1)
 
-    with_email = sum(1 for e in outgoing if e.get("email") and e["email"] != "no email")
-    hot = sum(1 for e in outgoing if e.get("score", 0) >= 70)
-    by_category = {}
-    for lead in outgoing:
-        by_category[lead.get("category")] = by_category.get(lead.get("category"), 0) + 1
-    cat_summary = "\n".join(
-        f"   🏷️ {CATEGORY_LABELS.get(k, k)}: {v}" for k, v in by_category.items()
-    )
-    sample_note = f"\n   (Sample of {sample_size} from {len(enriched)} total scraped — full batch has complete contact info)" if sample_mode else ""
-    summary = (
-        f"✅ Done! {total} leads {'sent (sample)' if sample_mode else 'checked'} — campaign: {campaign}\n"
-        f"{cat_summary}\n"
-        f"   📧 {with_email} have emails\n"
-        f"   🔥 {hot} scored 70+ (hot leads){sample_note}\n\n"
-        f"Sending your .txt report now..."
-    )
-    send_telegram(chat_id, summary)
-
-    # [NEW] Two versions of the report: .txt (plain, easy to copy/paste) and
-    # .html (real clickable links — open with your phone's browser, not Notes).
-    # Both are built from `outgoing`, so sample mode caps/masks them too.
     try:
-        txt_path = export_txt(outgoing, city, niche, review_cap, campaign, sample_mode=sample_mode)
-        cap = f"📄 {'Sample' if sample_mode else 'Full'} report (.txt) — {niche} in {city} ({total} leads)"
-        send_telegram_document(chat_id, txt_path, caption=cap)
-        print(f"  ✅ .txt report saved and sent: {txt_path}")
+        txt_path = export_txt(out, city, niche, review_cap, campaign, sample_mode)
+        html_path = export_html(out, city, niche, review_cap, campaign, sample_mode)
+        for p in (txt_path, html_path):
+            if p:
+                send_telegram_document(chat_id, p, caption=f"{campaign} — {total} leads{' (SAMPLE)' if sample_mode else ''}")
     except Exception as e:
-        print(f"  ⚠️ .txt export/send failed: {e}")
-        send_telegram(chat_id, "⚠️ Couldn't generate the .txt report — check the daemon logs.")
+        print(f"  Export failed: {e}")
+        send_telegram(chat_id, "(exports failed — lead batches above are complete)")
 
-    try:
-        html_path = export_html(outgoing, city, niche, review_cap, campaign, sample_mode=sample_mode)
-        cap = f"🔗 {'Sample' if sample_mode else 'Full'} report (.html, clickable links) — open with your browser, not Notes"
-        send_telegram_document(chat_id, html_path, caption=cap)
-        print(f"  ✅ .html report saved and sent: {html_path}")
-    except Exception as e:
-        print(f"  ⚠️ .html export/send failed: {e}")
-
-    print(f"\n✅ Complete: {total} sent, {with_email} with email, {hot} hot ({len(enriched)} scraped total)")
+    send_telegram(chat_id, "✓ Report complete. Use /mark <number> <status> on these results, /leads and /campaigns to browse.")
 
 
 # ══════════════════════════════════════════════════════════════
-#  FRESH SHOPIFY STORES via crt.sh
-#  Sweeps crt.sh for *.myshopify.com certs, then for each candidate
-#  domain pulls its FULL cert history (expired included) to find the
-#  true first-ever certificate — that's the store's real birthday,
-#  since a single cert renewal (which happens every ~90 days) is not
-#  a reliable signal of a new store on its own.
+#  FRESH SHOPIFY STORES via crt.sh — tick-based (Actions-safe)
+#
+#  Instead of one mega-sweep (which crt.sh blocks), each daemon run
+#  with an empty job queue may run ONE tick:
+#    Phase 1: one wildcard letter-slice (round-robin via Redis)
+#    Phase 2: age-check up to 25 pooled candidates (true birthday =
+#             earliest cert EVER for that exact domain)
+#    Phase 3: report fresh finds to Telegram
+#  Cron fires every 10 min; a lock limits ticks to one per 25 min.
+#  Full alphabet covered in ~1 day; failures retry on a fresh IP.
 # ══════════════════════════════════════════════════════════════
+
+# Optional relay (Cloudflare Worker) for when GitHub's IP is hard-blocked.
+# Set the CRTSH_RELAY_URL secret and everything routes through it.
+CRTSH_BASE = os.environ.get("CRTSH_RELAY_URL") or "https://crt.sh/json"
 
 CRTSH_INFRA_LABELS = {
     "shops", "shops-gclb", "shops-glb", "app-proxy-internal", "app-proxy",
@@ -1529,14 +1295,15 @@ def extract_store_domains(name_value):
     return out
 
 def crtsh_json(session, params, timeout=90, tries=3):
-    # 504s/timeouts are NORMAL on crt.sh — retry with backoff, skip if dead
+    """Exact-domain queries are small; retry with backoff on 504/flakes."""
     for i in range(tries):
         try:
-            r = session.get("https://crt.sh/json", params=params, timeout=timeout)
+            r = session.get(CRTSH_BASE, params=params, timeout=timeout)
             if r.status_code == 200:
                 return r.json()
-        except Exception:
-            pass
+            print(f"  crt.sh {params.get('q','')[:40]} -> HTTP {r.status_code} (attempt {i+1})")
+        except Exception as e:
+            print(f"  crt.sh {params.get('q','')[:40]} failed: {str(e)[:60]} (attempt {i+1})")
         time.sleep(8 * (i + 1))
     return None
 
@@ -1545,28 +1312,6 @@ def parse_ts(s):
         return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
     except Exception:
         return None
-
-def sweep_candidates(session, max_sweep_seconds=480):
-    """Letter-sliced sweep with exclude=expired (keeps responses survivable).
-    Returns candidate stores — a MIX of new stores and old stores that
-    recently renewed. True age gets checked separately."""
-    letters = list("abcdefghijklmnopqrstuvwxyz0123456789")
-    random.shuffle(letters)
-    candidates = set()
-    t0 = time.time()
-    for ch in letters:
-        if time.time() - t0 > max_sweep_seconds:
-            print(f"  ⏱️ Sweep budget hit at letter '{ch}'")
-            break
-        data = crtsh_json(session, {"q": f"{ch}%.myshopify.com", "exclude": "expired"})
-        if not data:
-            print(f"  crt.sh: '{ch}' slice failed — skipping")
-            continue
-        for row in data:
-            candidates.update(extract_store_domains(row.get("name_value", "")))
-        print(f"  letter '{ch}': {len(candidates)} candidates so far")
-        time.sleep(3)
-    return sorted(candidates)
 
 def store_first_cert(session, domain):
     """Earliest cert EVER for this exact domain (expired included) = true birthday."""
@@ -1608,33 +1353,88 @@ def quick_store_check(domain):
         print(f"    check failed: {e}")
     return out
 
-def run_fresh_stores(job):
-    chat_id = str(job.get("chat_id", ""))
-    max_age = int(job.get("max_age_days", 30))
-    want = int(job.get("count", 15))
-    MAX_AGE_CHECKS = 200   # hard cap so the run always fits the 30-min Actions window
+def crtsh_heavy_slice(session, letter):
+    """Wildcard slice with patient cache-warm retries. On 504, crt.sh often
+    finishes the query server-side and caches it — the retry returns fast."""
+    params = {"q": f"{letter}%.myshopify.com", "exclude": "expired"}
+    for attempt in range(2):
+        try:
+            r = session.get(CRTSH_BASE, params=params, timeout=240)
+            if r.status_code == 200:
+                try:
+                    return r.json()
+                except Exception:
+                    return None
+            print(f"  crt.sh slice '{letter}' -> HTTP {r.status_code} (attempt {attempt+1})")
+        except Exception as e:
+            print(f"  crt.sh slice '{letter}' failed: {str(e)[:60]} (attempt {attempt+1})")
+        time.sleep(50)   # the cache-warm wait — this is the whole trick
+    return None
 
-    send_telegram(chat_id,
-        f"🌱 Fresh-store job started — sweeping crt.sh, then checking each store's "
-        f"FIRST-EVER certificate (true age ≤ {max_age} days).\n"
-        f"This takes 15–25 minutes. Results land here in batches.")
+def maybe_fresh_tick():
+    """Called whenever the job queue is empty. Runs at most one tick per
+    25 minutes, driven by the config /fresh sets in Redis."""
+    cfg_raw = redis_get("fresh:config")
+    if not cfg_raw:
+        return
+    try:
+        cfg = json.loads(cfg_raw)
+    except Exception:
+        return
+    got = redis("SET", "fresh:tick:lock", "1", "NX", "EX", "1500")
+    if not got or got != "OK":
+        return
+    try:
+        run_fresh_tick(cfg)
+    except Exception as e:
+        print(f"  fresh tick failed: {e}")
+
+def run_fresh_tick(cfg):
+    chat_id = str(cfg.get("chat_id", ""))
+    max_age = int(cfg.get("max_age_days", 30))
+    want = int(cfg.get("count", 15))
+    MAX_TICK_SECONDS = 20 * 60
+    t0 = time.time()
+    def time_left():
+        return MAX_TICK_SECONDS - (time.time() - t0)
 
     session = make_session()
-    candidates = sweep_candidates(session)
-    send_telegram(chat_id, f"🔎 Sweep done: {len(candidates)} candidates to age-check.")
-    if not candidates:
-        return
 
-    fresh, checks = [], 0
-    for d in candidates:
-        if len(fresh) >= want * 3 or checks >= MAX_AGE_CHECKS:
+    # ── Phase 1: one wildcard slice (round-robin via Redis) ──
+    letters = list("abcdefghijklmnopqrstuvwxyz0123456789")
+    done = set(redis("SMEMBERS", "fresh:slices:done") or [])
+    todo = [ch for ch in letters if ch not in done]
+    if not todo:
+        redis("DEL", "fresh:slices:done")     # full rotation done — restart
+        done, todo = set(), letters
+    letter = todo[0]
+
+    data = crtsh_heavy_slice(session, letter)
+    added = 0
+    if data:
+        redis_sadd("fresh:slices:done", letter)
+        for row in data:
+            for d in extract_store_domains(row.get("name_value", "")):
+                redis_sadd("fresh:candidates", d)
+                added += 1
+        print(f"  slice '{letter}' OK — {added} candidate entries")
+    else:
+        print(f"  slice '{letter}' gave up this run — next run has a fresh IP")
+
+    # ── Phase 2: age-check up to 25 candidates, report fresh ones ──
+    fresh = []
+    checked = 0
+    while checked < 25 and time_left() > 180:
+        d = redis("SPOP", "fresh:candidates")
+        if not d:
             break
-        if redis_sismember("fresh:processed", d):
+        d = str(d).strip().lower()
+        if not d or redis_sismember("fresh:processed", d):
             continue
-        checks += 1
+        checked += 1
         first = store_first_cert(session, d)
-        redis_sadd("fresh:processed", d)   # never age-check the same store twice
         if first:
+            redis_sadd("fresh:processed", d)
             age_days = (datetime.now(timezone.utc) - first).days
             if age_days <= max_age:
                 info = quick_store_check(d)
@@ -1642,88 +1442,88 @@ def run_fresh_stores(job):
                              "first_cert": first.strftime("%Y-%m-%d")})
                 fresh.append(info)
                 print(f"  🌱 {d} — {age_days}d old — {info['status']}")
+        else:
+            # lookup failed — park it with a fail counter, drop after 3 tries
+            fails = int(redis("HINCRBY", "fresh:failcnt", d, "1") or 0)
+            if fails < 3:
+                redis_sadd("fresh:candidates", d)
         time.sleep(2)
 
-    if not fresh:
-        send_telegram(chat_id,
-            f"Checked {checks} candidates — none ≤ {max_age} days old this run. "
-            f"New certs appear daily; try again tomorrow, or raise the age: /fresh 60")
-        return
-
-    for bstart in range(0, len(fresh), 10):
-        chunk = fresh[bstart:bstart + 10]
-        lines = [f"🌱 FRESH SHOPIFY STORES — batch {bstart // 10 + 1}"]
-        for i, s in enumerate(chunk, 1):
+    # ── Phase 3: report ──
+    pool = redis("SCARD", "fresh:candidates") or 0
+    summary = (f"🌱 tick done — slice '{letter}' "
+               f"{'OK' if data else 'refused (retries next run)'}, "
+               f"{checked} stores age-checked, {len(fresh)} fresh, "
+               f"{pool} candidates waiting in pool.")
+    if fresh:
+        lines = [summary, ""]
+        for i, s in enumerate(fresh[:want], 1):
             icon = {"live": "🟢", "locked": "🔒", "dead": "💀"}.get(s["status"], "❔")
-            lines.append(f"\n{i}. {s['domain']} {icon}")
-            lines.append(f"   🎂 First cert: {s['first_cert']} ({s['age_days']} days old)")
+            lines.append(f"{i}. {s['domain']} {icon}")
+            lines.append(f"   🎂 {s['first_cert']} ({s['age_days']} days old)")
             if s.get("custom_domain"):
-                lines.append(f"   🌐 Custom domain: {s['custom_domain']}")
+                lines.append(f"   🌐 {s['custom_domain']}")
             if s.get("title"):
                 lines.append(f"   🏷️ {s['title']}")
-            if s.get("socials"):
-                lines.append("   📱 " + ", ".join(f"{k}: {v}" for k, v in list(s["socials"].items())[:3]))
             if s.get("email"):
                 lines.append(f"   📧 {s['email']}")
             lines.append(f"   🔗 https://{s['domain']}")
-            if s["status"] == "locked":
-                lines.append("   💡 'Coming soon' store — pitch them at launch")
+            lines.append("")
         send_telegram(chat_id, "\n".join(lines))
-
-    send_telegram(chat_id, "Next: run the 🟢/🔒 ones through FB Ad Library — new store + active ads = has budget.")
-
-
-# [NEW] Dispatches a job popped off Redis to the right handler based on
-# its "type" field. Jobs with no "type" (or type == "find") are the
-# existing Google-Maps /find flow; type == "fresh" is the new crt.sh sweep.
-def handle_job(job):
-    job_type = job.get("type", "find")
-    if job_type == "fresh":
-        run_fresh_stores(job)
     else:
-        process_job(job)
+        send_telegram(chat_id, summary)
 
+
+# ── Main ──
+BANNER = r"""
+┌──────────────────────────────────┐
+│  Maps Daemon — Karios Agency     │
+│  Polls Redis → Scrapes Maps      │
+│  + fresh-store ticks (crt.sh)    │
+└──────────────────────────────────┘
+"""
+
+def handle_job(job_raw):
+    try:
+        data = json.loads(job_raw)
+    except Exception as e:
+        print(f"  Bad job payload: {e}")
+        return
+    if data.get("type") == "fresh":
+        # Legacy leftover from the old /fresh — the new system is automatic.
+        print("  Ignoring legacy 'fresh' job — fresh runs as automatic ticks now.")
+        return
+    try:
+        process_job(data)
+    except Exception as e:
+        print(f"  Job failed: {e}")
+        try:
+            send_telegram(str(data.get("chat_id", "")), f"⚠️ Job failed: {str(e)[:150]}")
+        except Exception:
+            pass
 
 def main():
-    print("╔═══════════════════════════════════════╗")
-    print("║     Maps Daemon — Karios Agency       ║")
-    print("║     Polls Redis → Scrapes Maps        ║")
-    print("╚═══════════════════════════════════════╝")
-
-    # [NEW] RUN_MODE=once — checks Redis ONE time and exits. Used by the
-    # GitHub Actions scheduled workflow, which wakes this script up every
-    # few minutes instead of it running forever on its own.
+    print(BANNER)
     if RUN_MODE == "once":
-        print("\nRUN_MODE=once — checking for a single waiting job...")
-        try:
-            result = redis("LPOP", "jobs:find")
-            if result:
-                job = json.loads(result)
-                handle_job(job)
-            else:
-                print("No job waiting. Exiting.")
-        except Exception as e:
-            print(f"Run error: {e}")
+        job_raw = redis("LPOP", "jobs:find")
+        if job_raw:
+            handle_job(job_raw)
+        else:
+            print("No job waiting — trying a fresh-store tick (if enabled & due)...")
+            maybe_fresh_tick()
+            print("Done. Exiting.")
         return
 
-    # Default: loop forever (for running on your own PC)
-    print("\nWaiting for /find jobs from Telegram bot...")
-    print("A browser window will open when a job starts.")
-    print("Press Ctrl+C to exit\n")
     while True:
         try:
-            result = redis("LPOP", "jobs:find")
-            if result:
-                job = json.loads(result)
-                handle_job(job)
-            else:
-                time.sleep(3)
-        except KeyboardInterrupt:
-            print("\n👋 Shutting down...")
-            break
+            job_raw = redis("LPOP", "jobs:find")
+            if job_raw:
+                handle_job(job_raw)
+                continue
+            maybe_fresh_tick()
         except Exception as e:
-            print(f"Loop error: {e}")
-            time.sleep(5)
+            print(f"  loop error: {e}")
+        time.sleep(5)
 
 if __name__ == "__main__":
     main()
