@@ -43,6 +43,14 @@ jobs:
       - name: Probe crt.sh with the SAME heavy wildcard query the daemon uses
         run: curl -s -o /tmp/wild.json -w "wildcard query -> HTTP %{http_code}, %{size_download} bytes, %{time_total}s\n" --max-time 60 "https://crt.sh/json?q=a%25.myshopify.com&exclude=expired"
 
+      # [NEW] Print exactly what crt.sh sent back for that wildcard query.
+      # 138 bytes is too small to be real cert data for a letter this
+      # common — this shows us whether it's an empty array, an error
+      # object, or something else so we know what we're actually dealing
+      # with instead of guessing from a byte count.
+      - name: Show the wildcard query response body
+        run: cat /tmp/wild.json; echo
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
