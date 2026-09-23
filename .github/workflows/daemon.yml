@@ -33,6 +33,16 @@ jobs:
       - name: Probe crt.sh from this IP
         run: curl -s -o /dev/null -w "crt.sh says HTTP %{http_code}\n" --max-time 25 "https://crt.sh/json?q=shops.myshopify.com"
 
+      # [NEW] Same heavy wildcard query the daemon's slice-sweep actually
+      # uses. The simple probe above hits crt.sh with one exact domain name
+      # (cheap); this one asks for every cert starting with "a" under
+      # myshopify.com (expensive). If this one fails to even connect while
+      # the simple probe succeeds, that tells us crt.sh is dropping the
+      # expensive wildcard query specifically — a different problem than an
+      # IP block, with a different fix.
+      - name: Probe crt.sh with the SAME heavy wildcard query the daemon uses
+        run: curl -s -o /tmp/wild.json -w "wildcard query -> HTTP %{http_code}, %{size_download} bytes, %{time_total}s\n" --max-time 60 "https://crt.sh/json?q=a%25.myshopify.com&exclude=expired"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
