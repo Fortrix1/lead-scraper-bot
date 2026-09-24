@@ -823,7 +823,7 @@ module.exports = async (req, res) => {
     await send(chatId,
       `🌱 Fresh-store monitoring ON for 14 days: crt.sh stores ≤ ${maxAge}d old, up to ${count} reported per tick.\n` +
       (dispatched ? 'First tick starting within a minute or two. ' : 'Ticks run on the cron schedule. ') +
-      `Each run sweeps one more letter of the alphabet and age-checks a batch — the pool fills over the next day, results arrive after each tick.\n\n` +
+      `A full crt.sh sweep refreshes the candidate pool roughly once every 20 hours; every run in between just age-checks a batch from that pool. Results arrive after each tick.\n\n` +
       `Send /freshoff anytime to stop.`)
     return res.status(200).send('OK')
   }

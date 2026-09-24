@@ -1408,7 +1408,12 @@ def should_run_full_sweep():
 
 def maybe_fresh_tick():
     """Called whenever the job queue is empty. Runs at most one tick per
-    25 minutes, driven by the config /fresh sets in Redis."""
+    60 seconds, driven by the config /fresh sets in Redis. This is short on
+    purpose: it only exists to stop two literally-simultaneous runs from
+    clobbering each other, not to rate-limit crt.sh — that's handled
+    separately by the ~20-hour gate on the heavy full sweep
+    (should_run_full_sweep). Per-domain age-check lookups are cheap and
+    have been reliable, so there's no need to throttle those further."""
     cfg_raw = redis_get("fresh:config")
     if not cfg_raw:
         print("  fresh:config not set in Redis — send /fresh <age_days> <count> in Telegram to turn monitoring on.")
@@ -1418,9 +1423,9 @@ def maybe_fresh_tick():
     except Exception as e:
         print(f"  fresh:config exists but isn't valid JSON ({e}) — send /fresh again to reset it.")
         return
-    got = redis("SET", "fresh:tick:lock", "1", "NX", "EX", "1500")
+    got = redis("SET", "fresh:tick:lock", "1", "NX", "EX", "60")
     if not got or got != "OK":
-        print("  A fresh-store tick already ran in the last 25 minutes — skipping this run (lock held).")
+        print("  A fresh-store tick is already running (lock held) — skipping this run.")
         return
     print(f"  fresh:config found: max_age_days={cfg.get('max_age_days')}, count={cfg.get('count')}, chat_id={cfg.get('chat_id')} — running tick...")
     try:
