@@ -1309,6 +1309,11 @@ def crtsh_json(session, params, timeout=90, tries=3):
             if r.status_code == 200:
                 return r.json()
             print(f"  crt.sh {params.get('q','')[:40]} -> HTTP {r.status_code} (attempt {i+1})")
+            if r.status_code == 429:
+                # We're being rate-limited — a short backoff just gets us
+                # rate-limited again immediately after. Back off much longer.
+                time.sleep(20)
+                continue
         except Exception as e:
             print(f"  crt.sh {params.get('q','')[:40]} failed: {str(e)[:60]} (attempt {i+1})")
         time.sleep(8 * (i + 1))
@@ -1493,9 +1498,7 @@ def run_fresh_tick(cfg):
             fails = int(redis("HINCRBY", "fresh:failcnt", d, "1") or 0)
             if fails < 3:
                 redis_sadd("fresh:candidates", d)
-        time.sleep(2)
-
-    # ── Phase 3: report ──
+        time.sleep(4)
     pool = redis("SCARD", "fresh:candidates") or 0
     sweep_note = "full sweep ran" if swept_this_run else f"using existing pool (was {pool_before} before this tick)"
     summary = (f"🌱 tick done — {sweep_note}, "
