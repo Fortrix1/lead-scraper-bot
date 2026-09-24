@@ -1316,7 +1316,15 @@ def crtsh_json(session, params, timeout=90, tries=3):
 
 def parse_ts(s):
     try:
-        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        # crt.sh doesn't always include a timezone suffix on not_before —
+        # without this, fromisoformat returns a naive datetime, and later
+        # subtracting it from datetime.now(timezone.utc) crashes with
+        # "can't subtract offset-naive and offset-aware datetimes". crt.sh
+        # timestamps are UTC, so a naive result just means "assume UTC".
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return None
 
