@@ -1399,9 +1399,11 @@ def crtsh_full_sweep(session, timeout=280, tries=2):
         time.sleep(30)
     return None
 
-FULL_SWEEP_MIN_INTERVAL_SECONDS = 20 * 60 * 60  # ~20 hours between full sweeps
+FULL_SWEEP_MIN_INTERVAL_SECONDS = 20 * 60 * 60      # ~20 hours between sweeps while there's still a backlog
+EMPTY_POOL_RESWEEP_COOLDOWN_SECONDS = 10 * 60       # but if the pool is EMPTY, don't wait 20h for more work —
+                                                     # just don't retry more than once per 10 minutes
 
-def should_run_full_sweep():
+def should_run_full_sweep(pool_size):
     last = redis_get("fresh:sweep:last")
     if not last:
         return True
@@ -1409,7 +1411,12 @@ def should_run_full_sweep():
         last_ts = float(last)
     except Exception:
         return True
-    return (time.time() - last_ts) >= FULL_SWEEP_MIN_INTERVAL_SECONDS
+    elapsed = time.time() - last_ts
+    if pool_size == 0:
+        # Nothing left to check — waiting out the full 20h gate here just
+        # wastes ticks doing nothing. Re-sweep as soon as it's reasonable.
+        return elapsed >= EMPTY_POOL_RESWEEP_COOLDOWN_SECONDS
+    return elapsed >= FULL_SWEEP_MIN_INTERVAL_SECONDS
 
 def maybe_fresh_tick():
     """Called whenever the job queue is empty. Runs at most one tick per
@@ -1455,8 +1462,9 @@ def run_fresh_tick(cfg):
     # every other tick just works through the pool from the last sweep.
     swept_this_run = False
     pool_before = redis("SCARD", "fresh:candidates") or 0
-    if should_run_full_sweep():
-        print("  running full crt.sh sweep (last one was 20+ hours ago, or never)...")
+    if should_run_full_sweep(pool_before):
+        reason = "pool is empty" if pool_before == 0 else "last sweep was 20+ hours ago"
+        print(f"  running full crt.sh sweep ({reason})...")
         data = crtsh_full_sweep(session)
         added = 0
         if data:
@@ -1470,7 +1478,8 @@ def run_fresh_tick(cfg):
         else:
             print("  full sweep failed this run — will retry next tick, using existing pool for now")
     else:
-        print("  full sweep skipped — ran within the last 20 hours, using existing candidate pool")
+        cooldown = "10 min" if pool_before == 0 else "20h"
+        print(f"  full sweep skipped — within the {cooldown} cooldown, using existing candidate pool ({pool_before} left)")
 
     # ── Phase 2: age-check up to 25 candidates, report fresh ones ──
     fresh = []
