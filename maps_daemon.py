@@ -1264,14 +1264,21 @@ def process_job(data):
 # ══════════════════════════════════════════════════════════════
 #  FRESH SHOPIFY STORES via crt.sh — tick-based (Actions-safe)
 #
-#  Instead of one mega-sweep (which crt.sh blocks), each daemon run
-#  with an empty job queue may run ONE tick:
-#    Phase 1: one wildcard letter-slice (round-robin via Redis)
+#  crt.sh only supports '%' as a LEADING wildcard ('%.myshopify.com'), not
+#  a mid-token prefix like 'a%.myshopify.com' — the latter returns an HTML
+#  "Unsupported use of '%'" error (with HTTP 200!), which is why an earlier
+#  version of this that tried per-letter slicing silently produced nothing
+#  every single run. So instead: each daemon run with an empty job queue
+#  may run ONE tick:
+#    Phase 1: occasionally (≈once/20h) run the ONE query crt.sh actually
+#             supports — the full '%.myshopify.com' sweep — and cache
+#             every candidate domain it finds in Redis. Skipped on ticks
+#             that ran too recently, since it's a heavy request.
 #    Phase 2: age-check up to 25 pooled candidates (true birthday =
-#             earliest cert EVER for that exact domain)
+#             earliest cert EVER for that exact domain — this part uses
+#             small exact-domain queries, which crt.sh handles fine)
 #    Phase 3: report fresh finds to Telegram
 #  Cron fires every 10 min; a lock limits ticks to one per 25 min.
-#  Full alphabet covered in ~1 day; failures retry on a fresh IP.
 # ══════════════════════════════════════════════════════════════
 
 # Optional relay (Cloudflare Worker) for when GitHub's IP is hard-blocked.
@@ -1353,23 +1360,43 @@ def quick_store_check(domain):
         print(f"    check failed: {e}")
     return out
 
-def crtsh_heavy_slice(session, letter):
-    """Wildcard slice with patient cache-warm retries. On 504, crt.sh often
-    finishes the query server-side and caches it — the retry returns fast."""
-    params = {"q": f"{letter}%.myshopify.com", "exclude": "expired"}
-    for attempt in range(2):
+def crtsh_full_sweep(session, timeout=280, tries=2):
+    """crt.sh only supports '%' as a LEADING wildcard (e.g. '%.myshopify.com',
+    proven to work — that's exactly what you ran manually in the browser).
+    It does NOT support a mid-token wildcard like 'a%.myshopify.com' — that
+    returns an HTML error page ("Unsupported use of '%'") with HTTP 200,
+    which is why the old letter-sliced sweep silently produced nothing every
+    single run. There's no cheap way to slice this query server-side, so
+    this pulls the WHOLE myshopify.com identity list in one (heavy) request
+    instead. Called rarely — see should_run_full_sweep() — not every tick."""
+    params = {"q": "%.myshopify.com", "exclude": "expired"}
+    for attempt in range(tries):
         try:
-            r = session.get(CRTSH_BASE, params=params, timeout=240)
+            r = session.get(CRTSH_BASE, params=params, timeout=timeout)
             if r.status_code == 200:
                 try:
                     return r.json()
-                except Exception:
+                except Exception as e:
+                    print(f"  full sweep: got HTTP 200 but body isn't valid JSON ({e}) — "
+                          f"likely an HTML error page from crt.sh, not real cert data")
                     return None
-            print(f"  crt.sh slice '{letter}' -> HTTP {r.status_code} (attempt {attempt+1})")
+            print(f"  full sweep -> HTTP {r.status_code} (attempt {attempt+1})")
         except Exception as e:
-            print(f"  crt.sh slice '{letter}' failed: {str(e)[:60]} (attempt {attempt+1})")
-        time.sleep(50)   # the cache-warm wait — this is the whole trick
+            print(f"  full sweep failed: {str(e)[:80]} (attempt {attempt+1})")
+        time.sleep(30)
     return None
+
+FULL_SWEEP_MIN_INTERVAL_SECONDS = 20 * 60 * 60  # ~20 hours between full sweeps
+
+def should_run_full_sweep():
+    last = redis_get("fresh:sweep:last")
+    if not last:
+        return True
+    try:
+        last_ts = float(last)
+    except Exception:
+        return True
+    return (time.time() - last_ts) >= FULL_SWEEP_MIN_INTERVAL_SECONDS
 
 def maybe_fresh_tick():
     """Called whenever the job queue is empty. Runs at most one tick per
@@ -1404,26 +1431,28 @@ def run_fresh_tick(cfg):
 
     session = make_session()
 
-    # ── Phase 1: one wildcard slice (round-robin via Redis) ──
-    letters = list("abcdefghijklmnopqrstuvwxyz0123456789")
-    done = set(redis("SMEMBERS", "fresh:slices:done") or [])
-    todo = [ch for ch in letters if ch not in done]
-    if not todo:
-        redis("DEL", "fresh:slices:done")     # full rotation done — restart
-        done, todo = set(), letters
-    letter = todo[0]
-
-    data = crtsh_heavy_slice(session, letter)
-    added = 0
-    if data:
-        redis_sadd("fresh:slices:done", letter)
-        for row in data:
-            for d in extract_store_domains(row.get("name_value", "")):
-                redis_sadd("fresh:candidates", d)
-                added += 1
-        print(f"  slice '{letter}' OK — {added} candidate entries")
+    # ── Phase 1: occasionally refresh the FULL candidate pool ──
+    # See crtsh_full_sweep()'s docstring for why this can't be sliced by
+    # letter. It's a heavy request, so it only runs once every ~20 hours;
+    # every other tick just works through the pool from the last sweep.
+    swept_this_run = False
+    pool_before = redis("SCARD", "fresh:candidates") or 0
+    if should_run_full_sweep():
+        print("  running full crt.sh sweep (last one was 20+ hours ago, or never)...")
+        data = crtsh_full_sweep(session)
+        added = 0
+        if data:
+            for row in data:
+                for d in extract_store_domains(row.get("name_value", "")):
+                    redis_sadd("fresh:candidates", d)
+                    added += 1
+            redis_set("fresh:sweep:last", str(time.time()))
+            swept_this_run = True
+            print(f"  full sweep OK — {len(data)} certs scanned, {added} candidate domain entries added")
+        else:
+            print("  full sweep failed this run — will retry next tick, using existing pool for now")
     else:
-        print(f"  slice '{letter}' gave up this run — next run has a fresh IP")
+        print("  full sweep skipped — ran within the last 20 hours, using existing candidate pool")
 
     # ── Phase 2: age-check up to 25 candidates, report fresh ones ──
     fresh = []
@@ -1455,8 +1484,8 @@ def run_fresh_tick(cfg):
 
     # ── Phase 3: report ──
     pool = redis("SCARD", "fresh:candidates") or 0
-    summary = (f"🌱 tick done — slice '{letter}' "
-               f"{'OK' if data else 'refused (retries next run)'}, "
+    sweep_note = "full sweep ran" if swept_this_run else f"using existing pool (was {pool_before} before this tick)"
+    summary = (f"🌱 tick done — {sweep_note}, "
                f"{checked} stores age-checked, {len(fresh)} fresh, "
                f"{pool} candidates waiting in pool.")
     if fresh:
