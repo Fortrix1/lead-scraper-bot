@@ -249,6 +249,25 @@ Separately, `/scout` results are tagged with store age too (`🎂 age: 12d 🔥`
 
 **If crt.sh is blocked or rate-limiting your daemon's IP** (common on shared GitHub Actions IPs), the workflow's "Probe crt.sh from this IP" step will show `HTTP 403` in the Actions log instead of `HTTP 200`. In that case, set a `CRTSH_RELAY_URL` secret pointing at a small proxy (e.g. a Cloudflare Worker) that forwards requests to `crt.sh/json` from a different IP — both the daemon and the bot's own age lookups use it automatically once it's set.
 
+### Fresh Shopify Stores — real-time mode (CertStream, runs locally)
+
+`certstream_watcher.py` is a companion to the crt.sh tick system above, not a replacement. It connects to [CertStream](https://certstream.calidog.io/) — a live push feed of every certificate as it's issued across public Certificate Transparency logs — and watches for anything under `myshopify.com`. Instead of polling an overloaded server (crt.sh) and hoping it answers, certificates are pushed to it the moment they're issued, so a genuinely new store can get reported within seconds rather than however long it takes the next GitHub Actions tick to stumble onto it.
+
+**This runs on your PC, not GitHub Actions** — it needs a persistent, always-connected process, which a one-shot 10-minute cron job can't provide. Run it in its own terminal window, the same way you'd run `maps_daemon.py` in loop mode:
+
+```bash
+pip install -r requirements.txt
+python certstream_watcher.py
+```
+
+Leave it running. It prints a line to the terminal whenever it reports something; Ctrl+C to stop.
+
+It reuses the **same `/fresh` config** your Telegram bot already sets — no new commands. Send `/fresh 45 15` as usual to turn monitoring on (or `/freshoff` to pause it); the watcher and the GitHub Actions ticks both read that same setting. They also share the same Redis `fresh:processed` set, so whichever one sees a domain first marks it done — no duplicate reports between the two.
+
+Every match still goes through the same "is this a genuinely new store, or just a renewal of an old one" check (pulling the domain's full cert history to find its true first-ever certificate) before anything gets reported — CertStream tells you a cert was *just issued*, not that the store is new; those aren't the same thing for a store that's simply renewing.
+
+**Reliability note:** the public CertStream demo endpoint (`certstream.calidog.io`) is a free community service and isn't guaranteed to stay connected — the script auto-reconnects on drops, but if it proves too flaky over time, a self-hosted alternative ([`certstream-server-go`](https://github.com/d-Rickyy-b/certstream-server-go)) exists; point `CERTSTREAM_URL` at your own instance instead (no code changes needed, just the env var). Either way, GitHub Actions keeps running its own independent crt.sh ticks in the background regardless of whether this script is running, so losing the CertStream connection just means you fall back to the slower polling path, not that monitoring stops entirely.
+
 ### URLScan Scraping
 
 Send `/scout` in Telegram → pick a search → reply with how many leads → choose whether to include locked stores.
