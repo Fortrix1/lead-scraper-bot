@@ -1381,14 +1381,25 @@ def crtsh_full_sweep(session, timeout=280, tries=2):
     which is why the old letter-sliced sweep silently produced nothing every
     single run. There's no cheap way to slice this query server-side, so
     this pulls the WHOLE myshopify.com identity list in one (heavy) request
-    instead. Called rarely — see should_run_full_sweep() — not every tick."""
-    params = {"q": "%.myshopify.com", "exclude": "expired"}
+    instead. Called rarely — see should_run_full_sweep() — not every tick.
+
+    No 'exclude=expired' filter: it adds an extra filtering condition to an
+    already-expensive wildcard query, which is likely part of why crt.sh
+    has been returning the exact same small ~149-row result every time
+    instead of the thousands of rows that exist (confirmed via the browser
+    UI) — a probable internal row/time cap on expensive filtered wildcard
+    queries. We don't need the filter here anyway: this call only discovers
+    domain NAMES: age (and thus expiry-relevance) is determined separately,
+    per domain, by store_first_cert()'s own full-history query."""
+    params = {"q": "%.myshopify.com"}
     for attempt in range(tries):
         try:
             r = session.get(CRTSH_BASE, params=params, timeout=timeout)
             if r.status_code == 200:
                 try:
-                    return r.json()
+                    data = r.json()
+                    print(f"  full sweep: crt.sh returned {len(data)} raw rows")
+                    return data
                 except Exception as e:
                     print(f"  full sweep: got HTTP 200 but body isn't valid JSON ({e}) — "
                           f"likely an HTML error page from crt.sh, not real cert data")
@@ -1466,15 +1477,22 @@ def run_fresh_tick(cfg):
         reason = "pool is empty" if pool_before == 0 else "last sweep was 20+ hours ago"
         print(f"  running full crt.sh sweep ({reason})...")
         data = crtsh_full_sweep(session)
-        added = 0
+        added, already_seen = 0, 0
         if data:
             for row in data:
                 for d in extract_store_domains(row.get("name_value", "")):
+                    # Skip domains we've already fully checked — re-adding them
+                    # just pollutes the pool with dead weight that gets popped
+                    # and silently discarded next tick.
+                    if redis_sismember("fresh:processed", d):
+                        already_seen += 1
+                        continue
                     redis_sadd("fresh:candidates", d)
                     added += 1
             redis_set("fresh:sweep:last", str(time.time()))
             swept_this_run = True
-            print(f"  full sweep OK — {len(data)} certs scanned, {added} candidate domain entries added")
+            print(f"  full sweep OK — {len(data)} certs scanned, {added} new candidate(s) added, "
+                  f"{already_seen} already-processed domain(s) skipped")
         else:
             print("  full sweep failed this run — will retry next tick, using existing pool for now")
     else:
@@ -1484,12 +1502,18 @@ def run_fresh_tick(cfg):
     # ── Phase 2: age-check up to 25 candidates, report fresh ones ──
     fresh = []
     checked = 0
+    already_processed = 0
+    popped_empty = False
     while checked < 25 and time_left() > 180:
         d = redis("SPOP", "fresh:candidates")
         if not d:
+            popped_empty = True
             break
         d = str(d).strip().lower()
-        if not d or redis_sismember("fresh:processed", d):
+        if not d:
+            continue
+        if redis_sismember("fresh:processed", d):
+            already_processed += 1
             continue
         checked += 1
         first = store_first_cert(session, d)
@@ -1508,6 +1532,10 @@ def run_fresh_tick(cfg):
             if fails < 3:
                 redis_sadd("fresh:candidates", d)
         time.sleep(4)
+    if already_processed:
+        print(f"  skipped {already_processed} already-processed domain(s) pulled from the pool")
+    if popped_empty:
+        print("  pool ran dry mid-tick")
     pool = redis("SCARD", "fresh:candidates") or 0
     sweep_note = "full sweep ran" if swept_this_run else f"using existing pool (was {pool_before} before this tick)"
     summary = (f"🌱 tick done — {sweep_note}, "
