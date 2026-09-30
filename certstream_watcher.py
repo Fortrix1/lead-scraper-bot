@@ -78,14 +78,16 @@ def extract_candidate_domains(leaf_cert):
 def handle_candidate(domain):
     cfg_raw = md.redis_get("fresh:config")
     if not cfg_raw:
-        return  # /fresh isn't active — nothing to do
+        print("     (not checked: /fresh isn't active — send /fresh in Telegram)")
+        return
     try:
         cfg = json.loads(cfg_raw)
     except Exception:
         return
 
     if md.redis_sismember("fresh:processed", domain):
-        return  # GitHub Actions (or this script, earlier) already handled it
+        print("     (already checked before — skipping)")
+        return
 
     # We just SAW a cert get issued for this domain — but that could still
     # be a renewal cert for a years-old store, not a new one. Confirm by
@@ -94,13 +96,15 @@ def handle_candidate(domain):
     session = get_session()
     first = md.store_first_cert(session, domain)
     if not first:
-        return  # lookup failed — a later GitHub Actions tick will retry it
+        print("     (crt.sh lookup failed — a later GitHub Actions tick will retry)")
+        return
 
     md.redis_sadd("fresh:processed", domain)
     age_days = (datetime.now(timezone.utc) - first).days
     max_age = int(cfg.get("max_age_days", 30))
     if age_days > max_age:
-        return  # real store, just not a NEW one
+        print(f"     (real store, but {age_days}d old — renewal, not new — skipping)")
+        return
 
     chat_id = str(cfg.get("chat_id", ""))
     if not chat_id:
@@ -131,6 +135,12 @@ def on_message(message, context):
         return
     leaf_cert = message.get("data", {}).get("leaf_cert", {})
     for domain in extract_candidate_domains(leaf_cert):
+        # Proof the pipeline is actually alive: print every myshopify.com
+        # domain spotted, BEFORE the slower "is this genuinely new" network
+        # check runs. Most of these will turn out to be renewals of old
+        # stores — that's normal — but seeing this line at all confirms
+        # real data is flowing through, not just that the socket is open.
+        print(f"  👀 saw: {domain}")
         try:
             handle_candidate(domain)
         except Exception as e:
