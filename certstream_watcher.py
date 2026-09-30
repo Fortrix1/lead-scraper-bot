@@ -30,6 +30,7 @@ maps_daemon.py in loop mode. Ctrl+C to stop.
 import os
 import json
 import time
+import logging
 from datetime import datetime, timezone
 
 import certstream
@@ -39,6 +40,12 @@ import certstream
 # Importing it does NOT start the maps daemon; that only happens under
 # maps_daemon.py's own `if __name__ == "__main__":` guard.
 import maps_daemon as md
+
+# The certstream library logs its own "Connection established!" message via
+# Python's logging module, but does nothing to configure it — without this,
+# that confirmation is silently swallowed and never printed anywhere,
+# despite the library's own `setup_logger=True` default implying it would.
+logging.basicConfig(level=logging.INFO, format="  %(message)s")
 
 # Public demo endpoint by default. If it proves too unreliable, point this
 # at a self-hosted certstream-server-go instance instead — no code changes
@@ -131,7 +138,16 @@ def on_message(message, context):
             print(f"  error handling {domain}: {e}")
 
 
-def on_error(ws, error, context=None):
+def on_open():
+    print("✅ Connected — listening for new certificates...")
+
+
+def on_error(error):
+    # The certstream library calls this with just the exception itself —
+    # not (ws, error, context) like some websocket callback conventions.
+    # Getting this signature wrong means a real connection error would
+    # crash here with a confusing "missing argument" TypeError instead of
+    # showing you what actually went wrong.
     print(f"  certstream connection error: {error}")
 
 
@@ -145,7 +161,7 @@ def main():
           "send /fresh in Telegram if you haven't already.)")
     while True:
         try:
-            certstream.listen_for_events(on_message, url=CERTSTREAM_URL, on_error=on_error)
+            certstream.listen_for_events(on_message, url=CERTSTREAM_URL, on_open=on_open, on_error=on_error)
         except KeyboardInterrupt:
             print("\nStopped.")
             break
