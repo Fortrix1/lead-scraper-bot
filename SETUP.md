@@ -50,6 +50,7 @@
 |------|-------|
 | `SCRAPER_BOT_TOKEN` | your bot token |
 | `SCRAPER_ADMIN_ID` | your Telegram user ID — **required**: the bot now locks out anyone whose ID doesn't match this |
+| `COMPANIES_HOUSE_API_KEY` | *(optional)* enables `/newuk` — free, see below |
 | `UPSTASH_REDIS_REST_URL` | your Upstash REST URL |
 | `UPSTASH_REDIS_REST_TOKEN` | your Upstash REST token |
 
@@ -249,6 +250,26 @@ Separately, `/scout` results are tagged with store age too (`🎂 age: 12d 🔥`
 
 **If crt.sh is blocked or rate-limiting your daemon's IP** (common on shared GitHub Actions IPs), the workflow's "Probe crt.sh from this IP" step will show `HTTP 403` in the Actions log instead of `HTTP 200`. In that case, set a `CRTSH_RELAY_URL` secret pointing at a small proxy (e.g. a Cloudflare Worker) that forwards requests to `crt.sh/json` from a different IP — both the daemon and the bot's own age lookups use it automatically once it's set.
 
+### Newly Incorporated UK Companies (Companies House)
+
+In Telegram, send:
+```
+/newuk 1 20      # companies incorporated in the last 1 day, up to 20 reported
+```
+`1` = how many days back to search (default 1, capped at 30), `20` = how many to report (default 20, capped at 100).
+
+This calls the UK government's own [Companies House Advanced Search API](https://developer.company-information.service.gov.uk/api/docs/search/advanced-search/advancedSearchCompanies.html) directly — free, official, no scraping, and unlike crt.sh it's fast and reliable, so it runs straight from Vercel with no daemon involved. Each company includes its incorporation date, type, registered address, and a link to its public Companies House page. Results are deduplicated the same way `/scout` leads are, so re-running `/newuk` won't re-send companies you've already seen.
+
+**One-time setup (free, ~2 minutes):**
+1. Register at [developer.company-information.service.gov.uk](https://developer.company-information.service.gov.uk/)
+2. Create an application, then "Create new key" → choose **REST API key**
+3. Add it to Vercel → Settings → Environment Variables as `COMPANIES_HOUSE_API_KEY`
+4. Redeploy
+
+Without this key set, `/newuk` will tell you it's not configured yet rather than failing silently.
+
+**Coverage note:** this is UK-only. A US equivalent is possible but more limited — only 5 states (NY, CO, CT, PA, OR) publish free, commercial-use-OK open incorporation data; the largest states (Texas, California, Delaware) don't offer free bulk access at all. Germany's Handelsregister has no free official API for this either — every option is a paid third-party service sitting in front of the same government portal. Ask if you want either of those built; they're real, just not "flip a free switch" the way the UK one is.
+
 ### Fresh Shopify Stores — real-time mode (CertStream, runs locally)
 
 `certstream_watcher.py` is a companion to the crt.sh tick system above, not a replacement. It connects to [CertStream](https://certstream.calidog.io/) — a live push feed of every certificate as it's issued across public Certificate Transparency logs — and watches for anything under `myshopify.com`. Instead of polling an overloaded server (crt.sh) and hoping it answers, certificates are pushed to it the moment they're issued, so a genuinely new store can get reported within seconds rather than however long it takes the next GitHub Actions tick to stumble onto it.
@@ -290,6 +311,7 @@ Send a `.txt` file with one URL per line. The bot extracts, dedupes, and checks 
 | `/fresh [age_days] [count]` | Turn ON fresh-Shopify-store monitoring via crt.sh ticks (default: ≤30 days, top 15/tick) |
 | `/freshoff` | Turn OFF fresh-store monitoring |
 | `/audit` | Show the last 50 commands run, by whom and when |
+| `/newuk [days] [count]` | Newly incorporated UK companies via Companies House (default: last 1 day, top 20) |
 | `/campaigns` | List campaigns and how many leads each has |
 | `/leads <status>` | List leads by status: new, contacted, replied, interested, not_interested, do_not_contact, client |
 | `/mark <number> <status>` | Mark lead #N from your last /find report with a status |

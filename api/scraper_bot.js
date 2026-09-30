@@ -22,6 +22,10 @@ module.exports = async (req, res) => {
   const GITHUB_REPO  = process.env.GITHUB_REPO  || ''
   const GITHUB_WORKFLOW_FILE = process.env.GITHUB_WORKFLOW_FILE || 'daemon.yml'
 
+  // Free official Companies House API key — developer.company-information.service.gov.uk
+  // (register -> create an application -> "Create new key", REST API key type)
+  const COMPANIES_HOUSE_API_KEY = process.env.COMPANIES_HOUSE_API_KEY || ''
+
   const BATCH_SIZE  = 8
   const CONCURRENCY = 4
 
@@ -283,6 +287,33 @@ module.exports = async (req, res) => {
       if (m) socials[key] = m[0]
     }
     return socials
+  }
+
+  // Official, free Companies House "advanced search" — the one API endpoint
+  // that's genuinely built for this (unlike crt.sh's wildcard search, this
+  // is a documented, supported query pattern with a real 600-req/5min
+  // budget, not something we're working around). Auth is HTTP Basic with
+  // the API key as the username and an empty password — that's the
+  // spec's own convention, not a workaround.
+  async function fetchNewUKCompanies(fromDate, toDate, size) {
+    const params = new URLSearchParams({
+      incorporated_from: fromDate,
+      incorporated_to: toDate,
+      size: String(Math.min(Math.max(size, 1), 5000)),
+    })
+    const url = `https://api.company-information.service.gov.uk/advanced-search/companies?${params}`
+    const auth = Buffer.from(`${COMPANIES_HOUSE_API_KEY}:`).toString('base64')
+    try {
+      const r = await fetch(url, { headers: { Authorization: `Basic ${auth}` } })
+      if (!r.ok) {
+        console.error('Companies House error:', r.status, await r.text().catch(() => ''))
+        return null
+      }
+      return await r.json()
+    } catch (e) {
+      console.error('Companies House fetch failed:', e.message)
+      return null
+    }
   }
 
   async function getSpeedIndexSeconds(url) {
@@ -748,6 +779,7 @@ module.exports = async (req, res) => {
       `🌱 /fresh [age_days] [count] — turn ON new-Shopify-store monitoring via crt.sh (automatic ticks)\n` +
       `🛑 /freshoff — stop fresh-store monitoring\n` +
       `📋 /campaigns — see all your campaigns (e.g. "Med Spa — Miami") and lead counts\n` +
+      `🇬🇧 /newuk [days] [count] — newly incorporated UK companies (Companies House, official & free)\n` +
       `📂 /leads <status> — list leads by status: ${LEAD_STATUSES.join(', ')}\n` +
       `✅ /mark <number> <status> — mark lead #N from your last report (e.g. /mark 3 contacted)\n` +
       `🚫 /others — blacklisted links from last search\n` +
@@ -831,6 +863,66 @@ module.exports = async (req, res) => {
   if (text === '/freshoff') {
     await redis('DEL', 'fresh:config')
     await send(chatId, '🛑 Fresh-store monitoring stopped.')
+    return res.status(200).send('OK')
+  }
+
+  // ── /newuk [days] [count] — newly incorporated UK companies (Companies House) ──
+  // Official free API, no daemon needed — this runs straight from Vercel.
+  if (text.startsWith('/newuk')) {
+    if (!COMPANIES_HOUSE_API_KEY) {
+      await send(chatId,
+        `🇬🇧 Companies House isn't set up yet.\n\n` +
+        `It's free — register at developer.company-information.service.gov.uk, ` +
+        `create an application, then "Create new key" (REST API key type). ` +
+        `Add it to Vercel as COMPANIES_HOUSE_API_KEY, then redeploy.`)
+      return res.status(200).send('OK')
+    }
+    const parts = text.split(' ').slice(1)
+    const days = Math.min(Math.max(parseInt(parts[0]) || 1, 1), 30)
+    const count = Math.min(Math.max(parseInt(parts[1]) || 20, 1), 100)
+
+    const today = new Date()
+    const fromDate = new Date(today)
+    fromDate.setDate(fromDate.getDate() - days)
+    const fmt = d => d.toISOString().slice(0, 10)
+
+    await send(chatId, `🇬🇧 Pulling UK companies incorporated in the last ${days} day(s)...`)
+    const data = await fetchNewUKCompanies(fmt(fromDate), fmt(today), count)
+    if (!data) {
+      await send(chatId, `Companies House request failed — check the API key is valid in Vercel, or try again shortly.`)
+      return res.status(200).send('OK')
+    }
+
+    const items = (data.items || []).slice(0, count)
+    if (!items.length) {
+      await send(chatId, `No UK companies found for that window (${data.hits || 0} total hits before capping).`)
+      return res.status(200).send('OK')
+    }
+
+    // Dedup against previously-sent companies, same "seen" hash the /scout flow uses
+    const dedupeKeys = items.map(it => `ukco:${it.company_number}`)
+    const seenMap = await getSeenBatch(dedupeKeys)
+    const fresh = items.filter((it, i) => !seenMap[dedupeKeys[i]])
+    if (fresh.length) {
+      await markSeenBatch(fresh.map(it => [`ukco:${it.company_number}`, { sentAt: new Date().toISOString() }]))
+    }
+
+    if (!fresh.length) {
+      await send(chatId, `✓ ${items.length} in range — all already sent to you before. Nothing new.`)
+      return res.status(200).send('OK')
+    }
+
+    let reply = `🇬🇧 ${fresh.length} new UK compan${fresh.length === 1 ? 'y' : 'ies'} (${items.length} in range, ${data.hits || 0} total hits):`
+    fresh.forEach((it, i) => {
+      const addr = it.registered_office_address || {}
+      const addrLine = [addr.address_line_1, addr.locality, addr.postal_code].filter(Boolean).join(', ')
+      reply += `\n\n${i + 1}. ${it.company_name}` +
+        `\n    📅 Incorporated: ${it.date_of_creation}` +
+        `\n    🏢 ${it.company_type || 'unknown type'}` +
+        (addrLine ? `\n    📍 ${addrLine}` : '') +
+        `\n    🔗 https://find-and-update.company-information.service.gov.uk/company/${it.company_number}`
+    })
+    await send(chatId, reply)
     return res.status(200).send('OK')
   }
 
