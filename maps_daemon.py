@@ -1274,7 +1274,7 @@ def process_job(data):
 #             supports — the full '%.myshopify.com' sweep — and cache
 #             every candidate domain it finds in Redis. Skipped on ticks
 #             that ran too recently, since it's a heavy request.
-#    Phase 2: age-check up to 25 pooled candidates (true birthday =
+#    Phase 2: age-check up to 75 pooled candidates (true birthday =
 #             earliest cert EVER for that exact domain — this part uses
 #             small exact-domain queries, which crt.sh handles fine)
 #    Phase 3: report fresh finds to Telegram
@@ -1499,12 +1499,12 @@ def run_fresh_tick(cfg):
         cooldown = "10 min" if pool_before == 0 else "20h"
         print(f"  full sweep skipped — within the {cooldown} cooldown, using existing candidate pool ({pool_before} left)")
 
-    # ── Phase 2: age-check up to 25 candidates, report fresh ones ──
+    # ── Phase 2: age-check up to 75 candidates, report fresh ones ──
     fresh = []
     checked = 0
     already_processed = 0
     popped_empty = False
-    while checked < 25 and time_left() > 180:
+    while checked < 75 and time_left() > 180:
         d = redis("SPOP", "fresh:candidates")
         if not d:
             popped_empty = True
