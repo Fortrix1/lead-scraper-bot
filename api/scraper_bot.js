@@ -777,6 +777,7 @@ module.exports = async (req, res) => {
       `🔍 /scout — search URLScan.io for Shopify leads\n` +
       `🗺️ /find <city> <niche> [count] — scrape Google Maps (runs on your PC, sends a .txt report)\n` +
       `🌱 /fresh [age_days] [count] — turn ON new-Shopify-store monitoring via crt.sh (automatic ticks)\n` +
+      `🕵️ /findco <url> — company web discovery: fetch a list of "Company, City" lines, find their websites via authenticated Google\n` +
       `🛑 /freshoff — stop fresh-store monitoring\n` +
       `📋 /campaigns — see all your campaigns (e.g. "Med Spa — Miami") and lead counts\n` +
       `🇬🇧 /newuk [days] [count] — newly incorporated UK companies (Companies House, official & free)\n` +
@@ -863,6 +864,69 @@ module.exports = async (req, res) => {
   if (text === '/freshoff') {
     await redis('DEL', 'fresh:config')
     await send(chatId, '🛑 Fresh-store monitoring stopped.')
+    return res.status(200).send('OK')
+  }
+  // ── /findco <url> — company web discovery via authenticated Google ──
+  // Fetches a raw text list: one company per line, "Company Name, City" or
+  // "Company Name | City" (location optional, defaults to UK). Posts a
+  // {"type": "discovery"} job for the daemon. Requires google cookies at
+  // cookies/google_cookies.json on the machine running the daemon.
+  if (text.startsWith('/findco')) {
+    const url = text.split(' ')[1]
+    if (!url || !url.startsWith('http')) {
+      await send(chatId, `Usage: /findco <url to raw company list>\n` +
+        `List format — one per line:\n` +
+        `  Acme Ltd, London\n` +
+        `  WidgetCo | Manchester\n` +
+        `  SoloCompany\n\n` +
+        `Also needs Google cookies exported via the Cookie-Editor extension ` +
+        `saved as cookies/google_cookies.json next to maps_daemon.py.`)
+      return res.status(200).send('OK')
+    }
+    await send(chatId, `📥 Fetching company list...`)
+    try {
+      const controller = new AbortController()
+      const t = setTimeout(() => controller.abort(), 8000)
+      const r = await fetch(url, { signal: controller.signal, headers: { 'User-Agent': 'Mozilla/5.0' } })
+      clearTimeout(t)
+      if (!r.ok) { await send(chatId, `Fetch failed (HTTP ${r.status}).`); return res.status(200).send('OK') }
+      const raw = await r.text()
+      const companies = []
+      for (let line of raw.split('\n')) {
+        line = line.trim()
+        if (!line || line.startsWith('#')) continue
+        let name = line, location = 'UK'
+        if (line.includes('|')) {
+          const parts = line.split('|').map(s => s.trim())
+          name = parts[0]; if (parts[1]) location = parts.slice(1).join(', ')
+        } else if (line.includes(',')) {
+          const idx = line.lastIndexOf(',')
+          const maybeLoc = line.slice(idx + 1).trim()
+          // treat the comma-separated tail as a location only if it's short
+          // and contains no digits-only junk (keeps "Smith, Sons & Co" intact)
+          if (maybeLoc && maybeLoc.length <= 60 && !/^\d+$/.test(maybeLoc)) {
+            name = line.slice(0, idx).trim()
+            location = maybeLoc
+          }
+        }
+        if (name) companies.push({ name, location })
+        if (companies.length >= 500) break
+      }
+      if (!companies.length) { await send(chatId, `No parseable companies found.`); return res.status(200).send('OK') }
+      const jobId = `co-${Date.now()}`
+      await redis('RPUSH', 'jobs:find', JSON.stringify({
+        type: 'discovery', chat_id: chatId, job_id: jobId, companies, max: 100
+      }))
+      const dispatched = await triggerGithubWorkflow()
+      await send(chatId,
+        `✅ Discovery job posted: ${companies.length} compan${companies.length === 1 ? 'y' : 'ies'} ` +
+        `(job ${jobId}).\n` +
+        (dispatched
+          ? `Triggered GitHub Actions immediately — should start within a minute or two.\n`
+          : `Make sure the daemon is running, or wait for the next scheduled run.\n`) +
+        `Searches are rate-limited (~40/hour shared across all runners) and cached for 30 days. ` +
+        `Expect batches of results in Telegram as they're found.`)
+    } catch (e) { await send(chatId, `Couldn't fetch that URL.`) }
     return res.status(200).send('OK')
   }
 

@@ -289,6 +289,55 @@ Every match still goes through the same "is this a genuinely new store, or just 
 
 **Reliability note:** the public CertStream demo endpoint (`certstream.calidog.io`) is a free community service and isn't guaranteed to stay connected — the script auto-reconnects on drops, but if it proves too flaky over time, a self-hosted alternative ([`certstream-server-go`](https://github.com/d-Rickyy-b/certstream-server-go)) exists; point `CERTSTREAM_URL` at your own instance instead (no code changes needed, just the env var). Either way, GitHub Actions keeps running its own independent crt.sh ticks in the background regardless of whether this script is running, so losing the CertStream connection just means you fall back to the slower polling path, not that monitoring stops entirely.
 
+
+### Company Web Discovery (/findco) — authenticated Google search
+
+`web_discovery.py` finds companies' websites and LinkedIn pages by searching
+Google with your **real, logged-in Chrome cookies** — so it doesn't hit
+CAPTCHAs the way anonymous scraping does, and it shares your existing
+daemon infrastructure (Redis queue, GitHub Actions schedule, Telegram
+reports).
+
+**One-time cookie setup (~2 minutes, redo whenever Google logs you out):**
+1. Install the **Cookie-Editor** Chrome extension
+2. Go to google.com while logged into your Google account
+3. Export cookies as JSON → save to `cookies/google_cookies.json` next to
+   `maps_daemon.py` (on your PC, and in the repo as a **secret** — see
+   below — if you want GitHub Actions runs to use it too)
+
+**Usage:**
+```
+/findco https://example.com/companies.txt
+```
+The list is plain text, one company per line — location optional:
+```
+Acme Ltd, London
+WidgetCo | Manchester
+SoloCompany
+```
+
+**How it behaves:**
+- Searches are budgeted at ~40/hour, shared across all runners via Redis,
+  with randomized 3–7s human-like delays between searches
+- Every answer is cached in SQLite for 30 days — repeat runs never
+  re-search the same company
+- Progress checkpoints to Redis after each company, so if a run hits the
+  30-minute job cap it resumes where it left off on the next tick
+- If Google shows a CAPTCHA mid-run, the job pauses itself, alerts you in
+  Telegram, and waits for fresh cookies instead of burning the list
+- Results arrive in Telegram in batches plus a `.txt` export, with a
+  confidence score and match reason per company
+
+**For GitHub Actions runs:** add a repo secret `GOOGLE_COOKIES_JSON` with
+the full contents of `google_cookies.json`, and add a step before the
+daemon run in `daemon.yml`:
+```yaml
+      - name: Restore Google cookies from secret
+        run: mkdir -p cookies && echo '${{ secrets.GOOGLE_COOKIES_JSON }}' > cookies/google_cookies.json
+```
+(Your local PC runs read the file directly — the workflow's env var
+`GOOGLE_COOKIES_PATH` points at the same relative path by default.)
+
 ### URLScan Scraping
 
 Send `/scout` in Telegram → pick a search → reply with how many leads → choose whether to include locked stores.

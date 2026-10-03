@@ -1575,6 +1575,20 @@ def handle_job(job_raw):
     except Exception as e:
         print(f"  Bad job payload: {e}")
         return
+    if data.get("type") == "discovery":
+        # Company web-presence discovery via authenticated Google searches
+        # (web_discovery.py). Runs on the same daemon schedule as /find.
+        try:
+            import web_discovery
+            web_discovery.process_job(data)
+        except Exception as e:
+            print(f"  Discovery job failed: {e}")
+            try:
+                send_telegram(str(data.get("chat_id", "")),
+                              f"⚠️ Discovery job failed: {str(e)[:150]}")
+            except Exception:
+                pass
+        return
     if data.get("type") == "fresh":
         # Legacy leftover from the old /fresh — the new system is automatic.
         print("  Ignoring legacy 'fresh' job — fresh runs as automatic ticks now.")
