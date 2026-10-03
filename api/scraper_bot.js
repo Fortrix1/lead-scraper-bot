@@ -139,7 +139,7 @@ module.exports = async (req, res) => {
 
   async function getUserQueue(userId) {
     const { result: v } = await redis('GET', `queue:${userId}`)
-    return v ? JSON.parse(v) : { pending: [], results: [], awaitingMessages: false, messages: [], awaitingCustomQuery: false, awaitingReviewCap: false, pendingFindJob: null }
+    return v ? JSON.parse(v) : { pending: [], results: [], awaitingMessages: false, messages: [], awaitingCustomQuery: false, awaitingReviewCap: false, awaitingCompanyList: false, pendingFindJob: null }
   }
 
   async function saveUserQueue(userId, queue) {
@@ -314,6 +314,53 @@ module.exports = async (req, res) => {
       console.error('Companies House fetch failed:', e.message)
       return null
     }
+  }
+
+  // Parses a pasted or fetched company list into [{name, location}].
+  // Handles "Name, City" / "Name | City" / bare names, numbered lines,
+  // and pasted /newuk output (decoration lines and links are skipped).
+  function parseCompanyLines(raw) {
+    const companies = []
+    for (let line of raw.split('\n')) {
+      line = line.trim()
+      if (!line || line.startsWith('#')) continue
+      if (/^(🔗|📅|🏢|📍|🇬🇧|✓|•|--)/.test(line)) continue   // /newuk decoration
+      if (/^https?:\/\//.test(line)) continue                 // any link lines
+      line = line.replace(/^\d+[.)]\s*/, '')                  // "1. " numbering
+      if (!line) continue
+      let name = line, location = 'UK'
+      if (line.includes('|')) {
+        const parts = line.split('|').map(s => s.trim())
+        name = parts[0]
+        if (parts[1]) location = parts.slice(1).join(', ')
+      } else if (line.includes(',')) {
+        const idx = line.lastIndexOf(',')
+        const maybeLoc = line.slice(idx + 1).trim()
+        if (maybeLoc && maybeLoc.length <= 60 && !/^\d+$/.test(maybeLoc)) {
+          name = line.slice(0, idx).trim()
+          location = maybeLoc
+        }
+      }
+      if (name) companies.push({ name, location })
+      if (companies.length >= 500) break
+    }
+    return companies
+  }
+
+  async function postDiscoveryJob(chatId, companies) {
+    const jobId = `co-${Date.now()}`
+    await redis('RPUSH', 'jobs:find', JSON.stringify({
+      type: 'discovery', chat_id: chatId, job_id: jobId, companies, max: 100
+    }))
+    const dispatched = await triggerGithubWorkflow()
+    await send(chatId,
+      `✅ Discovery job posted: ${companies.length} compan${companies.length === 1 ? 'y' : 'ies'} ` +
+      `(job ${jobId}).\n` +
+      (dispatched
+        ? `Triggered GitHub Actions immediately — should start within a minute or two.\n`
+        : `Make sure the daemon is running, or wait for the next scheduled run.\n`) +
+      `Searches are rate-limited (~40/hour shared across all runners) and cached for 30 days. ` +
+      `Results arrive here in batches as they're found.`)
   }
 
   async function getSpeedIndexSeconds(url) {
@@ -777,7 +824,7 @@ module.exports = async (req, res) => {
       `🔍 /scout — search URLScan.io for Shopify leads\n` +
       `🗺️ /find <city> <niche> [count] — scrape Google Maps (runs on your PC, sends a .txt report)\n` +
       `🌱 /fresh [age_days] [count] — turn ON new-Shopify-store monitoring via crt.sh (automatic ticks)\n` +
-      `🕵️ /findco <url> — company web discovery: fetch a list of "Company, City" lines, find their websites via authenticated Google\n` +
+      `🕵️ /findco — company web discovery: send it, then paste a list of companies and it finds their websites via authenticated Google\n` +
       `🛑 /freshoff — stop fresh-store monitoring\n` +
       `📋 /campaigns — see all your campaigns (e.g. "Med Spa — Miami") and lead counts\n` +
       `🇬🇧 /newuk [days] [count] — newly incorporated UK companies (Companies House, official & free)\n` +
@@ -866,67 +913,39 @@ module.exports = async (req, res) => {
     await send(chatId, '🛑 Fresh-store monitoring stopped.')
     return res.status(200).send('OK')
   }
-  // ── /findco <url> — company web discovery via authenticated Google ──
-  // Fetches a raw text list: one company per line, "Company Name, City" or
-  // "Company Name | City" (location optional, defaults to UK). Posts a
-  // {"type": "discovery"} job for the daemon. Requires google cookies at
-  // cookies/google_cookies.json on the machine running the daemon.
+  // ── /findco — company web discovery via authenticated Google ──
+  // Two ways to use:
+  //   /findco https://example.com/list.txt   (list hosted online)
+  //   /findco                                 then paste the list as your
+  //                                            next message (multi-line OK —
+  //                                            even raw /newuk output works)
   if (text.startsWith('/findco')) {
     const url = text.split(' ')[1]
-    if (!url || !url.startsWith('http')) {
-      await send(chatId, `Usage: /findco <url to raw company list>\n` +
-        `List format — one per line:\n` +
-        `  Acme Ltd, London\n` +
-        `  WidgetCo | Manchester\n` +
-        `  SoloCompany\n\n` +
-        `Also needs Google cookies exported via the Cookie-Editor extension ` +
-        `saved as cookies/google_cookies.json next to maps_daemon.py.`)
-      return res.status(200).send('OK')
+    if (url && url.startsWith('http')) {
+      await send(chatId, `📥 Fetching company list...`)
+      try {
+        const controller = new AbortController()
+        const t = setTimeout(() => controller.abort(), 8000)
+        const r = await fetch(url, { signal: controller.signal, headers: { 'User-Agent': 'Mozilla/5.0' } })
+        clearTimeout(t)
+        if (!r.ok) { await send(chatId, `Fetch failed (HTTP ${r.status}).`); return res.status(200).send('OK') }
+        const companies = parseCompanyLines(await r.text())
+        if (!companies.length) { await send(chatId, `No parseable companies found.`); return res.status(200).send('OK') }
+        return await postDiscoveryJob(chatId, companies)
+      } catch (e) { await send(chatId, `Couldn't fetch that URL.`); return res.status(200).send('OK') }
     }
-    await send(chatId, `📥 Fetching company list...`)
-    try {
-      const controller = new AbortController()
-      const t = setTimeout(() => controller.abort(), 8000)
-      const r = await fetch(url, { signal: controller.signal, headers: { 'User-Agent': 'Mozilla/5.0' } })
-      clearTimeout(t)
-      if (!r.ok) { await send(chatId, `Fetch failed (HTTP ${r.status}).`); return res.status(200).send('OK') }
-      const raw = await r.text()
-      const companies = []
-      for (let line of raw.split('\n')) {
-        line = line.trim()
-        if (!line || line.startsWith('#')) continue
-        let name = line, location = 'UK'
-        if (line.includes('|')) {
-          const parts = line.split('|').map(s => s.trim())
-          name = parts[0]; if (parts[1]) location = parts.slice(1).join(', ')
-        } else if (line.includes(',')) {
-          const idx = line.lastIndexOf(',')
-          const maybeLoc = line.slice(idx + 1).trim()
-          // treat the comma-separated tail as a location only if it's short
-          // and contains no digits-only junk (keeps "Smith, Sons & Co" intact)
-          if (maybeLoc && maybeLoc.length <= 60 && !/^\d+$/.test(maybeLoc)) {
-            name = line.slice(0, idx).trim()
-            location = maybeLoc
-          }
-        }
-        if (name) companies.push({ name, location })
-        if (companies.length >= 500) break
-      }
-      if (!companies.length) { await send(chatId, `No parseable companies found.`); return res.status(200).send('OK') }
-      const jobId = `co-${Date.now()}`
-      await redis('RPUSH', 'jobs:find', JSON.stringify({
-        type: 'discovery', chat_id: chatId, job_id: jobId, companies, max: 100
-      }))
-      const dispatched = await triggerGithubWorkflow()
-      await send(chatId,
-        `✅ Discovery job posted: ${companies.length} compan${companies.length === 1 ? 'y' : 'ies'} ` +
-        `(job ${jobId}).\n` +
-        (dispatched
-          ? `Triggered GitHub Actions immediately — should start within a minute or two.\n`
-          : `Make sure the daemon is running, or wait for the next scheduled run.\n`) +
-        `Searches are rate-limited (~40/hour shared across all runners) and cached for 30 days. ` +
-        `Expect batches of results in Telegram as they're found.`)
-    } catch (e) { await send(chatId, `Couldn't fetch that URL.`) }
+    // No URL — arm the paste-catcher and wait for their list
+    const q = await getUserQueue(userId)
+    q.awaitingCompanyList = true
+    await saveUserQueue(userId, q)
+    await send(chatId,
+      `📋 Paste your company list as your next message — one per line.\n\n` +
+      `Formats that work:\n` +
+      `  Acme Ltd, London\n` +
+      `  WidgetCo | Manchester\n` +
+      `  SoloCompany\n\n` +
+      `You can even paste /newuk output straight in — the extra lines ` +
+      `(dates, links, addresses) are ignored automatically.`)
     return res.status(200).send('OK')
   }
 
@@ -1161,6 +1180,18 @@ module.exports = async (req, res) => {
 
   try {
     const userQueue = await getUserQueue(userId)
+
+    // ── Awaiting pasted company list for /findco ──
+    if (userQueue.awaitingCompanyList) {
+      const companies = parseCompanyLines(text)
+      userQueue.awaitingCompanyList = false
+      await saveUserQueue(userId, userQueue)
+      if (!companies.length) {
+        await send(chatId, `Couldn't parse any companies from that. One per line, e.g.:\n  Acme Ltd, London\n  WidgetCo, Manchester\nSend /findco to try again.`)
+        return res.status(200).send('OK')
+      }
+      return await postDiscoveryJob(chatId, companies)
+    }
 
     // ── Awaiting review cap for /find ──
     if (userQueue.awaitingReviewCap) {
