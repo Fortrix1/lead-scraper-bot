@@ -967,6 +967,16 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK')
   }
 
+  if (/^\/cancel(@\w+)?$/.test(text)) {
+    const q = await getUserQueue(userId)
+    q.awaitingMessages = false; q.awaitingReviewCap = false; q.awaitingCompanyList = false
+    q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false
+    q.pendingFindJob = null; q.pending = []; q.results = []; q.messages = []
+    await saveUserQueue(userId, q)
+    await send(chatId, '🧹 Cleared. The bot is no longer waiting for anything — old scout results and pending batches were dropped.')
+    return res.status(200).send('OK')
+  }
+
   if (text === '/freshoff') {
     await redis('DEL', 'fresh:config')
     await send(chatId, '🛑 Fresh-store monitoring stopped.')
@@ -1007,6 +1017,7 @@ module.exports = async (req, res) => {
     const q = await getUserQueue(userId)
     q.awaitingReviewCap = false
     q.pendingFindJob = null
+    q.awaitingMessages = false
     q.awaitingCompanyList = true
     await saveUserQueue(userId, q)
     await send(chatId,
@@ -1364,6 +1375,16 @@ module.exports = async (req, res) => {
       userQueue.messages = []
       await saveUserQueue(userId, userQueue)
       return res.status(200).send('OK')
+    }
+
+    // ── A pasted UK company list is never an outreach message ──
+    if (userQueue.awaitingMessages && /company-information\.service\.gov\.uk|Incorporated:/i.test(text)) {
+      const companies = parseCompanyLines(text)
+      if (companies.length) {
+        userQueue.awaitingMessages = false
+        await saveUserQueue(userId, userQueue)
+        return await postDiscoveryJob(chatId, companies)
+      }
     }
 
     // ── Awaiting outreach messages ──

@@ -53,7 +53,12 @@ jobs:
 
       - name: Restore Google search cookies for /findco
         # Exported via Cookie-Editor while logged into google.com.
-        run: mkdir -p cookies && echo '${{ secrets.GOOGLE_COOKIES_JSON }}' > cookies/google_cookies.json
+        env:
+          GOOGLE_COOKIES_JSON: ${{ secrets.GOOGLE_COOKIES_JSON }}
+        run: |
+          mkdir -p cookies
+          printf '%s' "$GOOGLE_COOKIES_JSON" > cookies/google_cookies.json
+          python3 -c "import json,os;d=json.load(open('cookies/google_cookies.json'));print('google cookies in secret:',len(d))" || echo "!! GOOGLE_COOKIES_JSON secret is missing, empty, or not valid JSON"
 
       - name: Run the daemon (single pass)
         env:
