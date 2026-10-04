@@ -366,6 +366,7 @@ module.exports = async (req, res) => {
       let line = rawLine.trim()
       if (!line || line.startsWith('#')) continue
       if (/^https?:\/\//.test(line)) continue
+      if (line.startsWith('/')) continue                   // pasted bot commands
       line = line.replace(/^[^\w(]+/, '').replace(/^\d+[.)]\s*/, '').trim()
       if (!line) continue
       if (JUNK.some(rx => rx.test(line))) continue
@@ -417,8 +418,8 @@ module.exports = async (req, res) => {
       (dispatched
         ? `Triggered GitHub Actions immediately — should start within a minute or two.\n`
         : `Make sure the daemon is running, or wait for the next scheduled run.\n`) +
-      `Searches are rate-limited (~40/hour shared across all runners) and cached for 30 days. ` +
-      `Results arrive here in batches as they're found.`)
+      `Per company: Companies House directors → Google (name, town, contact, socials) → their website → Maps (name only) → each director on Google/LinkedIn. ` +
+      `~15-25 companies/hour (shared Google budget), cached 30 days; leftovers resume automatically. Results arrive here as they're found.`)
   }
 
   async function getSpeedIndexSeconds(url) {
@@ -882,7 +883,7 @@ module.exports = async (req, res) => {
       `🔍 /scout — search URLScan.io for Shopify leads\n` +
       `🗺️ /find <city> <niche> [count] — scrape Google Maps (runs on your PC, sends a .txt report)\n` +
       `🌱 /fresh [age_days] [count] — turn ON new-Shopify-store monitoring via crt.sh (automatic ticks)\n` +
-      `🕵️ /findco — company web discovery: send it, then paste a list of companies and it finds their websites via authenticated Google\n` +
+      `🕵️ /findco — company contact discovery: send it, then paste a list (or raw /newuk output) — finds websites, emails, phones, socials and the directors' LinkedIn\n` +
       `🛑 /freshoff — stop fresh-store monitoring\n` +
       `📋 /campaigns — see all your campaigns (e.g. "Med Spa — Miami") and lead counts\n` +
       `🇬🇧 /newuk [days] [count] — newly incorporated UK companies (Companies House, official & free)\n` +
@@ -899,7 +900,7 @@ module.exports = async (req, res) => {
   }
 
   // ── /find <city> <niche> [count] [sample] [rescan] ──
-  if (text.startsWith('/find')) {
+  if (/^\/find(@\w+)?(\s|$)/.test(text)) {
     let parts = text.split(' ').slice(1)
     if (parts.length < 2) {
       await send(chatId, 'Usage: /find <city> <niche> [count] [sample] [rescan]\nExample: /find Austin restaurant 20\nExample: /find Austin restaurant 20 sample\nExample: /find Austin restaurant 20 rescan\nExample: /find banana island lagos nigeria restaurants 30\n\nNiches: restaurant, food_truck, salon, gym, auto_repair, real_estate\n\n"sample" = capped, contact-info-masked run (10-20 leads) suitable to hand to a prospective buyer.\n"rescan" = also include businesses you\'ve already scraped before (normally skipped so every run is fresh).')
@@ -977,7 +978,7 @@ module.exports = async (req, res) => {
   //   /findco                                 then paste the list as your
   //                                            next message (multi-line OK —
   //                                            even raw /newuk output works)
-  if (text.startsWith('/findco')) {
+  if (/^\/findco(@\w+)?(\s|$)/.test(text)) {
     const url = text.split(' ')[1]
     if (url && url.startsWith('http')) {
       await send(chatId, `📥 Fetching company list...`)
@@ -994,7 +995,7 @@ module.exports = async (req, res) => {
     }
     // Same-message paste: "/findco <blob>" — parse the rest of THIS message
     const inline = text.replace(/^\/findco(@\w+)?\s*/, '')
-    if (inline.trim().length > 10) {
+    if (inline.trim().length > 0) {
       const companies = parseCompanyLines(inline)
       if (!companies.length) {
         await send(chatId, `Couldn't parse any companies from that. Send /findco alone, then paste the list as your next message.`)
@@ -1004,6 +1005,8 @@ module.exports = async (req, res) => {
     }
     // No URL, no paste — arm the paste-catcher and wait for their list
     const q = await getUserQueue(userId)
+    q.awaitingReviewCap = false
+    q.pendingFindJob = null
     q.awaitingCompanyList = true
     await saveUserQueue(userId, q)
     await send(chatId,

@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
-"""web_discovery.py — contact-discovery engine (v2).
+"""web_discovery.py — contact-discovery engine (v3).
 
-For each company, builds the fullest possible contact picture:
+For each company (typically pasted from /newuk), builds the fullest possible
+contact picture, in this order:
 
-  Phase A  Google web search (authenticated cookies)  → official website,
-           LinkedIn company page, every social profile found in results
-  Phase B  Google Maps listing                        → phone number,
-           rating/review count, address, hours
-  Phase C  Companies House officers (free official
-           API, needs COMPANIES_HOUSE_API_KEY + the
-           company number from the find-and-update
-           links in your pasted list)                → director names
-  Phase D  Google search per director                 → their personal
-           LinkedIn (/in/), X, Instagram, Facebook
+  Phase C  Companies House (free official API)  -> company number (looked up
+           by name if the paste didn't include one), registered town, and
+           the CURRENT directors (the founders).
+  Phase A  Google web search, several angles     -> official website,
+           LinkedIn company page, every social profile, plus any emails /
+           phone numbers visible in result snippets, plus directory pages
+           that mention the company ("mentions").
+  Phase A2 Website crawl (no Google budget used)  -> emails, phones and
+           social links from the home / contact / about pages.
+  Phase B  Google Maps, searching JUST the name   -> phone, website, rating,
+           address. Falls back to name + town. A listing is only accepted if
+           its title actually matches the company name.
+  Phase D  Google search per director             -> personal LinkedIn,
+           Instagram, Facebook, X, TikTok. Each hit is marked verified
+           (company name appears next to the person) or possible.
 
-Everything is cached in SQLite for 30 days, progress checkpoints to
-Redis after every company (resume-safe), page navigations are counted
-against a shared hourly budget, and a CAPTCHA wall pauses the job and
-waits for fresh cookies instead of burning the list.
+Everything is cached in SQLite for 30 days, progress checkpoints to Redis
+after every company, page navigations are counted against a shared hourly
+budget, and a CAPTCHA wall pauses the job instead of burning the list.
+Unfinished companies are automatically re-queued.
 
 Cookie setup (one-time / when Google logs you out):
-  Cookie-Editor extension → export google.com cookies →
+  Cookie-Editor extension -> export google.com cookies ->
   cookies/google_cookies.json next to this script.
 """
 
@@ -33,7 +39,7 @@ import random
 import base64
 import sqlite3
 from datetime import datetime, timezone
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse, quote_plus, parse_qs, unquote
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -53,22 +59,20 @@ DB_PATH = os.environ.get(
 )
 COMPANIES_HOUSE_API_KEY = os.environ.get("COMPANIES_HOUSE_API_KEY", "")
 
-# Navigations per hour across ALL runners (PC + GitHub Actions ticks).
-# One company = up to ~6 navigations (web ladder + maps + 2 directors),
-# so ~100 navigations/hour ≈ 15-20 companies/hour.
-MAX_NAVS_PER_HOUR = 100
+CACHE_VERSION = 3          # bump to invalidate old (thinner) cached results
+
+# Page navigations per hour across ALL runners (PC + GitHub Actions).
+# A full company costs roughly 6-10 navigations, so 150/h ~ 15-25 companies/h.
+MAX_NAVS_PER_HOUR = int(os.environ.get("DISCOVERY_NAVS_PER_HOUR", "150"))
 REDIS_RL_KEY = "disc:rl:hour"
 REDIS_PROGRESS_PREFIX = "disc:progress:"
 
 CACHE_TTL_DAYS = 30
 MIN_DELAY, MAX_DELAY = 3, 7
-MAX_DIRECTORS = 2          # director searches per company (budget control)
-
-QUERY_TEMPLATES = [
-    '"{name}" {location} official website',
-    '"{name}" {location}',
-    '"{name}" company',
-]
+MAX_DIRECTORS = 3                  # directors searched per company
+MAX_WEB_QUERIES = 4                # Google web queries per company
+MAX_PERSON_QUERIES = 3             # Google queries per director
+MAX_RUN_SECONDS = int(os.environ.get("DISCOVERY_MAX_RUN_SECONDS", str(20 * 60)))
 
 JUNK_DOMAINS = [
     "facebook.com", "instagram.com", "twitter.com", "x.com", "linkedin.com",
@@ -79,20 +83,53 @@ JUNK_DOMAINS = [
     "tiktok.com", "reddit.com", "ebay.", "bbb.org", "manta.com",
     "yellowpages", "dnb.com", "rocketreach.co", "zoominfo.com",
     "owler.com", "pitchbook.com", "reuters.com", "gov.uk",
+    "opencorporates.com", "companycheck", "endole.co.uk", "checkcompany",
+    "companieslist", "companiesinfo", "ukcompanyinfo", "company-information",
+    "gb.kompass", "192.com", "creditsafe", "northdata", "cylex", "hotfrog",
+    "scoot.co.uk", "yell.com", "thomsonlocal", "cityfos", "wikidata",
 ]
 
-RESULT_ANCHORS = ["div.MjjYud a h3", "div.g a h3", "a h3"]
-
 SOCIAL_PATTERNS = {
-    "linkedin":  r"https?://(?:www\.)?linkedin\.com/(?:company|in)/[a-zA-Z0-9_\-%.]+",
+    "linkedin":  r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/(?:company|in)/[a-zA-Z0-9_\-%.]+",
     "instagram": r"https?://(?:www\.)?instagram\.com/[a-zA-Z0-9_.\-]+",
-    "facebook":  r"https?://(?:www\.)?facebook\.com/[a-zA-Z0-9.\-]+",
+    "facebook":  r"https?://(?:www\.|m\.|web\.)?facebook\.com/[a-zA-Z0-9.\-]+",
     "tiktok":    r"https?://(?:www\.)?tiktok\.com/@[a-zA-Z0-9_.\-]+",
-    "x":         r"https?://(?:www\.)?(?:twitter|x)\.com/[a-zA-Z0-9_\-]+",
+    "x":         r"https?://(?:www\.)?(?:twitter|x)\.com/[a-zA-Z0-9_]+",
 }
 SOCIAL_HOSTS = re.compile(
     r"(linkedin\.com|instagram\.com|facebook\.com|twitter\.com|"
     r"(?:^|\.)x\.com|tiktok\.com)")
+# first path segments that are never a real profile
+SOCIAL_SKIP = {
+    "share", "sharer", "sharer.php", "intent", "login", "dialog", "plugins",
+    "tr", "home", "explore", "p", "reel", "reels", "hashtag", "search",
+    "watch", "groups", "pages", "policies", "legal", "help", "about",
+    "privacy", "events", "marketplace", "stories", "photo", "photo.php",
+    "permalink.php", "profile.php", "wix", "wordpress", "shopify",
+    "squarespace", "godaddy", "elementor", "facebook", "instagram",
+    "twitter", "linkedin", "google", "youtube", "tiktok", "i", "x",
+    "company", "in", "feed", "jobs", "pub",
+}
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
+EMAIL_BAD_TAIL = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js", ".ico")
+EMAIL_BAD_DOMAIN = ("sentry", "example.", "wixpress", "schema.org", "yourdomain",
+                    "domain.com", "email.com", "godaddy", "w3.org", "gstatic",
+                    "googleapis", "cloudflare", "sentry.io", "shopify.com")
+# UK phone numbers: +44 ... or 0xxxx xxx xxx
+PHONE_RE = re.compile(
+    r"(?<![\d.])(?:\+44[\s\-.]?\(?0?\)?[\s\-.]?|0)(?:\d[\s\-.]?){9,10}(?!\d)")
+
+CONTACT_PATHS = ["/contact", "/contact-us", "/about", "/about-us"]
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+
+class Wall(Exception):
+    """Raised when we must stop browsing: 'budget' or 'blocked' (CAPTCHA)."""
+    def __init__(self, kind):
+        super().__init__(kind)
+        self.kind = kind
 
 
 # ------------------------------------------------------------------
@@ -125,6 +162,8 @@ def get_cached(name, location=""):
         if not row:
             return None
         result, ts = json.loads(row[0]), row[1]
+        if result.get("v") != CACHE_VERSION:
+            return None
         if (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).days > CACHE_TTL_DAYS:
             return None
         result["from_cache"] = True
@@ -167,13 +206,17 @@ def load_google_cookies(path=COOKIES_PATH):
         exp = c.get("expirationDate") or c.get("expires")
         if exp and float(exp) < now:
             continue
+        secure = bool(c.get("secure"))
         same_site = (c.get("sameSite") or "unspecified").lower()
         same_site = {"no_restriction": "None", "unspecified": "None"}.get(
             same_site, same_site.capitalize())
+        # Chromium rejects SameSite=None without Secure -> downgrade to Lax
+        if same_site == "None" and not secure:
+            same_site = "Lax"
         entry = {"name": c["name"], "value": c.get("value", ""),
                  "domain": c["domain"], "path": c.get("path", "/"),
                  "httpOnly": bool(c.get("httpOnly")),
-                 "secure": bool(c.get("secure")), "sameSite": same_site}
+                 "secure": secure, "sameSite": same_site}
         if exp:
             entry["expires"] = float(exp)
         out.append(entry)
@@ -181,7 +224,7 @@ def load_google_cookies(path=COOKIES_PATH):
 
 
 # ------------------------------------------------------------------
-# Rate limiting (navigations, shared via Redis)
+# Rate limiting / human-ish behaviour
 # ------------------------------------------------------------------
 
 def nav_allowed(md):
@@ -217,8 +260,7 @@ def make_context(p, cookies):
     )
     context = browser.new_context(
         viewport={"width": 1366, "height": 850},
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        user_agent=UA,
         locale="en-GB",
         timezone_id="Europe/London",
         extra_http_headers={"Accept-Language": "en-GB,en;q=0.9"},
@@ -253,45 +295,60 @@ def is_blocked(page):
 
 
 def safe_goto(page, url, md):
-    """Budget-checked navigation. Returns False when budget/wall hit."""
-    allowed, used, cap = nav_allowed(md)
+    """Budget-checked navigation. Raises Wall on budget / CAPTCHA."""
+    allowed, _used, _cap = nav_allowed(md)
     if not allowed:
-        return "budget"
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        raise Wall("budget")
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    except Exception as e:
+        print(f"    navigation problem: {str(e)[:100]}")
     human_pause(2, 4)
     dismiss_consent(page)
     if is_blocked(page):
-        return "blocked"
+        raise Wall("blocked")
     return True
 
 
-def extract_results(page):
-    results, seen = [], set()
-    for sel in RESULT_ANCHORS:
-        try:
-            anchors = page.query_selector_all(sel)
-        except Exception:
-            continue
-        for a in anchors:
-            try:
-                href = (a.get_attribute("href") or "").strip()
-                if not href.startswith("http") or href in seen:
-                    continue
-                title = a.inner_text().strip()
-                snippet = ""
-                try:
-                    card = a.evaluate("el => el.closest('div.MjjYud, div.g, [data-sokoban-container]')")
-                    if card:
-                        snippet = card.inner_text().strip().replace("\n", " ")[:300]
-                except Exception:
-                    pass
-                seen.add(href)
-                results.append((href, title, snippet))
-            except Exception:
-                continue
-        if len(results) >= 10:
-            break
-    return results[:10]
+# ------------------------------------------------------------------
+# Name helpers
+# ------------------------------------------------------------------
+
+SUFFIX_WORDS = {"ltd", "limited", "llc", "inc", "corp", "corporation", "plc",
+                "llp", "lp", "cic", "uk"}
+STOP_WORDS = SUFFIX_WORDS | {"the", "and", "of", "co", "company", "group",
+                             "services", "solutions", "holdings"}
+
+
+def core_name(name):
+    """'MW IMPACT LTD' -> 'mw impact'."""
+    words = re.findall(r"[a-z0-9&]+", name.lower())
+    while words and words[-1] in SUFFIX_WORDS:
+        words.pop()
+    return " ".join(words)
+
+
+def squash(s):
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def name_tokens(name):
+    return {t for t in re.findall(r"[a-z0-9]+", name.lower())
+            if len(t) > 2 and t not in STOP_WORDS}
+
+
+def name_in_text(name, text):
+    """Is this company genuinely mentioned in text?"""
+    core = core_name(name)
+    if not core:
+        return False
+    low = re.sub(r"\s+", " ", text.lower())
+    if core in low:
+        return True
+    toks = name_tokens(name)
+    if len(toks) >= 2:
+        return all(t in low for t in toks)
+    return False
 
 
 def host_of(url):
@@ -301,99 +358,256 @@ def host_of(url):
         return ""
 
 
-def harvest_socials(urls):
-    """Scan a list of URLs for social profiles."""
+def score_candidate(url, title, snippet, name):
+    host = host_of(url)
+    label = host.split(".")[0]
+    core_sq = squash(core_name(name))
+    blob = f"{title} {snippet} {host}"
+    if core_sq and len(core_sq) >= 4 and (core_sq in squash(label) or
+                                          (len(squash(label)) >= 5 and squash(label) in core_sq)):
+        return 95, "company name in domain"
+    if name_in_text(name, blob):
+        return 80, "company name on page"
+    toks = name_tokens(name)
+    if toks and any(t in blob.lower() for t in toks):
+        return 55, "partial name match"
+    return 25, "weak match"
+
+
+# ------------------------------------------------------------------
+# Extraction helpers (emails / phones / socials)
+# ------------------------------------------------------------------
+
+def clean_emails(text):
+    out = []
+    for m in EMAIL_RE.findall(html.unescape(text or "")):
+        e = m.strip(".,;:()<>[]\"'").lower()
+        if e.endswith(EMAIL_BAD_TAIL) or any(b in e for b in EMAIL_BAD_DOMAIN):
+            continue
+        if e not in out:
+            out.append(e)
+    return out
+
+
+def clean_phones(text):
+    out = []
+    for m in PHONE_RE.findall(text or ""):
+        digits = re.sub(r"\D", "", m)
+        if digits.startswith("44"):
+            digits = "0" + digits[2:]
+        if not (10 <= len(digits) <= 11):
+            continue
+        pretty = re.sub(r"\s+", " ", m.strip())
+        if pretty not in out and all(re.sub(r"\D", "", o).lstrip("0")[-9:] != digits[-9:] for o in out):
+            out.append(pretty)
+    return out
+
+
+def harvest_socials(texts, skip_handles=None):
+    """Find social profile URLs inside a list of strings (hrefs or raw HTML)."""
     found = {}
-    for u in urls:
+    for chunk in texts:
         for net, pat in SOCIAL_PATTERNS.items():
-            m = re.search(pat, u)
-            if m and not found.get(net):
-                # skip share/login-style URLs that aren't profiles
-                link = m.group(0)
-                if re.search(r"/(share|login|intent|hashtag)/?", link):
+            if found.get(net):
+                continue
+            for m in re.finditer(pat, chunk or ""):
+                link = m.group(0).rstrip(".")
+                path = urlparse(link).path.strip("/").split("/")
+                seg = path[-1] if net == "linkedin" else path[0]
+                seg = seg.lower().lstrip("@")
+                if net != "linkedin" and seg in SOCIAL_SKIP:
+                    continue
+                if net == "linkedin" and (len(path) < 2 or path[1].lower() in SOCIAL_SKIP):
+                    continue
+                if skip_handles and seg in skip_handles:
                     continue
                 found[net] = link
+                break
     return found
 
 
-def name_tokens(name):
-    stop = {"ltd", "limited", "llc", "inc", "corp", "corporation", "plc",
-            "uk", "the", "and", "of", "co", "company", "group", "services",
-            "solutions", "llp", "lp", "holdings"}
-    return {t for t in re.findall(r"[a-z0-9]+", name.lower())
-            if len(t) > 2 and t not in stop}
-
-
-def score_candidate(url, title, snippet, name):
-    host = host_of(url)
-    tokens = name_tokens(name)
-    domain_tokens = set(re.findall(r"[a-z0-9]+", host.split(".")[0]))
-    blob = f"{title} {snippet} {host}".lower()
-    hits = sum(1 for t in tokens if t in blob)
-    if tokens and domain_tokens & tokens:
-        return 95, "company name in domain"
-    if tokens and hits >= max(2, len(tokens) - 1):
-        return 80, "strong name match"
-    if tokens and hits >= 1:
-        return 60, "partial name match"
-    return 30, "weak match"
-
-
 # ------------------------------------------------------------------
-# Phase A — web search
+# Google SERP parsing
 # ------------------------------------------------------------------
 
-def search_company_web(page, name, location, md):
-    best, linkedin, socials = None, None, {}
-    for template in QUERY_TEMPLATES:
-        q = template.format(name=name, location=location or "UK")
-        url = f"https://www.google.com/search?q={quote_plus(q)}&num=10&hl=en&gl=uk"
-        status = safe_goto(page, url, md)
-        if status is not True:
-            return {"error": status}
-        human_scroll(page)
-        results = extract_results(page)
+RESULT_ANCHORS = ["div.MjjYud a h3", "div.g a h3", "a h3"]
 
-        for href, title, snippet in results:
-            if SOCIAL_HOSTS.search(href):
-                socials.update(harvest_socials([href]))
-                if "linkedin.com/company" in href and not linkedin:
-                    linkedin = href
+
+def _unwrap(href):
+    if href.startswith("/url?"):
+        q = parse_qs(urlparse(href).query).get("q", [""])[0]
+        return unquote(q)
+    return href
+
+
+def extract_results(page):
+    """-> [(href, title, snippet)] for the visible organic results."""
+    results, seen = [], set()
+    for sel in RESULT_ANCHORS:
+        try:
+            handles = page.query_selector_all(sel)
+        except Exception:
+            continue
+        for h3 in handles:
+            try:
+                info = h3.evaluate(
+                    """el => {
+                        const a = el.closest('a');
+                        const card = el.closest('div.MjjYud, div.g, [data-sokoban-container]');
+                        return {href: a ? a.getAttribute('href') : '',
+                                title: el.innerText || '',
+                                snippet: card ? card.innerText : ''};
+                    }""")
+                href = _unwrap((info.get("href") or "").strip())
+                if not href.startswith("http") or href in seen:
+                    continue
+                seen.add(href)
+                results.append((href, (info.get("title") or "").strip(),
+                                re.sub(r"\s+", " ", info.get("snippet") or "")[:500]))
+            except Exception:
                 continue
-            if any(j in href.lower() for j in JUNK_DOMAINS):
+        if len(results) >= 10:
+            break
+    return results[:10]
+
+
+def serp(page, query, md):
+    url = f"https://www.google.com/search?q={quote_plus(query)}&num=10&hl=en&gl=uk"
+    safe_goto(page, url, md)
+    human_scroll(page)
+    return extract_results(page)
+
+
+# ------------------------------------------------------------------
+# Phase A — Google web search (several angles)
+# ------------------------------------------------------------------
+
+def web_queries(name, locality, number):
+    qs = [
+        f'"{name}"',                                        # exact name, anywhere
+        f'"{name}" {locality or "UK"}',                     # + town
+        f'"{name}" contact email phone',                    # contact details
+        f'"{name}" linkedin OR instagram OR facebook',      # socials
+    ]
+    if number:
+        qs.append(f'"{name}" "{number}"')                   # directory pages
+    return qs[:MAX_WEB_QUERIES]
+
+
+def search_company_web(page, name, locality, number, md):
+    best = None
+    linkedin = None
+    socials = {}
+    emails, phones, mentions = [], [], []
+    relevant_total = 0
+    ran = 0
+
+    for q in web_queries(name, locality, number):
+        results = serp(page, q, md)
+        ran += 1
+        for href, title, snippet in results:
+            blob = f"{title} {snippet}"
+            relevant = name_in_text(name, blob + " " + href)
+
+            if SOCIAL_HOSTS.search(href):
+                # accept a social hit only if it actually concerns this company
+                if relevant or squash(core_name(name)) in squash(href):
+                    relevant_total += 1
+                    got = harvest_socials([href])
+                    for k, v in got.items():
+                        socials.setdefault(k, v)
+                    if "linkedin.com/company" in href and not linkedin:
+                        linkedin = href
+                continue
+
+            if relevant:
+                relevant_total += 1
+                for e in clean_emails(snippet):
+                    if e not in emails:
+                        emails.append(e)
+                for ph in clean_phones(snippet):
+                    if ph not in phones:
+                        phones.append(ph)
+
+            low = href.lower()
+            if any(j in low for j in JUNK_DOMAINS):
+                if relevant and len(mentions) < 4:
+                    mentions.append({"url": href, "title": title[:90]})
                 continue
             score, why = score_candidate(href, title, snippet, name)
             cand = {"url": href, "title": title, "score": score, "why": why}
             if best is None or cand["score"] > best["score"]:
                 best = cand
-            if score >= 80:
-                break
-        if best and best["score"] >= 80:
+
+        # nothing at all online about this name after two angles -> stop early
+        if ran >= 2 and relevant_total == 0 and not (best and best["score"] >= 80):
+            break
+        # got everything useful -> stop early
+        if (best and best["score"] >= 80 and (emails or phones)
+                and (linkedin or socials)):
             break
 
-    if best is None:
-        return {"website": None, "linkedin_company": linkedin,
-                "socials": socials, "confidence": 0}
-    return {"website": best["url"], "website_title": best.get("title", ""),
-            "match_reason": best.get("why", ""),
-            "linkedin_company": linkedin, "socials": socials,
-            "confidence": best["score"]}
+    out = {"linkedin_company": linkedin, "socials": socials,
+           "emails": emails, "phones": phones, "mentions": mentions,
+           "queries_run": ran}
+    if best and best["score"] >= 55:
+        out.update({"website": best["url"], "website_title": best.get("title", ""),
+                    "match_reason": best.get("why", ""),
+                    "confidence": best["score"]})
+    else:
+        out.update({"website": None, "confidence": 0})
+    return out
 
 
 # ------------------------------------------------------------------
-# Phase B — Google Maps listing
+# Phase A2 — crawl the company's own website (no Google budget used)
 # ------------------------------------------------------------------
 
-def maps_lookup(page, name, location, md):
-    q = f"{name} {location}".strip() if location and location != "UK" else name
-    url = "https://www.google.com/maps/search/" + quote_plus(q)
-    status = safe_goto(page, url, md)
-    if status is not True:
-        return {"error": status}
+def crawl_site(url):
+    out = {"emails": [], "phones": [], "socials": {}, "pages": 0}
+    if not url:
+        return out
+    base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    pages = [url] + [base + p for p in CONTACT_PATHS]
+    seen = set()
+    texts = []
+    for i, u in enumerate(pages):
+        if u in seen:
+            continue
+        seen.add(u)
+        try:
+            r = requests.get(u, headers={"User-Agent": UA}, timeout=8,
+                             allow_redirects=True)
+        except Exception:
+            if i == 0:
+                break          # home page unreachable -> don't try the rest
+            continue
+        if r.status_code != 200 or "text/html" not in r.headers.get("content-type", ""):
+            continue
+        out["pages"] += 1
+        texts.append(r.text[:400000])
+        if out["pages"] >= 4:
+            break
+    if not texts:
+        return out
+    blob = "\n".join(texts)
+    mailtos = re.findall(r'mailto:([^"\'?\s>]+)', blob, flags=re.I)
+    tels = re.findall(r'tel:([+\d\s\-().]+)', blob, flags=re.I)
+    emails = clean_emails(" ".join(mailtos) + " " + re.sub(r"<[^>]+>", " ", blob))
+    out["emails"] = emails[:6]
+    out["phones"] = clean_phones(" ".join(tels) + " " +
+                                 re.sub(r"<[^>]+>", " ", blob))[:4]
+    out["socials"] = harvest_socials([blob])
+    return out
 
+
+# ------------------------------------------------------------------
+# Phase B — Google Maps (search JUST the name first)
+# ------------------------------------------------------------------
+
+def _maps_parse_place(page):
     out = {}
     try:
-        time.sleep(random.uniform(1.5, 3))
         for sel in ["h1.DUwDvf", "h1.fontHeadlineLarge", '[role="main"] h1']:
             el = page.query_selector(sel)
             if el:
@@ -435,60 +649,179 @@ def maps_lookup(page, name, location, md):
                 out["website"] = href
                 break
     except Exception as e:
-        print(f"    maps parse error for {name}: {e}")
+        print(f"    maps parse error: {e}")
     return out
 
 
+def maps_name_matches(candidate, name):
+    c = core_name(candidate)
+    n = core_name(name)
+    if not c or not n:
+        return False
+    if c == n or n in c or c in n and len(c) >= 4:
+        return True
+    return squash(c) == squash(n)
+
+
+def _maps_try(page, query, name, md):
+    url = "https://www.google.com/maps/search/" + quote_plus(query)
+    safe_goto(page, url, md)
+    try:
+        page.wait_for_selector("h1.DUwDvf, a.hfpxzc", timeout=9000)
+    except Exception:
+        return {}
+    time.sleep(random.uniform(1.2, 2.2))
+
+    # Result LIST -> click the first entry whose label matches the company
+    if not page.query_selector("h1.DUwDvf"):
+        try:
+            for a in page.query_selector_all("a.hfpxzc")[:6]:
+                label = a.get_attribute("aria-label") or ""
+                if maps_name_matches(label, name):
+                    a.click()
+                    page.wait_for_selector("h1.DUwDvf", timeout=9000)
+                    time.sleep(random.uniform(1.0, 2.0))
+                    break
+            else:
+                return {}
+        except Exception:
+            return {}
+
+    place = _maps_parse_place(page)
+    if place.get("name") and maps_name_matches(place["name"], name):
+        return place
+    return {}
+
+
+def maps_lookup(page, name, locality, md):
+    """Search Maps for the bare company name; fall back to name + town."""
+    place = _maps_try(page, name, name, md)
+    if place:
+        return place
+    if locality and locality.upper() != "UK":
+        return _maps_try(page, f"{name} {locality}", name, md)
+    return {}
+
+
 # ------------------------------------------------------------------
-# Phase C — Companies House officers (free official API)
+# Phase C — Companies House (free official API)
 # ------------------------------------------------------------------
 
-def fetch_officers(company_number):
-    if not (COMPANIES_HOUSE_API_KEY and company_number):
-        return []
-    url = (f"https://api.company-information.service.gov.uk/company/"
-           f"{company_number}/officers")
+def _ch_get(path, params=None):
+    if not COMPANIES_HOUSE_API_KEY:
+        return None
     auth = base64.b64encode(f"{COMPANIES_HOUSE_API_KEY}:".encode()).decode()
     try:
-        r = requests.get(url, headers={"Authorization": f"Basic {auth}"},
-                         timeout=10)
+        r = requests.get("https://api.company-information.service.gov.uk" + path,
+                         headers={"Authorization": f"Basic {auth}"},
+                         params=params, timeout=12)
         if r.status_code != 200:
-            return []
-        out = []
-        for it in r.json().get("items", []):
-            raw = (it.get("name") or "").strip()
-            if not raw:
-                continue
-            # Companies House format is "SURNAME, Forename" — flip it
-            if "," in raw:
-                last, _, first = raw.partition(",")
-                display = f"{first.strip()} {last.strip()}".strip()
-            else:
-                display = raw.title()
-            out.append({"name": display,
-                        "role": it.get("officer_role", "").replace("_", " ")})
-        return out[:MAX_DIRECTORS]
+            return None
+        return r.json()
     except Exception as e:
-        print(f"    officers lookup failed for {company_number}: {e}")
+        print(f"    companies house call failed ({path}): {e}")
+        return None
+
+
+def resolve_company_number(name):
+    """Pasted a bare name with no link? Find its number by exact name match."""
+    data = _ch_get("/search/companies", {"q": name, "items_per_page": 5})
+    if not data:
+        return ""
+    want = re.sub(r"\s+", " ", name.upper().strip())
+    for it in data.get("items", []):
+        if re.sub(r"\s+", " ", (it.get("title") or "").upper().strip()) == want:
+            return it.get("company_number", "")
+    return ""
+
+
+def fetch_profile(company_number):
+    d = _ch_get(f"/company/{company_number}") if company_number else None
+    if not d:
+        return {}
+    addr = d.get("registered_office_address") or {}
+    return {"locality": addr.get("locality", ""),
+            "postcode": addr.get("postal_code", ""),
+            "address": ", ".join(x for x in [addr.get("address_line_1"),
+                                             addr.get("locality"),
+                                             addr.get("postal_code")] if x),
+            "created": d.get("date_of_creation", ""),
+            "sic": d.get("sic_codes", [])}
+
+
+def fetch_officers(company_number):
+    """Current (not resigned) human officers, directors first."""
+    d = _ch_get(f"/company/{company_number}/officers") if company_number else None
+    if not d:
         return []
+    out = []
+    for it in d.get("items", []):
+        if it.get("resigned_on"):
+            continue
+        raw = (it.get("name") or "").strip()
+        if not raw or re.search(r"\b(ltd|limited|llp|plc|inc)\b", raw, re.I):
+            continue                         # corporate officer
+        if "," in raw:
+            last, _, first = raw.partition(",")
+            full = f"{first.strip()} {last.strip()}".title()
+            search = f"{first.strip().split()[0]} {last.strip()}".title() if first.strip() else last.title()
+        else:
+            full = search = raw.title()
+        role = (it.get("officer_role") or "").replace("-", " ").replace("_", " ")
+        addr = it.get("address") or {}
+        out.append({"name": full, "search_name": search, "role": role,
+                    "locality": addr.get("locality", ""),
+                    "occupation": it.get("occupation", "")})
+    out.sort(key=lambda o: 0 if "director" in o["role"] or "member" in o["role"] else 1)
+    return out[:MAX_DIRECTORS]
 
 
 # ------------------------------------------------------------------
-# Phase D — person search (director → LinkedIn / socials)
+# Phase D — founder / director search
 # ------------------------------------------------------------------
 
-def person_search(page, person_name, company_name, md):
-    q = f'"{person_name}" {company_name} linkedin'
-    url = f"https://www.google.com/search?q={quote_plus(q)}&num=10&hl=en&gl=uk"
-    status = safe_goto(page, url, md)
-    if status is not True:
-        return {"error": status}
-    human_scroll(page)
-    results = extract_results(page)
-    urls = [h for h, _, _ in results]
-    socials = harvest_socials(urls)
-    linkedin = socials.get("linkedin", "")
-    return {"linkedin": linkedin, "socials": socials}
+def person_queries(person, company, locality):
+    loc = locality or ""
+    return [
+        f'"{person}" "{company}"',                              # name + company anywhere
+        f'"{person}" {company} linkedin',                       # LinkedIn
+        f'"{person}" {loc} instagram OR facebook OR twitter'.replace("  ", " "),
+    ][:MAX_PERSON_QUERIES]
+
+
+def person_search(page, person, company, locality, md):
+    toks = re.findall(r"[a-z]+", person.lower())
+    first, last = (toks[0], toks[-1]) if toks else ("", "")
+    links = {}                      # net -> {"url":..., "verified": bool}
+    emails, phones, mentions = [], [], []
+
+    for q in person_queries(person, company, locality):
+        for href, title, snippet in serp(page, q, md):
+            blob = f"{title} {snippet} {href}".lower()
+            if not (first and last and first in blob and last in blob):
+                continue                    # not this person
+            verified = name_in_text(company, blob)
+            if SOCIAL_HOSTS.search(href):
+                for net, url in harvest_socials([href]).items():
+                    # a personal LinkedIn is /in/, never /company/
+                    if net == "linkedin" and "/company/" in url:
+                        continue
+                    prev = links.get(net)
+                    if not prev or (verified and not prev["verified"]):
+                        links[net] = {"url": url, "verified": verified}
+            elif verified:
+                for e in clean_emails(snippet):
+                    if e not in emails:
+                        emails.append(e)
+                for ph in clean_phones(snippet):
+                    if ph not in phones:
+                        phones.append(ph)
+                if len(mentions) < 3 and not any(j in href.lower() for j in ("google.", "gov.uk")):
+                    mentions.append({"url": href, "title": title[:90]})
+        # enough? personal LinkedIn + one more channel
+        if "linkedin" in links and len(links) >= 2:
+            break
+    return {"links": links, "emails": emails, "phones": phones, "mentions": mentions}
 
 
 # ------------------------------------------------------------------
@@ -510,12 +843,105 @@ def load_progress(md, job_id):
 
 
 def save_progress(md, job_id, progress):
-    md.redis_set(progress_key(job_id), json.dumps(progress))
+    md.redis("SET", progress_key(job_id), json.dumps(progress), "EX", str(7 * 86400))
+
+
+# ------------------------------------------------------------------
+# Per-company pipeline
+# ------------------------------------------------------------------
+
+def merge_contacts(result_parts):
+    """result_parts: [(source, emails, phones)] -> deduped contact lists."""
+    emails, phones = {}, {}
+    for source, em, ph in result_parts:
+        for e in em or []:
+            emails.setdefault(e, source)
+        for p in ph or []:
+            key = re.sub(r"\D", "", p)[-9:]
+            if key and key not in {re.sub(r"\D", "", k)[-9:] for k in phones}:
+                phones[p] = source
+    return ([{"value": k, "source": v} for k, v in emails.items()],
+            [{"value": k, "source": v} for k, v in phones.items()])
+
+
+def discover_company(page, c, md):
+    name = c.get("name", "")
+    location = c.get("location", "UK") or "UK"
+    number = c.get("company_number", "")
+
+    # Phase C — official register: number, town, current directors
+    if not number:
+        number = resolve_company_number(name)
+    profile = fetch_profile(number)
+    officers = fetch_officers(number)
+    locality = profile.get("locality") or (location if location.upper() != "UK" else "")
+
+    # Phase A — Google, several angles, anywhere
+    web = search_company_web(page, name, locality, number, md)
+
+    # Phase A2 — read the company's own website
+    site = crawl_site(web.get("website")) if web.get("website") else \
+        {"emails": [], "phones": [], "socials": {}, "pages": 0}
+
+    # Phase B — Maps, just the name
+    maps = maps_lookup(page, name, locality, md)
+    if maps.get("website") and not web.get("website"):
+        web["website"] = maps["website"]
+        web["match_reason"] = "website listed on Google Maps"
+        web["confidence"] = 85
+        site = crawl_site(maps["website"])
+
+    # Phase D — each director / founder
+    officer_results = []
+    for off in officers:
+        ps = person_search(page, off["search_name"], name,
+                           off.get("locality") or locality, md)
+        officer_results.append({**off, **ps})
+        human_pause()
+
+    socials = dict(site.get("socials") or {})
+    for k, v in (web.get("socials") or {}).items():
+        socials.setdefault(k, v)
+    linkedin = web.get("linkedin_company") or socials.pop("linkedin", None)
+    socials.pop("linkedin", None)
+
+    emails, phones = merge_contacts([
+        ("website", site.get("emails"), site.get("phones")),
+        ("google", web.get("emails"), web.get("phones")),
+        ("maps", [], [maps.get("phone")] if maps.get("phone") else []),
+    ])
+
+    return {
+        "v": CACHE_VERSION,
+        "company": name, "location": location,
+        "company_number": number,
+        "registered_address": profile.get("address", ""),
+        "discovered_website": web.get("website"),
+        "website_title": web.get("website_title", ""),
+        "discovered_linkedin": linkedin,
+        "socials": socials,
+        "emails": emails, "phones": phones,
+        "mentions": web.get("mentions", []),
+        "maps": maps or None,
+        "officers": officer_results,
+        "discovery_source": "google_search" if web.get("website") else "not_found",
+        "confidence_score": web.get("confidence", 0),
+        "match_reason": web.get("match_reason", ""),
+        "queries_run": web.get("queries_run", 0),
+        "search_timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # ------------------------------------------------------------------
 # Job processing
 # ------------------------------------------------------------------
+
+def requeue(md, data, remaining, delay_seconds=0):
+    job = dict(data)
+    job["companies"] = remaining
+    job["resume_after"] = int(time.time()) + delay_seconds if delay_seconds else 0
+    md.redis("RPUSH", "jobs:find", json.dumps(job))
+
 
 def process_job(data):
     import maps_daemon as md
@@ -525,12 +951,23 @@ def process_job(data):
     job_id = str(data.get("job_id") or f"{chat_id}-{int(time.time())}")
     max_to_process = int(data.get("max", 40))
 
-    md.send_telegram(
-        chat_id,
-        f"🕵️ Discovery job started: {len(companies)} compan"
-        f"{'y' if len(companies)==1 else 'ies'} (up to {max_to_process}/run). "
-        "For each: Google web search → Maps listing → Companies House "
-        "directors → their LinkedIn/socials. Results land here...")
+    # A budget-delayed job that isn't due yet goes back on the shelf quietly.
+    resume_after = int(data.get("resume_after") or 0)
+    if resume_after and time.time() < resume_after:
+        md.redis("RPUSH", "jobs:find", json.dumps(data))
+        time.sleep(5)
+        return
+
+    progress = load_progress(md, job_id)
+    if not progress.get("started"):
+        md.send_telegram(
+            chat_id,
+            f"🕵️ Discovery started: {len(companies)} compan"
+            f"{'y' if len(companies) == 1 else 'ies'}.\n"
+            "Per company: Companies House directors → Google (name, town, "
+            "contact, socials) → their website → Google Maps (name only) → "
+            "each director on Google/LinkedIn/socials. Results land here...")
+        progress["started"] = True
 
     cookies = load_google_cookies()
     if not cookies:
@@ -539,112 +976,60 @@ def process_job(data):
             f"⚠️ No usable google.com cookies at {COOKIES_PATH}.\n\n"
             "Export them with the Cookie-Editor extension while logged in to "
             "google.com, save as cookies/google_cookies.json next to "
-            "maps_daemon.py, then re-run.")
+            "maps_daemon.py (or the GOOGLE_COOKIES_JSON secret), then re-send /findco.")
         return
 
-    progress = load_progress(md, job_id)
     if progress.get("blocked"):
         md.send_telegram(
             chat_id,
-            "⏸️ This job hit a Google CAPTCHA / unusual-traffic wall last run "
-            "and is paused. Refresh your cookies (Cookie-Editor export → "
-            "cookies/google_cookies.json), then send /findco again with the "
-            "same list to resume.")
+            "⏸️ This job hit a Google CAPTCHA wall earlier and is paused. "
+            "Refresh your cookies, then send /findco again with the same list.")
         return
 
     done_map = progress.setdefault("done", {})
-    remaining = [c for c in companies
-                 if company_key(c.get("name", ""), c.get("location", ""))
-                 not in done_map][:max_to_process]
+    pending = [c for c in companies
+               if company_key(c.get("name", ""), c.get("location", "")) not in done_map]
+    batch = pending[:max_to_process]
 
-    instant, needs_search = [], []
-    for c in remaining:
+    results, to_search = [], []
+    for c in batch:
         hit = get_cached(c.get("name", ""), c.get("location", ""))
-        (instant if hit else needs_search).append((c, hit))
+        if hit:
+            done_map[company_key(c.get("name", ""), c.get("location", ""))] = hit
+            results.append(hit)
+        else:
+            to_search.append(c)
 
-    results = []
-    for c, hit in instant:
-        done_map[company_key(c.get("name", ""), c.get("location", ""))] = hit
-        results.append(hit)
-
-    budget_hit = False
-    if needs_search:
+    stop_reason = None
+    started = time.time()
+    if to_search:
         with sync_playwright() as p:
             browser, context = make_context(p, cookies)
             page = context.new_page()
             try:
-                for c, _ in needs_search:
-                    name = c.get("name", "")
-                    location = c.get("location", "UK")
-                    company_number = c.get("company_number", "")
-                    key = company_key(name, location)
-
-                    # Phase C first — it's free and needs no browser
-                    officers = fetch_officers(company_number)
-
-                    # Phase A — web search
-                    web = search_company_web(page, name, location, md)
-                    if web.get("error") in ("budget", "blocked"):
-                        if web["error"] == "blocked":
-                            progress["blocked"] = True
-                            save_progress(md, job_id, progress)
-                            md.send_telegram(
-                                chat_id,
-                                "🚫 Google threw a CAPTCHA / unusual-traffic "
-                                "wall mid-run. Job PAUSED and state saved — "
-                                "refresh your google cookies (Cookie-Editor → "
-                                "cookies/google_cookies.json), then re-send "
-                                "the same /findco command to resume.")
-                        else:
-                            budget_hit = True
-                            md.send_telegram(
-                                chat_id,
-                                f"⏳ Hourly search budget reached. "
-                                f"{len(needs_search)} compan"
-                                f"{'y' if len(needs_search)==1 else 'ies'} left "
-                                "— progress is saved and the next tick resumes.")
-                            save_progress(md, job_id, progress)
+                for c in to_search:
+                    if time.time() - started > MAX_RUN_SECONDS:
+                        stop_reason = "time"
                         break
-
-                    # Phase B — maps
-                    maps = maps_lookup(page, name, location, md)
-                    if maps.get("error") in ("budget", "blocked"):
-                        maps = {}
-
-                    # Phase D — director searches
-                    officer_results = []
-                    for off in officers:
-                        ps = person_search(page, off["name"], name, md)
-                        if ps.get("error"):
-                            break
-                        officer_results.append({**off, **ps})
-                        human_pause()
-
-                    result = {
-                        "company": name, "location": location,
-                        "company_number": company_number,
-                        "discovered_website": web.get("website"),
-                        "website_title": web.get("website_title", ""),
-                        "discovered_linkedin": web.get("linkedin_company"),
-                        "socials": web.get("socials", {}),
-                        "maps": maps or None,
-                        "officers": officer_results,
-                        "discovery_source": "google_search" if web.get("website")
-                                            else "not_found",
-                        "confidence_score": web.get("confidence", 0),
-                        "match_reason": web.get("match_reason", ""),
-                        "search_timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
-                    put_cached(name, location, result)
+                    name = c.get("name", "")
+                    key = company_key(name, c.get("location", ""))
+                    try:
+                        result = discover_company(page, c, md)
+                    except Wall as w:
+                        stop_reason = w.kind
+                        break
+                    except Exception as e:
+                        print(f"  ⚠️ {name} failed: {e}")
+                        continue
+                    put_cached(name, c.get("location", ""), result)
                     done_map[key] = result
                     save_progress(md, job_id, progress)
                     results.append(result)
-
-                    site = result["discovered_website"] or "— no website"
-                    print(f"  🔎 {name}: {site} "
+                    print(f"  🔎 {name}: {result['discovered_website'] or '— no website'} "
                           f"({result['confidence_score']}) "
-                          f"maps={'✓' if maps else '✗'} "
-                          f"officers={len(officer_results)}")
+                          f"maps={'✓' if result['maps'] else '✗'} "
+                          f"emails={len(result['emails'])} "
+                          f"directors={len(result['officers'])}")
                     human_pause()
             finally:
                 try:
@@ -652,117 +1037,146 @@ def process_job(data):
                 except Exception:
                     pass
 
-    send_report(md, chat_id, job_id, results)
-
-    try:
-        path = export_report(results, job_id)
-        md.send_telegram_document(chat_id, path,
-                                  caption=f"Discovery results — {job_id}")
-    except Exception as e:
-        print(f"  discovery export failed: {e}")
-
-    left = len(companies) - len(done_map)
-    if left > 0:
+    if stop_reason == "blocked":
+        progress["blocked"] = True
         md.send_telegram(
             chat_id,
-            f"⏭️ {left} companies still pending (budget/cap). The next daemon "
-            "tick picks them up automatically — re-send the same list or wait "
-            "for the schedule.")
-    else:
+            "🚫 Google threw a CAPTCHA / unusual-traffic wall. Job PAUSED and "
+            "saved — refresh your google cookies, then re-send /findco.")
+    save_progress(md, job_id, progress)
+
+    if results:
+        send_report(md, chat_id, job_id, results)
+        try:
+            path = export_report(list(done_map.values()), job_id)
+            md.send_telegram_document(chat_id, path,
+                                      caption=f"Discovery results — {job_id}")
+        except Exception as e:
+            print(f"  discovery export failed: {e}")
+
+    remaining = [c for c in companies
+                 if company_key(c.get("name", ""), c.get("location", "")) not in done_map]
+    if remaining and stop_reason != "blocked":
+        if stop_reason == "budget":
+            if not progress.get("budget_notified"):
+                progress["budget_notified"] = True
+                save_progress(md, job_id, progress)
+                md.send_telegram(
+                    chat_id,
+                    f"⏳ Hourly Google budget reached. {len(remaining)} left — "
+                    "they're re-queued and will resume automatically in ~50 min.")
+            requeue(md, data, remaining, delay_seconds=50 * 60)
+        else:
+            requeue(md, data, remaining)
+            md.send_telegram(chat_id,
+                             f"⏭️ {len(remaining)} still pending — continuing on the next run.")
+    elif not remaining:
         md.redis("DEL", progress_key(job_id))
-        found = sum(1 for r in results if r.get("discovered_website"))
+        found = sum(1 for r in done_map.values() if r.get("discovered_website"))
+        contactable = sum(1 for r in done_map.values()
+                          if r.get("emails") or r.get("phones") or r.get("discovered_linkedin")
+                          or r.get("socials")
+                          or any(o.get("links") for o in r.get("officers", [])))
         md.send_telegram(chat_id,
-                         f"✓ Discovery job complete: {found} websites found, "
-                         f"{len(results) - found} not found.")
+                         f"✓ Discovery complete: {len(done_map)} companies, "
+                         f"{found} websites, {contactable} with at least one way to contact.")
+
+
+# ------------------------------------------------------------------
+# Reporting
+# ------------------------------------------------------------------
+
+def _tick(v):
+    return "✅" if v else "❓"
+
+
+def format_result(r, i=None):
+    conf = r.get("confidence_score", 0)
+    hot = " 🔥" if conf >= 80 else ""
+    head = f"{i}. " if i else ""
+    lines = [f"{head}{r['company']}{hot}"]
+    if r.get("company_number"):
+        lines[0] += f"  (#{r['company_number']})"
+    lines.append(f"   🔗 {r['discovered_website']}" if r.get("discovered_website")
+                 else "   🔗 no website found")
+    for e in r.get("emails", [])[:3]:
+        lines.append(f"   📧 {e['value']}  ({e['source']})")
+    for p in r.get("phones", [])[:3]:
+        lines.append(f"   📱 {p['value']}  ({p['source']})")
+    if r.get("discovered_linkedin"):
+        lines.append(f"   💼 {r['discovered_linkedin']}")
+    soc = [f"{k}: {v}" for k, v in (r.get("socials") or {}).items()]
+    if soc:
+        lines.append("   📣 " + " | ".join(soc[:4]))
+    m = r.get("maps") or {}
+    if m:
+        bits = []
+        if m.get("rating"):
+            bits.append(f"⭐ {m['rating']}" + (f" ({m['reviews']})" if m.get("reviews") else ""))
+        if m.get("address"):
+            bits.append(f"📍 {m['address']}")
+        if bits:
+            lines.append("   🗺️ Maps: " + " · ".join(bits))
+    for off in r.get("officers", []):
+        lines.append(f"   👤 {off.get('name', '')} ({off.get('role', '')})")
+        links = off.get("links") or {}
+        for net, d in links.items():
+            lines.append(f"      {'💼' if net == 'linkedin' else '📣'} {net}: {d['url']} {_tick(d['verified'])}")
+        for e in off.get("emails", [])[:2]:
+            lines.append(f"      📧 {e}")
+        for ph in off.get("phones", [])[:2]:
+            lines.append(f"      📱 {ph}")
+        for mt in off.get("mentions", [])[:2]:
+            lines.append(f"      🔎 {mt['title']} — {mt['url']}")
+        if not (links or off.get("emails") or off.get("phones") or off.get("mentions")):
+            lines.append("      — nothing public found")
+    for mt in r.get("mentions", [])[:2]:
+        lines.append(f"   🔎 {mt['title']} — {mt['url']}")
+    if not (r.get("emails") or r.get("phones") or r.get("discovered_linkedin")
+            or r.get("socials") or r.get("discovered_website")
+            or any(o.get("links") for o in r.get("officers", []))):
+        lines.append("   ⚠️ no public footprint yet (very new company) — "
+                     "check director names above / registered address")
+    return lines
 
 
 def send_report(md, chat_id, job_id, results):
-    lines = [f"🕵️ Discovery report — {job_id}", ""]
+    blocks = []
     for i, r in enumerate(results, 1):
-        conf = r.get("confidence_score", 0)
-        hot = " 🔥" if conf >= 80 else ""
-        lines.append(f"{i}. {r['company']} ({r.get('location', '')}){hot}")
-        if r.get("discovered_website"):
-            lines.append(f"   🔗 {r['discovered_website']}")
-        else:
-            lines.append("   🔗 no website found")
-        socials = r.get("socials") or {}
-        social_bits = [f"{k}: {v}" for k, v in socials.items()
-                       if k != "linkedin"]
-        if social_bits:
-            lines.append("   📣 " + " | ".join(social_bits[:4]))
-        if r.get("discovered_linkedin"):
-            lines.append(f"   💼 {r['discovered_linkedin']}")
-        maps = r.get("maps") or {}
-        if maps:
-            bits = []
-            if maps.get("rating"):
-                bits.append(f"⭐ {maps['rating']}"
-                            + (f" ({maps['reviews']})" if maps.get("reviews") else ""))
-            if maps.get("phone"):
-                bits.append(f"📱 {maps['phone']}")
-            if maps.get("address"):
-                bits.append(f"📍 {maps['address']}")
-            if bits:
-                lines.append("   " + " · ".join(bits))
-        for off in r.get("officers", []):
-            role = off.get("role", "")
-            ln = off.get("linkedin") or ""
-            osoc = off.get("socials", {})
-            extra = " | ".join(v for k, v in osoc.items()
-                               if k != "linkedin")
-            lines.append(f"   👤 {off.get('name','')} ({role})"
-                         + (f"\n      💼 {ln}" if ln else "")
-                         + (f"\n      📣 {extra}" if extra else "")
-                         + ("" if (ln or extra) else " — nothing public"))
-        lines.append("")
-    msg = "\n".join(lines)
-    for start in range(0, len(msg), 3800):
-        md.send_telegram(chat_id, msg[start:start + 3800])
+        blocks.append("\n".join(format_result(r, i)))
+    header = f"🕵️ Discovery report — {job_id}\n(✅ = person confirmed with the company, ❓ = same name, unconfirmed)\n"
+    msg, chunks = header, []
+    for b in blocks:
+        if len(msg) + len(b) + 2 > 3800:
+            chunks.append(msg)
+            msg = ""
+        msg += "\n" + b + "\n"
+    chunks.append(msg)
+    for ch in chunks:
+        md.send_telegram(chat_id, ch)
         time.sleep(1)
 
 
 def export_report(results, job_id):
-    os.makedirs(os.path.join(os.path.dirname(DB_PATH), "exports"),
-                exist_ok=True)
+    os.makedirs(os.path.join(os.path.dirname(DB_PATH), "exports"), exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(os.path.dirname(DB_PATH),
-                        "exports", f"discovery_{ts}_{job_id[:20]}.txt")
+    path = os.path.join(os.path.dirname(DB_PATH), "exports",
+                        f"discovery_{ts}_{job_id[:20]}.txt")
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"DISCOVERY REPORT — {job_id}\n")
         f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
         f.write("=" * 60 + "\n\n")
         for r in results:
-            f.write(f"{r['company']} ({r.get('location','')})\n")
-            f.write(f"  website:   {r.get('discovered_website')}\n")
-            f.write(f"  linkedin:  {r.get('discovered_linkedin')}\n")
-            socials = r.get("socials") or {}
-            for k, v in socials.items():
-                if k != "linkedin":
-                    f.write(f"  {k}: {v}\n")
-            maps = r.get("maps") or {}
-            if maps:
-                f.write(f"  maps:      {maps.get('rating','')} "
-                        f"({maps.get('reviews','')} reviews) "
-                        f"{maps.get('phone','')} {maps.get('address','')}\n")
-            for off in r.get("officers", []):
-                f.write(f"  officer:   {off.get('name','')} "
-                        f"({off.get('role','')})\n")
-                if off.get("linkedin"):
-                    f.write(f"    linkedin: {off['linkedin']}\n")
-                for k, v in (off.get("socials") or {}).items():
-                    if k != "linkedin":
-                        f.write(f"    {k}: {v}\n")
-            f.write(f"  score:     {r.get('confidence_score')}/100 "
-                    f"({r.get('match_reason','')})\n")
-            f.write(f"  checked:   {r.get('search_timestamp','')}\n\n")
+            f.write("\n".join(format_result(r)) + "\n")
+            f.write(f"   score: {r.get('confidence_score')}/100 "
+                    f"({r.get('match_reason', '')}) · registered: "
+                    f"{r.get('registered_address', '')}\n\n")
     return path
 
 
 if __name__ == "__main__":
-    import maps_daemon as md  # noqa: F401  (self-test needs md.* helpers)
-    demo = [
-        {"name": "Rolls-Royce", "location": "Derby UK", "company_number": "00021500"},
-    ]
+    import maps_daemon as md  # noqa: F401
+    demo = [{"name": "Rolls-Royce Holdings plc", "location": "Derby UK",
+             "company_number": "07524813"}]
     process_job({"type": "discovery", "chat_id": os.environ.get("DEMO_CHAT_ID", ""),
                  "job_id": f"demo-{int(time.time())}", "companies": demo})
