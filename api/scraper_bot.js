@@ -316,18 +316,64 @@ module.exports = async (req, res) => {
     }
   }
 
-  // Parses a pasted or fetched company list into [{name, location}].
-  // Handles "Name, City" / "Name | City" / bare names, numbered lines,
-  // and pasted /newuk output (decoration lines and links are skipped).
+  // Parses a pasted or fetched company list into [{name, location, company_number}].
+  // Understands "Name, City" / "Name | City" / bare names, numbered lines,
+  // raw /newuk output, and even the junk around a sloppy copy-paste
+  // (chat headers, browser link-previews, other bot replies). A line only
+  // counts as a company if it looks like one — ALL-CAPS or carrying a
+  // company suffix — which automatically skips addresses, dates, bot
+  // chatter, and link previews. find-and-update links attach their
+  // company number to the nearest company name.
+  function looksLikeCompany(line) {
+    const letters = line.replace(/[^a-zA-Z]/g, '')
+    if (letters.length < 3) return false
+    const upperRatio = letters.replace(/[^A-Z]/g, '').length / letters.length
+    if (/\b(LTD|LIMITED|LLP|PLC|LLC|INC|LP)\b\.?$/.test(line)) return true
+    if (upperRatio > 0.85) return true                    // PEAKWOOD LIMITED / WIDGETCO
+    const words = line.split(/\s+/)
+    const addressish = /\b(farm|road|rd|street|st\b|lane|ln|avenue|ave|court|ct|flat|apartment|apt|house|view|building|drive|dr|close|place|square|terrace|grove|way|park|estate|high\s?street)\b/i
+    if (words.length >= 2 && words.length <= 5 && !/\d/.test(line)
+        && /^[A-Z][a-zA-Z&'.\-]*(\s+[A-Z][a-zA-Z&'.\-]*)+$/.test(line)
+        && !addressish.test(line)) return true            // Title Case names
+    return false
+  }
+
   function parseCompanyLines(raw) {
+    const JUNK = [/total hits/i, /new UK compan/i, /overview - find/i,
+      /free company information/i, /find-and-update/i,
+      /company-information\.service\.gov\.uk/i, /job posted/i,
+      /scraping google maps/i, /review cap/i, /reply with a number/i,
+      /no leads collected/i, /results will land/i, /triggered github/i,
+      /what's the max/i, /captcha/i, /^skip$/i, /try again later/i,
+      /takes a while/i, /up to \d+ leads/i, /more reviews/i,
+      /incorporated:/i, /^ltd\.?$/i]
     const companies = []
-    for (let line of raw.split('\n')) {
-      line = line.trim()
+    const byName = new Map()
+    let pendingNumber = ''
+    const attach = (num) => {
+      for (let i = companies.length - 1; i >= 0; i--) {
+        if (!companies[i].company_number) { companies[i].company_number = num; break }
+        break  // only the most recent company is eligible
+      }
+      pendingNumber = ''   // consumed — never leaks into the next company
+    }
+    for (let rawLine of raw.split('\n')) {
+      const numMatch = rawLine.match(/company\/([A-Z0-9]{6,10})/i)
+      if (numMatch) {
+        pendingNumber = numMatch[1].toUpperCase()
+        attach(pendingNumber)
+      }
+      let line = rawLine.trim()
       if (!line || line.startsWith('#')) continue
-      if (/^(🔗|📅|🏢|📍|🇬🇧|✓|•|--)/.test(line)) continue   // /newuk decoration
-      if (/^https?:\/\//.test(line)) continue                 // any link lines
-      line = line.replace(/^\d+[.)]\s*/, '')                  // "1. " numbering
+      if (/^https?:\/\//.test(line)) continue
+      line = line.replace(/^[^\w(]+/, '').replace(/^\d+[.)]\s*/, '').trim()
       if (!line) continue
+      if (JUNK.some(rx => rx.test(line))) continue
+      if (line.length > 70) continue                       // sentences, not names
+      if (/^[([\]].*[)\]]?$/.test(line) && line.length < 40) continue
+      if (/^[\w.-]+\.[a-z]{2,}(\.[a-z]{2,})?$/.test(line)) continue
+      if (/^[^\w]/.test(line)) continue
+
       let name = line, location = 'UK'
       if (line.includes('|')) {
         const parts = line.split('|').map(s => s.trim())
@@ -336,12 +382,24 @@ module.exports = async (req, res) => {
       } else if (line.includes(',')) {
         const idx = line.lastIndexOf(',')
         const maybeLoc = line.slice(idx + 1).trim()
-        if (maybeLoc && maybeLoc.length <= 60 && !/^\d+$/.test(maybeLoc)) {
+        if (maybeLoc && maybeLoc.length <= 60 && !/^\d+$/.test(maybeLoc)
+            && !/^(ltd|limited|llp|plc|inc|llc|uk)$/i.test(maybeLoc)) {
           name = line.slice(0, idx).trim()
           location = maybeLoc
         }
       }
-      if (name) companies.push({ name, location })
+      if (!looksLikeCompany(name)) continue
+      const key = name.toLowerCase().replace(/\s+/g, ' ').trim()
+      if (byName.has(key)) {
+        const e = byName.get(key)
+        if (pendingNumber && !e.company_number) e.company_number = pendingNumber
+        if (e.location === 'UK' && location !== 'UK') e.location = location
+      } else {
+        const entry = { name, location, company_number: pendingNumber }
+        companies.push(entry)
+        byName.set(key, entry)
+      }
+      pendingNumber = ''
       if (companies.length >= 500) break
     }
     return companies
@@ -350,7 +408,7 @@ module.exports = async (req, res) => {
   async function postDiscoveryJob(chatId, companies) {
     const jobId = `co-${Date.now()}`
     await redis('RPUSH', 'jobs:find', JSON.stringify({
-      type: 'discovery', chat_id: chatId, job_id: jobId, companies, max: 100
+      type: 'discovery', chat_id: chatId, job_id: jobId, companies, max: 40
     }))
     const dispatched = await triggerGithubWorkflow()
     await send(chatId,
@@ -934,7 +992,17 @@ module.exports = async (req, res) => {
         return await postDiscoveryJob(chatId, companies)
       } catch (e) { await send(chatId, `Couldn't fetch that URL.`); return res.status(200).send('OK') }
     }
-    // No URL — arm the paste-catcher and wait for their list
+    // Same-message paste: "/findco <blob>" — parse the rest of THIS message
+    const inline = text.replace(/^\/findco(@\w+)?\s*/, '')
+    if (inline.trim().length > 10) {
+      const companies = parseCompanyLines(inline)
+      if (!companies.length) {
+        await send(chatId, `Couldn't parse any companies from that. Send /findco alone, then paste the list as your next message.`)
+        return res.status(200).send('OK')
+      }
+      return await postDiscoveryJob(chatId, companies)
+    }
+    // No URL, no paste — arm the paste-catcher and wait for their list
     const q = await getUserQueue(userId)
     q.awaitingCompanyList = true
     await saveUserQueue(userId, q)
@@ -1195,6 +1263,10 @@ module.exports = async (req, res) => {
 
     // ── Awaiting review cap for /find ──
     if (userQueue.awaitingReviewCap) {
+      if (text.includes('\n') || text.length > 30) {
+        await send(chatId, `That doesn't look like a review cap — reply with just a number (e.g. 200) or "skip".`)
+        return res.status(200).send('OK')
+      }
       const raw = text.trim().toLowerCase()
       let reviewCap = null
       if (raw !== 'skip' && raw !== 'no' && raw !== 'none' && raw !== '0') {

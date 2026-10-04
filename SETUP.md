@@ -305,28 +305,52 @@ reports).
    `maps_daemon.py` (on your PC, and in the repo as a **secret** — see
    below — if you want GitHub Actions runs to use it too)
 
-**Usage:**
+**Usage (two ways):**
 ```
-/findco https://example.com/companies.txt
+/findco
 ```
-The list is plain text, one company per line — location optional:
+then paste your company list as the next message — one per line, location
+optional. You can even paste raw `/newuk` output straight in; the dates,
+links, and address lines are ignored automatically and only the company
+names get picked up.
 ```
 Acme Ltd, London
 WidgetCo | Manchester
 SoloCompany
 ```
+Or point it at a hosted list:
+```
+/findco https://example.com/companies.txt
+```
+
+**What it does per company (full contact picture):**
+1. **Google web search** → official website, LinkedIn company page, and
+   every social profile (Instagram, Facebook, TikTok, X) found in results
+2. **Google Maps** → phone number, rating, review count, address
+3. **Companies House directors** (free official API — the bot picks the
+   company numbers out of the find-and-update links in your paste
+   automatically) → the actual people behind the company
+4. **Per-director Google search** → their personal LinkedIn and socials,
+   so you know exactly who to contact
 
 **How it behaves:**
-- Searches are budgeted at ~40/hour, shared across all runners via Redis,
-  with randomized 3–7s human-like delays between searches
-- Every answer is cached in SQLite for 30 days — repeat runs never
-  re-search the same company
-- Progress checkpoints to Redis after each company, so if a run hits the
-  30-minute job cap it resumes where it left off on the next tick
-- If Google shows a CAPTCHA mid-run, the job pauses itself, alerts you in
-  Telegram, and waits for fresh cookies instead of burning the list
-- Results arrive in Telegram in batches plus a `.txt` export, with a
-  confidence score and match reason per company
+- Paste it in ANY form: `/findco` then the list as the next message, or
+  paste everything on the same line as the command — even raw `/newuk`
+  output or a messy multi-app copy-paste (addresses, browser link
+  previews, other bot replies) is filtered down to just the company names
+- Page navigations are budgeted (~100/hour shared across all runners via
+  Redis) with randomized human-like delays; roughly 15–20 companies/hour
+- Every answer is cached in SQLite for 30 days — repeats are free
+- Progress checkpoints to Redis after each company, so a run that hits
+  the 30-minute job cap resumes mid-list on the next tick
+- If Google shows a CAPTCHA mid-run, the job pauses itself, alerts you,
+  and waits for fresh cookies instead of burning the list
+- Results arrive in Telegram plus a `.txt` export: website, socials,
+  Maps phone/rating, and each director with their LinkedIn
+
+**Local run needs one extra line in `.env`:** `COMPANIES_HOUSE_API_KEY=...`
+(same free key as Vercel). For GitHub Actions runs, add it as a repo
+secret of the same name — `daemon.yml` passes it through automatically.
 
 **For GitHub Actions runs:** add a repo secret `GOOGLE_COOKIES_JSON` with
 the full contents of `google_cookies.json`, and add a step before the

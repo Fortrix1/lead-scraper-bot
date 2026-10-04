@@ -51,6 +51,10 @@ jobs:
         # Written fresh every run, never committed.
         run: echo '${{ secrets.GM_COOKIES_JSON }}' > gm_cookies.json
 
+      - name: Restore Google search cookies for /findco
+        # Exported via Cookie-Editor while logged into google.com.
+        run: mkdir -p cookies && echo '${{ secrets.GOOGLE_COOKIES_JSON }}' > cookies/google_cookies.json
+
       - name: Run the daemon (single pass)
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
@@ -59,5 +63,10 @@ jobs:
           # Optional: only needed if the probe above shows 403.
           # When set, ALL crt.sh traffic goes through your relay instead.
           CRTSH_RELAY_URL: ${{ secrets.CRTSH_RELAY_URL }}
+          # Needed for /findco director lookups (free key, same one as
+          # Vercel's COMPANIES_HOUSE_API_KEY).
+          COMPANIES_HOUSE_API_KEY: ${{ secrets.COMPANIES_HOUSE_API_KEY }}
+          # Needed for /findco: exported google.com cookies (Cookie-Editor).
+          GOOGLE_COOKIES_JSON: ${{ secrets.GOOGLE_COOKIES_JSON }}
           RUN_MODE: once
         run: xvfb-run --auto-servernum python3 maps_daemon.py
