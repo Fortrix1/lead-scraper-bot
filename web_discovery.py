@@ -59,7 +59,7 @@ DB_PATH = os.environ.get(
 )
 COMPANIES_HOUSE_API_KEY = os.environ.get("COMPANIES_HOUSE_API_KEY", "")
 
-CACHE_VERSION = 3          # bump to invalidate old (thinner) cached results
+CACHE_VERSION = 4          # bump to invalidate old (thinner) cached results
 
 # Page navigations per hour across ALL runners (PC + GitHub Actions).
 # A full company costs roughly 6-10 navigations, so 150/h ~ 15-25 companies/h.
@@ -375,6 +375,51 @@ def score_candidate(url, title, snippet, name):
 
 
 # ------------------------------------------------------------------
+# Address verification — is this the SAME company, or just the same name?
+# ------------------------------------------------------------------
+
+UK_POSTCODE_RE = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?)\s*(\d[A-Z]{2})\b", re.I)
+
+
+def norm_pc(pc):
+    return re.sub(r"\s+", "", pc or "").upper()
+
+
+def postcodes_in(text):
+    return {m.group(1).upper() + m.group(2).upper()
+            for m in UK_POSTCODE_RE.finditer(text or "")}
+
+
+def addr_status(profile, text):
+    """Compare a page / listing / snippet against the REGISTERED address.
+       verified = our exact postcode appears
+       likely   = same postcode area (e.g. B65) or same town, no contradicting postcode
+       conflict = it shows other UK postcodes and none of ours -> different business
+       unknown  = no address information at all"""
+    pc = norm_pc(profile.get("postcode"))
+    found = postcodes_in(text)
+    if pc and pc in found:
+        return "verified"
+    outward = pc[:-3] if len(pc) > 4 else ""
+    if outward and any(f[:-3] == outward for f in found):
+        return "likely"
+    if found:
+        return "conflict"
+    loc = (profile.get("locality") or "").strip().lower()
+    if loc and len(loc) > 3 and re.search(r"\b" + re.escape(loc) + r"\b", (text or "").lower()):
+        return "likely"
+    return "unknown"
+
+
+def is_recent(profile, days=90):
+    try:
+        d = datetime.fromisoformat(profile.get("created", ""))
+        return (datetime.now() - d).days <= days
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------------------
 # Extraction helpers (emails / phones / socials)
 # ------------------------------------------------------------------
 
@@ -482,81 +527,76 @@ def serp(page, query, md):
 # Phase A — Google web search (several angles)
 # ------------------------------------------------------------------
 
-def web_queries(name, locality, number):
+def web_queries(name, locality, number, postcode=""):
     qs = [
-        f'"{name}"',                                        # exact name, anywhere
-        f'"{name}" {locality or "UK"}',                     # + town
-        f'"{name}" contact email phone',                    # contact details
-        f'"{name}" linkedin OR instagram OR facebook',      # socials
+        f'"{name}"',                                              # exact name, anywhere
+        f'"{name}" {postcode}' if postcode else f'"{name}" {locality or "UK"}',   # + registered postcode
+        f'"{name}" contact email phone',                          # contact details
+        f'"{name}" linkedin OR instagram OR facebook',            # socials
     ]
     if number:
-        qs.append(f'"{name}" "{number}"')                   # directory pages
+        qs.append(f'"{name}" "{number}"')                         # directory pages
     return qs[:MAX_WEB_QUERIES]
 
 
-def search_company_web(page, name, locality, number, md):
-    best = None
-    linkedin = None
-    socials = {}
+def search_company_web(page, name, profile, number, md):
+    locality = profile.get("locality", "")
+    postcode = profile.get("postcode", "")
+    cands = {}                      # url -> candidate
+    linkedin = None                 # {"url","verified"}
+    socials = {}                    # net -> {"url","verified"}
     emails, phones, mentions = [], [], []
     relevant_total = 0
     ran = 0
 
-    for q in web_queries(name, locality, number):
+    for q in web_queries(name, locality, number, postcode):
         results = serp(page, q, md)
         ran += 1
         for href, title, snippet in results:
             blob = f"{title} {snippet}"
             relevant = name_in_text(name, blob + " " + href)
+            loc_ok = addr_status(profile, blob) in ("verified", "likely")
 
             if SOCIAL_HOSTS.search(href):
-                # accept a social hit only if it actually concerns this company
                 if relevant or squash(core_name(name)) in squash(href):
                     relevant_total += 1
-                    got = harvest_socials([href])
-                    for k, v in got.items():
-                        socials.setdefault(k, v)
-                    if "linkedin.com/company" in href and not linkedin:
-                        linkedin = href
+                    for k, v in harvest_socials([href]).items():
+                        prev = socials.get(k)
+                        if not prev or (loc_ok and not prev["verified"]):
+                            socials[k] = {"url": v, "verified": loc_ok}
+                    if "linkedin.com/company" in href and (not linkedin or (loc_ok and not linkedin["verified"])):
+                        linkedin = {"url": href, "verified": loc_ok}
                 continue
 
             if relevant:
                 relevant_total += 1
-                for e in clean_emails(snippet):
-                    if e not in emails:
-                        emails.append(e)
-                for ph in clean_phones(snippet):
-                    if ph not in phones:
-                        phones.append(ph)
+                if loc_ok:          # only trust contact details sitting next to OUR address
+                    for e in clean_emails(snippet):
+                        if e not in emails:
+                            emails.append(e)
+                    for ph in clean_phones(snippet):
+                        if ph not in phones:
+                            phones.append(ph)
 
             low = href.lower()
             if any(j in low for j in JUNK_DOMAINS):
-                if relevant and len(mentions) < 4:
+                if relevant and loc_ok and len(mentions) < 4:
                     mentions.append({"url": href, "title": title[:90]})
                 continue
             score, why = score_candidate(href, title, snippet, name)
-            cand = {"url": href, "title": title, "score": score, "why": why}
-            if best is None or cand["score"] > best["score"]:
-                best = cand
+            if score >= 55 and (href not in cands or score > cands[href]["score"]):
+                cands[href] = {"url": href, "title": title, "score": score, "why": why}
 
-        # nothing at all online about this name after two angles -> stop early
-        if ran >= 2 and relevant_total == 0 and not (best and best["score"] >= 80):
+        strong = any(c["score"] >= 80 for c in cands.values())
+        if ran >= 2 and relevant_total == 0 and not strong:
             break
-        # got everything useful -> stop early
-        if (best and best["score"] >= 80 and (emails or phones)
-                and (linkedin or socials)):
+        if strong and (emails or phones) and (linkedin or socials):
             break
 
-    out = {"linkedin_company": linkedin, "socials": socials,
-           "emails": emails, "phones": phones, "mentions": mentions,
-           "queries_run": ran}
-    if best and best["score"] >= 55:
-        out.update({"website": best["url"], "website_title": best.get("title", ""),
-                    "match_reason": best.get("why", ""),
-                    "confidence": best["score"]})
-    else:
-        out.update({"website": None, "confidence": 0})
-    return out
+    ordered = sorted(cands.values(), key=lambda c: -c["score"])[:3]
+    return {"linkedin_company": linkedin, "socials": socials,
+            "emails": emails, "phones": phones, "mentions": mentions,
+            "candidates": ordered, "queries_run": ran}
 
 
 # ------------------------------------------------------------------
@@ -598,6 +638,7 @@ def crawl_site(url):
     out["phones"] = clean_phones(" ".join(tels) + " " +
                                  re.sub(r"<[^>]+>", " ", blob))[:4]
     out["socials"] = harvest_socials([blob])
+    out["text"] = html.unescape(re.sub(r"<[^>]+>", " ", blob))[:150000]
     return out
 
 
@@ -693,14 +734,28 @@ def _maps_try(page, query, name, md):
     return {}
 
 
-def maps_lookup(page, name, locality, md):
-    """Search Maps for the bare company name; fall back to name + town."""
-    place = _maps_try(page, name, name, md)
-    if place:
-        return place
-    if locality and locality.upper() != "UK":
-        return _maps_try(page, f"{name} {locality}", name, md)
-    return {}
+def maps_lookup(page, name, profile, md):
+    """Name only first; if the listing is at a different address (a look-alike),
+    retry with name + registered postcode, then name + town.
+    Returns (place_or_{}, rejected_listing_or_None)."""
+    postcode, locality = profile.get("postcode", ""), profile.get("locality", "")
+    queries = [name]
+    if postcode:
+        queries.append(f"{name} {postcode}")
+    if locality:
+        queries.append(f"{name} {locality}")
+    rejected = None
+    for q in queries:
+        place = _maps_try(page, q, name, md)
+        if not place:
+            continue
+        st = addr_status(profile, place.get("address", ""))
+        place["addr_status"] = st
+        if st == "conflict":
+            rejected = {"name": place.get("name", ""), "address": place.get("address", "")}
+            continue
+        return place, rejected
+    return {}, rejected
 
 
 # ------------------------------------------------------------------
@@ -850,18 +905,34 @@ def save_progress(md, job_id, progress):
 # Per-company pipeline
 # ------------------------------------------------------------------
 
-def merge_contacts(result_parts):
-    """result_parts: [(source, emails, phones)] -> deduped contact lists."""
+def merge_contacts(parts):
+    """parts: [(source, verified, emails, phones)] -> deduped contact lists."""
     emails, phones = {}, {}
-    for source, em, ph in result_parts:
+    for source, ok, em, ph in parts:
         for e in em or []:
-            emails.setdefault(e, source)
+            emails.setdefault(e, {"value": e, "source": source, "verified": ok})
         for p in ph or []:
             key = re.sub(r"\D", "", p)[-9:]
             if key and key not in {re.sub(r"\D", "", k)[-9:] for k in phones}:
-                phones[p] = source
-    return ([{"value": k, "source": v} for k, v in emails.items()],
-            [{"value": k, "source": v} for k, v in phones.items()])
+                phones[p] = {"value": p, "source": source, "verified": ok}
+    return list(emails.values()), list(phones.values())
+
+
+def pick_website(candidates, profile):
+    """Crawl candidate sites (free, no Google budget) and keep the first that
+    isn't clearly a different business. Returns (cand, site, status, rejected)."""
+    rejected = []
+    for cand in candidates:
+        site = crawl_site(cand["url"])
+        text = site.pop("text", "")
+        status = addr_status(profile, text) if site["pages"] else "unknown"
+        if status == "conflict":
+            found = sorted(postcodes_in(text))[:2]
+            rejected.append({"url": cand["url"],
+                             "why": "its address is elsewhere (" + ", ".join(found) + ")"})
+            continue
+        return cand, site, status, rejected
+    return None, {"emails": [], "phones": [], "socials": {}, "pages": 0}, "unknown", rejected
 
 
 def discover_company(page, c, md):
@@ -869,27 +940,36 @@ def discover_company(page, c, md):
     location = c.get("location", "UK") or "UK"
     number = c.get("company_number", "")
 
-    # Phase C — official register: number, town, current directors
+    # Phase C — official register: number, registered address, current directors
     if not number:
         number = resolve_company_number(name)
     profile = fetch_profile(number)
+    if not profile.get("locality") and location.upper() != "UK":
+        profile["locality"] = location
     officers = fetch_officers(number)
-    locality = profile.get("locality") or (location if location.upper() != "UK" else "")
+    locality = profile.get("locality", "")
 
-    # Phase A — Google, several angles, anywhere
-    web = search_company_web(page, name, locality, number, md)
+    # Phase A — Google, several angles (postcode-aware)
+    web = search_company_web(page, name, profile, number, md)
 
-    # Phase A2 — read the company's own website
-    site = crawl_site(web.get("website")) if web.get("website") else \
-        {"emails": [], "phones": [], "socials": {}, "pages": 0}
+    # Phase A2 — pick the website that actually matches the registered address
+    cand, site, site_status, rejected = pick_website(web["candidates"], profile)
+    website = cand["url"] if cand else None
+    confidence = cand["score"] if cand else 0
+    reason = cand["why"] if cand else ""
 
-    # Phase B — Maps, just the name
-    maps = maps_lookup(page, name, locality, md)
-    if maps.get("website") and not web.get("website"):
-        web["website"] = maps["website"]
-        web["match_reason"] = "website listed on Google Maps"
-        web["confidence"] = 85
-        site = crawl_site(maps["website"])
+    # Phase B — Maps: name first, then name + postcode, verified against our address
+    maps, maps_rejected = maps_lookup(page, name, profile, md)
+    if maps_rejected:
+        rejected.append({"url": f"Maps: {maps_rejected['name']}",
+                         "why": f"listed at {maps_rejected['address']}"})
+    if maps.get("website") and not website:
+        mc, msite, mstatus, mrej = pick_website(
+            [{"url": maps["website"], "score": 85, "why": "website listed on Google Maps"}], profile)
+        rejected += mrej
+        if mc:
+            website, site, site_status = mc["url"], msite, mstatus
+            confidence, reason = 85, mc["why"]
 
     # Phase D — each director / founder
     officer_results = []
@@ -899,16 +979,26 @@ def discover_company(page, c, md):
         officer_results.append({**off, **ps})
         human_pause()
 
-    socials = dict(site.get("socials") or {})
+    site_ok = site_status in ("verified", "likely")
+    maps_ok = maps.get("addr_status") in ("verified", "likely")
+
+    socials = {}
+    for k, v in (site.get("socials") or {}).items():
+        socials[k] = {"url": v, "verified": site_ok}
     for k, v in (web.get("socials") or {}).items():
-        socials.setdefault(k, v)
-    linkedin = web.get("linkedin_company") or socials.pop("linkedin", None)
+        if k not in socials or (v["verified"] and not socials[k]["verified"]):
+            socials[k] = v
+    li = web.get("linkedin_company")
+    if socials.get("linkedin") and "/company/" in socials["linkedin"]["url"]:
+        cand_li = socials["linkedin"]
+        if not li or (cand_li["verified"] and not li["verified"]):
+            li = cand_li
     socials.pop("linkedin", None)
 
     emails, phones = merge_contacts([
-        ("website", site.get("emails"), site.get("phones")),
-        ("google", web.get("emails"), web.get("phones")),
-        ("maps", [], [maps.get("phone")] if maps.get("phone") else []),
+        ("website", site_ok, site.get("emails"), site.get("phones")),
+        ("google", True, web.get("emails"), web.get("phones")),
+        ("maps", maps_ok, [], [maps.get("phone")] if maps.get("phone") else []),
     ])
 
     return {
@@ -916,17 +1006,21 @@ def discover_company(page, c, md):
         "company": name, "location": location,
         "company_number": number,
         "registered_address": profile.get("address", ""),
-        "discovered_website": web.get("website"),
-        "website_title": web.get("website_title", ""),
-        "discovered_linkedin": linkedin,
+        "registered_postcode": profile.get("postcode", ""),
+        "is_new": is_recent(profile),
+        "created": profile.get("created", ""),
+        "discovered_website": website,
+        "website_status": site_status,
+        "discovered_linkedin": li,
         "socials": socials,
         "emails": emails, "phones": phones,
         "mentions": web.get("mentions", []),
+        "rejected": rejected,
         "maps": maps or None,
         "officers": officer_results,
-        "discovery_source": "google_search" if web.get("website") else "not_found",
-        "confidence_score": web.get("confidence", 0),
-        "match_reason": web.get("match_reason", ""),
+        "discovery_source": "google_search" if website else "not_found",
+        "confidence_score": confidence,
+        "match_reason": reason,
         "queries_run": web.get("queries_run", 0),
         "search_timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -1092,29 +1186,40 @@ def _tick(v):
 
 def format_result(r, i=None):
     conf = r.get("confidence_score", 0)
-    hot = " 🔥" if conf >= 80 else ""
+    st = r.get("website_status", "unknown")
     head = f"{i}. " if i else ""
-    lines = [f"{head}{r['company']}{hot}"]
+    lines = [f"{head}{r['company']}"]
     if r.get("company_number"):
         lines[0] += f"  (#{r['company_number']})"
-    lines.append(f"   🔗 {r['discovered_website']}" if r.get("discovered_website")
-                 else "   🔗 no website found")
+    if r.get("registered_address"):
+        lines.append(f"   🏛️ Registered: {r['registered_address']}")
+    if r.get("discovered_website"):
+        tag = {"verified": "✅ address matches", "likely": "✅ same area"}.get(
+            st, "❓ address not confirmed")
+        lines.append(f"   🔗 {r['discovered_website']}  {tag}")
+        if st == "unknown" and r.get("is_new"):
+            lines.append("   ⚠️ Company is only weeks old — a website this easy to find may belong "
+                         "to another business with the same name. Check before contacting.")
+    else:
+        lines.append("   🔗 no matching website found")
+    for rj in r.get("rejected", [])[:3]:
+        lines.append(f"   🚫 ignored look-alike: {rj['url']} — {rj['why']}")
     for e in r.get("emails", [])[:3]:
-        lines.append(f"   📧 {e['value']}  ({e['source']})")
+        lines.append(f"   📧 {e['value']}  ({e['source']}) {_tick(e.get('verified'))}")
     for p in r.get("phones", [])[:3]:
-        lines.append(f"   📱 {p['value']}  ({p['source']})")
-    if r.get("discovered_linkedin"):
-        lines.append(f"   💼 {r['discovered_linkedin']}")
-    soc = [f"{k}: {v}" for k, v in (r.get("socials") or {}).items()]
-    if soc:
-        lines.append("   📣 " + " | ".join(soc[:4]))
+        lines.append(f"   📱 {p['value']}  ({p['source']}) {_tick(p.get('verified'))}")
+    li = r.get("discovered_linkedin")
+    if li:
+        lines.append(f"   💼 {li['url']} {_tick(li.get('verified'))}")
+    for net, d in (r.get("socials") or {}).items():
+        lines.append(f"   📣 {net}: {d['url']} {_tick(d.get('verified'))}")
     m = r.get("maps") or {}
     if m:
         bits = []
         if m.get("rating"):
             bits.append(f"⭐ {m['rating']}" + (f" ({m['reviews']})" if m.get("reviews") else ""))
         if m.get("address"):
-            bits.append(f"📍 {m['address']}")
+            bits.append(f"📍 {m['address']} {_tick(m.get('addr_status') in ('verified', 'likely'))}")
         if bits:
             lines.append("   🗺️ Maps: " + " · ".join(bits))
     for off in r.get("officers", []):
@@ -1136,7 +1241,7 @@ def format_result(r, i=None):
             or r.get("socials") or r.get("discovered_website")
             or any(o.get("links") for o in r.get("officers", []))):
         lines.append("   ⚠️ no public footprint yet (very new company) — "
-                     "check director names above / registered address")
+                     "check the director names above / registered address")
     return lines
 
 
@@ -1144,7 +1249,7 @@ def send_report(md, chat_id, job_id, results):
     blocks = []
     for i, r in enumerate(results, 1):
         blocks.append("\n".join(format_result(r, i)))
-    header = f"🕵️ Discovery report — {job_id}\n(✅ = person confirmed with the company, ❓ = same name, unconfirmed)\n"
+    header = f"🕵️ Discovery report — {job_id}\n(✅ = matches the company's registered address / confirmed, ❓ = same name only, unconfirmed)\n"
     msg, chunks = header, []
     for b in blocks:
         if len(msg) + len(b) + 2 > 3800:

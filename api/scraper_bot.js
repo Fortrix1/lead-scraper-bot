@@ -786,6 +786,293 @@ module.exports = async (req, res) => {
     if (chunk.trim()) await send(chatId, chunk)
   }
 
+
+  // ══════════════════════════════════════════════
+  //  MENU LAYER — button screens, "/" command list, guided flows
+  // ══════════════════════════════════════════════
+
+  // Set PUBLIC_ACCESS=true in Vercel to let other people use the SAFE features.
+  // Everything that spends the owner's Google account / GitHub minutes / shared
+  // lead database stays owner-only (see PUBLIC_CMDS).
+  const PUBLIC_ACCESS = process.env.PUBLIC_ACCESS === 'true'
+  const PUBLIC_CMDS = ['/start', '/menu', '/help', '/cancel', '/newuk']
+  const actorId = String(body.callback_query?.from?.id || body.message?.from?.id || '')
+  const isOwner = !ADMIN_ID || actorId === ADMIN_ID
+
+  const B = (text, data) => ({ text, callback_data: data })
+
+  function screenFor(name, owner) {
+    const go = (label, data) => owner ? B(label, data) : B('🔒 ' + label, 'locked')
+    const nav = (back) => [B('⬅️ Back', back || 'menu:main'), B('🏠 Main menu', 'menu:main')]
+
+    switch (name) {
+      case 'uk':
+        return {
+          text:
+            `<b>🇬🇧 New UK Companies</b>\n\n` +
+            `<b>What it does:</b> pulls brand-new companies from Companies House, the official UK register. Free and 100% real.\n\n` +
+            `<b>Why it's useful:</b> a company this new has no suppliers, website or marketing yet — the perfect moment to pitch it.\n\n` +
+            `<b>Pick how far back to look</b> (more days = bigger list):`,
+          kb: [
+            [B('📅 Today · 20', 'run:/newuk 1 20'), B('📅 3 days · 50', 'run:/newuk 3 50')],
+            [B('📅 7 days · 100', 'run:/newuk 7 100'), B('📅 30 days · 100', 'run:/newuk 30 100')],
+            [go('🕵️ Next step: find their contacts', 'menu:findco')],
+            nav()
+          ]
+        }
+      case 'findco':
+        return {
+          text:
+            `<b>🕵️ Find Contacts</b>\n\n` +
+            `Turns a list of company names into ways to reach them.\n\n` +
+            `<b>3 easy steps</b>\n` +
+            `1️⃣ Get a list from 🇬🇧 New UK Companies\n` +
+            `2️⃣ Tap ▶️ Start below\n` +
+            `3️⃣ Copy that whole list and paste it here\n\n` +
+            `<b>For each company I check:</b> its directors (the founders) → Google → its website → Google Maps → each director's LinkedIn, Instagram and Facebook.\n\n` +
+            `⏱ Roughly 15–25 companies per hour. Results arrive here as they're found; anything left continues automatically.\n\n` +
+            `💡 A company only a day old often has nothing online yet. When that happens, the directors' profiles are your best lead.`,
+          kb: [
+            [go('▶️ Start — I\'ll paste my list', 'run:/findco')],
+            [B('🇬🇧 Get a list first', 'menu:uk')],
+            nav()
+          ]
+        }
+      case 'local':
+        return {
+          text:
+            `<b>🗺️ Local Businesses</b>\n\n` +
+            `Finds real businesses in any city from Google Maps — restaurants, salons, gyms, car repair, real estate — with phone, website and email when available. You get a .txt report.\n\n` +
+            `Tap Start and I'll ask 3 quick questions:\n` +
+            `<b>city → type of business → how many</b>\n\n` +
+            `Good to know: every run is fresh — businesses you already have are skipped.`,
+          kb: [
+            [go('▶️ Start guided search', 'wiz:find')],
+            nav()
+          ]
+        }
+      case 'shopify':
+        return {
+          text:
+            `<b>🛍️ Shopify Stores</b>\n\n` +
+            `Find online stores built on Shopify, check they're live, and grab their contact email.\n\n` +
+            `🔍 <b>Search</b> — look for stores by niche (skincare, jewelry, pets…)\n` +
+            `🌱 <b>Watch</b> — get a message the moment a brand-new store appears\n` +
+            `📄 <b>Have your own list?</b> Just send me a .txt file of links and I'll check them all.`,
+          kb: [
+            [go('🔍 Search stores', 'run:/scout')],
+            [go('🌱 Watch for new stores', 'run:/fresh 30'), go('🛑 Stop watching', 'run:/freshoff')],
+            nav()
+          ]
+        }
+      case 'leads':
+        return {
+          text:
+            `<b>📂 My Leads</b>\n\n` +
+            `Every lead has a status so you never contact the same person twice:\n` +
+            `new → contacted → replied → interested → client\n` +
+            `(or not interested / do not contact)\n\n` +
+            `<b>To change one:</b> after any report, type /mark 3 contacted (3 = the number in the report).\n\n` +
+            `<b>See your leads by status:</b>`,
+          kb: [
+            [go('🆕 New', 'run:/leads new'), go('📨 Contacted', 'run:/leads contacted')],
+            [go('💬 Replied', 'run:/leads replied'), go('⭐ Interested', 'run:/leads interested')],
+            [go('🤝 Clients', 'run:/leads client'), go('🚷 Do not contact', 'run:/leads do_not_contact')],
+            [go('📋 My campaigns', 'run:/campaigns')],
+            nav()
+          ]
+        }
+      case 'tools':
+        return {
+          text:
+            `<b>🧰 Tools</b>\n\nHandy extras and an emergency reset.\n\n` +
+            `🧹 <b>Cancel / reset</b> — use this if the bot seems stuck waiting for something.`,
+          kb: [
+            [go('🚫 Blacklisted links', 'run:/others'), go('🧾 Activity log', 'run:/audit')],
+            [B('🧹 Cancel / reset', 'run:/cancel')],
+            [B('📜 All commands', 'menu:cmds')],
+            nav()
+          ]
+        }
+      case 'help':
+        return {
+          text:
+            `<b>❓ How this bot works</b>\n\n` +
+            `In one line: it finds new businesses, then finds a way to contact them.\n\n` +
+            `<b>The easiest path</b>\n` +
+            `1️⃣ 🇬🇧 New UK Companies — get a fresh list\n` +
+            `2️⃣ 🕵️ Find Contacts — paste the list; get websites, emails, phones, socials and the owners' LinkedIn\n` +
+            `3️⃣ Reach out, then track it in 📂 My Leads\n\n` +
+            `<b>Words used here</b>\n` +
+            `• <b>Lead</b> — a business you could sell to\n` +
+            `• <b>Director</b> — the person who started the company (the founder)\n\n` +
+            `Stuck? Tap 🧹 Cancel in Tools, or send /start.`,
+          kb: [
+            [B('🇬🇧 Start with UK companies', 'menu:uk')],
+            [B('📜 All commands', 'menu:cmds')],
+            nav()
+          ]
+        }
+      case 'cmds':
+        return {
+          text:
+            `<b>📜 All commands</b>\n(You can also just tap the buttons — no typing needed.)\n\n` +
+            `/start — main menu\n` +
+            `/newuk [days] [count] — new UK companies\n` +
+            `/findco — find contacts for a pasted company list\n` +
+            `/find &lt;city&gt; &lt;niche&gt; [count] — Google Maps businesses\n` +
+            `/scout — search Shopify stores\n` +
+            `/fresh [age_days] [count] — watch for new Shopify stores\n` +
+            `/freshoff — stop watching\n` +
+            `/campaigns — your campaigns\n` +
+            `/leads &lt;status&gt; — leads by status\n` +
+            `/mark &lt;number&gt; &lt;status&gt; — update a lead\n` +
+            `/others — blacklisted links\n` +
+            `/black &lt;url&gt; — add to the blacklist\n` +
+            `/scoutlist &lt;url&gt; — scan a domain list\n` +
+            `/audit — activity log\n` +
+            `/cancel — stop whatever I'm waiting for\n\n` +
+            `📄 Send a .txt file of links and I'll extract, dedupe and check them.\n` +
+            `When a scout finishes, send outreach messages separated by / and I'll pair them with emails.`,
+          kb: [nav('menu:tools')]
+        }
+      case 'main':
+      default:
+        return {
+          text:
+            `<b>👋 Lead Scraper Bot</b>\n\n` +
+            `Find businesses that need your services — and the contact details to reach them.\n\n` +
+            `<b>New here?</b> Tap 🇬🇧 New UK Companies, then 🕵️ Find Contacts. That's the whole flow.\n\n` +
+            (owner ? '' : `🔒 = owner-only for now.\n\n`) +
+            `<b>What do you want to do?</b>`,
+          kb: [
+            [B('🇬🇧 New UK Companies', 'menu:uk'), go('🕵️ Find Contacts', 'menu:findco')],
+            [go('🗺️ Local Businesses', 'menu:local'), go('🛍️ Shopify Stores', 'menu:shopify')],
+            [go('📂 My Leads', 'menu:leads'), B('🧰 Tools', 'menu:tools')],
+            [B('❓ How it works', 'menu:help')]
+          ]
+        }
+    }
+  }
+
+  async function tgCall(method, payload) {
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+      return await r.json()
+    } catch (e) { console.error(method, 'error:', e.message); return null }
+  }
+
+  // Replace the menu in place (like BasedBot). Falls back to a new message.
+  async function showScreen(chatId, messageId, name, owner) {
+    const s = screenFor(name, owner)
+    const base = { chat_id: chatId, text: s.text, parse_mode: 'HTML', reply_markup: { inline_keyboard: s.kb }, disable_web_page_preview: true }
+    if (messageId) {
+      const d = await tgCall('editMessageText', { ...base, message_id: messageId })
+      if (d && (d.ok || /not modified/i.test(d.description || ''))) return
+    }
+    await tgCall('sendMessage', base)
+  }
+
+  async function answerCb(id, text, alert) {
+    await tgCall('answerCallbackQuery', { callback_query_id: id, ...(text ? { text, show_alert: !!alert } : {}) })
+  }
+
+  // Makes the "/" list in Telegram show /start (and the rest) + the Menu button.
+  async function registerCommands(ownerChatId) {
+    const pub = [
+      ['start', '🏠 Open the main menu'], ['menu', '🏠 Main menu'], ['newuk', '🇬🇧 New UK companies'],
+      ['help', '❓ How this bot works'], ['cancel', '🧹 Stop what I\'m waiting for']
+    ]
+    const all = [
+      ['start', '🏠 Open the main menu'], ['menu', '🏠 Main menu'], ['help', '❓ How this bot works'],
+      ['newuk', '🇬🇧 New UK companies'], ['findco', '🕵️ Find contacts for companies'],
+      ['find', '🗺️ Local businesses (Google Maps)'], ['scout', '🛍️ Search Shopify stores'],
+      ['fresh', '🌱 Watch for brand-new stores'], ['freshoff', '🛑 Stop watching new stores'],
+      ['campaigns', '📋 Your campaigns'], ['leads', '📂 Leads by status'], ['mark', '✅ Update a lead\'s status'],
+      ['others', '🚫 Blacklisted links'], ['black', '🔒 Add to blacklist'], ['scoutlist', '🕵️ Scan a domain list'],
+      ['audit', '🧾 Activity log'], ['cancel', '🧹 Stop what I\'m waiting for']
+    ].map(([command, description]) => ({ command, description }))
+    await tgCall('setMyCommands', { commands: pub.map(([command, description]) => ({ command, description })) })
+    await tgCall('setMyCommands', { commands: all, scope: { type: 'chat', chat_id: ownerChatId } })
+    await tgCall('setChatMenuButton', { menu_button: { type: 'commands' } })
+  }
+
+  // ── Menu / guided-flow button presses (menu:, run:, wiz:, locked) ──
+  if (body.callback_query && /^(menu:|run:|wiz:|locked)/.test(body.callback_query.data || '')) {
+    const cq = body.callback_query
+    const d = cq.data
+    const cbChat = cq.message.chat.id
+    const cbMsg = cq.message.message_id
+
+    if (!isOwner && !PUBLIC_ACCESS) {
+      await answerCb(cq.id, 'Private bot.', true)
+      return res.status(200).send('OK')
+    }
+    if (d === 'locked') {
+      await answerCb(cq.id, '🔒 Owner-only for now — this feature uses private accounts and limits.', true)
+      return res.status(200).send('OK')
+    }
+
+    if (d.startsWith('menu:')) {
+      await answerCb(cq.id)
+      const wq = await getUserQueue(actorId)
+      if (wq.wizard) { wq.wizard = null; await saveUserQueue(actorId, wq) }
+      await showScreen(cbChat, cbMsg, d.slice(5), isOwner)
+      return res.status(200).send('OK')
+    }
+
+    if (d.startsWith('wiz:')) {
+      if (!isOwner) { await answerCb(cq.id, '🔒 Owner-only for now.', true); return res.status(200).send('OK') }
+      await answerCb(cq.id)
+      const wq = await getUserQueue(actorId)
+      const parts = d.split(':')
+      if (parts[1] === 'find' && !parts[2]) {
+        wq.wizard = { cmd: 'find', step: 'city' }
+        await saveUserQueue(actorId, wq)
+        await tgCall('sendMessage', { chat_id: cbChat, parse_mode: 'HTML',
+          text: `<b>🗺️ Step 1 of 3 — Where?</b>\n\nType the city or area.\nExamples: <i>Austin</i> · <i>Lagos Nigeria</i> · <i>banana island lagos</i>\n\n(Changed your mind? /cancel)` })
+        return res.status(200).send('OK')
+      }
+      if (parts[1] === 'niche' && wq.wizard) {
+        if (parts[2] === 'other') {
+          wq.wizard.step = 'niche_text'
+          await saveUserQueue(actorId, wq)
+          await tgCall('sendMessage', { chat_id: cbChat, text: 'Type the business type as ONE word (e.g. dentist, barber, plumber).' })
+          return res.status(200).send('OK')
+        }
+        wq.wizard.niche = parts[2]; wq.wizard.step = 'count'
+        await saveUserQueue(actorId, wq)
+        await tgCall('sendMessage', { chat_id: cbChat, parse_mode: 'HTML',
+          text: `<b>🗺️ Step 3 of 3 — How many?</b>\n\n${wq.wizard.niche.replace(/_/g, ' ')} in ${wq.wizard.city}`,
+          reply_markup: { inline_keyboard: [[B('10', 'wiz:count:10'), B('20', 'wiz:count:20'), B('50', 'wiz:count:50')]] } })
+        return res.status(200).send('OK')
+      }
+      if (parts[1] === 'count' && wq.wizard && wq.wizard.city && wq.wizard.niche) {
+        const cmd = `/find ${wq.wizard.city} ${wq.wizard.niche} ${parseInt(parts[2]) || 20}`
+        wq.wizard = null
+        await saveUserQueue(actorId, wq)
+        body = { message: { chat: cq.message.chat, from: cq.from, text: cmd } }   // fall through as if typed
+      } else {
+        await tgCall('sendMessage', { chat_id: cbChat, text: 'That guided search expired — open 🗺️ Local Businesses to start again.' })
+        return res.status(200).send('OK')
+      }
+    }
+
+    if (d.startsWith('run:')) {
+      const cmd = d.slice(4)
+      const base = cmd.split(' ')[0].toLowerCase()
+      if (!isOwner && !PUBLIC_CMDS.includes(base)) {
+        await answerCb(cq.id, '🔒 Owner-only for now.', true)
+        return res.status(200).send('OK')
+      }
+      await answerCb(cq.id)
+      body = { message: { chat: cq.message.chat, from: cq.from, text: cmd } }   // fall through as if typed
+    }
+  }
+
   // ══════════════════════════════════════════════
   //  CALLBACK BUTTONS
   // ══════════════════════════════════════════════
@@ -869,33 +1156,73 @@ module.exports = async (req, res) => {
   await redis('RPUSH', 'audit:commands', JSON.stringify({ ts: new Date().toISOString(), user: userId, text: text.slice(0, 100) }))
   await redis('LTRIM', 'audit:commands', 0, 499)
 
-  // Admin lock — strangers get nothing.
-  if (ADMIN_ID && userId !== ADMIN_ID) {
-    await send(chatId, 'Private bot.')
-    return res.status(200).send('OK')
+  // Access gate — owner gets everything; strangers get nothing unless PUBLIC_ACCESS=true,
+  // and then only the safe commands in PUBLIC_CMDS.
+  if (!isOwner) {
+    if (!PUBLIC_ACCESS) {
+      await send(chatId, 'Private bot.')
+      return res.status(200).send('OK')
+    }
+    const baseCmd = text.split(/[\s@]/)[0].toLowerCase()
+    if (!text.startsWith('/')) {
+      await send(chatId, 'Tap /start to open the menu 👇')
+      return res.status(200).send('OK')
+    }
+    if (!PUBLIC_CMDS.includes(baseCmd)) {
+      await tgCall('sendMessage', { chat_id: chatId, text: '🔒 That feature is owner-only for now. Tap below to see what you can use.',
+        reply_markup: { inline_keyboard: [[B('🏠 Main menu', 'menu:main')]] } })
+      return res.status(200).send('OK')
+    }
   }
 
-  // ── /start ──
-  if (text.startsWith('/start')) {
-    await send(chatId,
-      `👋 Lead Scraper Bot\n\n` +
-      `Commands:\n` +
-      `🔍 /scout — search URLScan.io for Shopify leads\n` +
-      `🗺️ /find <city> <niche> [count] — scrape Google Maps (runs on your PC, sends a .txt report)\n` +
-      `🌱 /fresh [age_days] [count] — turn ON new-Shopify-store monitoring via crt.sh (automatic ticks)\n` +
-      `🕵️ /findco — company contact discovery: send it, then paste a list (or raw /newuk output) — finds websites, emails, phones, socials and the directors' LinkedIn\n` +
-      `🛑 /freshoff — stop fresh-store monitoring\n` +
-      `📋 /campaigns — see all your campaigns (e.g. "Med Spa — Miami") and lead counts\n` +
-      `🇬🇧 /newuk [days] [count] — newly incorporated UK companies (Companies House, official & free)\n` +
-      `📂 /leads <status> — list leads by status: ${LEAD_STATUSES.join(', ')}\n` +
-      `✅ /mark <number> <status> — mark lead #N from your last report (e.g. /mark 3 contacted)\n` +
-      `🚫 /others — blacklisted links from last search\n` +
-      `🔒 /black <url> — grow blacklist from domain list\n` +
-      `🕵️ /scoutlist <url> — scan any domain list as leads\n\n` +
-      `📄 Send a .txt file — I extract, dedupe, and check links\n\n` +
-      `Already-checked links are never re-checked.\n` +
-      `When done, send outreach messages separated by / and I'll pair them with emails.`
-    )
+  // ── Guided flow answers (typed city / niche) ──
+  if (text) {
+    const wq = await getUserQueue(userId)
+    if (wq.wizard) {
+      if (text.startsWith('/')) {
+        wq.wizard = null
+        await saveUserQueue(userId, wq)
+      } else {
+        const nicheButtons = [
+          [B('🍽️ Restaurant', 'wiz:niche:restaurant'), B('💇 Salon', 'wiz:niche:salon')],
+          [B('🏋️ Gym', 'wiz:niche:gym'), B('🔧 Auto repair', 'wiz:niche:auto_repair')],
+          [B('🏠 Real estate', 'wiz:niche:real_estate'), B('🚚 Food truck', 'wiz:niche:food_truck')],
+          [B('✏️ Something else', 'wiz:niche:other')]
+        ]
+        if (wq.wizard.step === 'city') {
+          wq.wizard.city = text.slice(0, 60).replace(/[\n\r]+/g, ' ').trim()
+          wq.wizard.step = 'niche'
+          await saveUserQueue(userId, wq)
+          await tgCall('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `<b>🗺️ Step 2 of 3 — What kind of business?</b>\n\nIn <i>${wq.wizard.city.replace(/[<>&]/g, '')}</i>. Pick one:`,
+            reply_markup: { inline_keyboard: nicheButtons } })
+        } else if (wq.wizard.step === 'niche_text') {
+          wq.wizard.niche = text.trim().split(/\s+/)[0].toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 30)
+          if (!wq.wizard.niche) {
+            await send(chatId, 'Please type one plain word, like: dentist')
+          } else {
+            wq.wizard.step = 'count'
+            await saveUserQueue(userId, wq)
+            await tgCall('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+              text: `<b>🗺️ Step 3 of 3 — How many?</b>\n\n${wq.wizard.niche} in ${wq.wizard.city.replace(/[<>&]/g, '')}`,
+              reply_markup: { inline_keyboard: [[B('10', 'wiz:count:10'), B('20', 'wiz:count:20'), B('50', 'wiz:count:50')]] } })
+          }
+        } else {
+          await send(chatId, 'Please tap one of the buttons above — or /cancel to stop.')
+        }
+        return res.status(200).send('OK')
+      }
+    }
+  }
+
+  // ── /start, /menu, /help ──
+  if (/^\/(start|menu)(@\w+)?(\s|$)/.test(text)) {
+    if (isOwner) await registerCommands(chatId)     // makes "/" show the command list + Menu button
+    await showScreen(chatId, null, 'main', isOwner)
+    return res.status(200).send('OK')
+  }
+  if (/^\/help(@\w+)?$/.test(text)) {
+    await showScreen(chatId, null, 'help', isOwner)
     return res.status(200).send('OK')
   }
 
@@ -1065,11 +1392,12 @@ module.exports = async (req, res) => {
     }
 
     // Dedup against previously-sent companies, same "seen" hash the /scout flow uses
-    const dedupeKeys = items.map(it => `ukco:${it.company_number}`)
+    const ukScope = isOwner ? '' : `${userId}:`   // public users get their own 'already seen' list
+    const dedupeKeys = items.map(it => `ukco:${ukScope}${it.company_number}`)
     const seenMap = await getSeenBatch(dedupeKeys)
     const fresh = items.filter((it, i) => !seenMap[dedupeKeys[i]])
     if (fresh.length) {
-      await markSeenBatch(fresh.map(it => [`ukco:${it.company_number}`, { sentAt: new Date().toISOString() }]))
+      await markSeenBatch(fresh.map(it => [`ukco:${ukScope}${it.company_number}`, { sentAt: new Date().toISOString() }]))
     }
 
     if (!fresh.length) {
@@ -1088,6 +1416,8 @@ module.exports = async (req, res) => {
         `\n    🔗 https://find-and-update.company-information.service.gov.uk/company/${it.company_number}`
     })
     await send(chatId, reply)
+    await tgCall('sendMessage', { chat_id: chatId, text: 'Next step 👇  Copy the list above, then tap Find Contacts and paste it.',
+      reply_markup: { inline_keyboard: [[isOwner ? B('🕵️ Find Contacts', 'menu:findco') : B('🔒 Find Contacts', 'locked')], [B('🏠 Main menu', 'menu:main')]] } })
     return res.status(200).send('OK')
   }
 
