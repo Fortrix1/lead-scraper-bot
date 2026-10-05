@@ -65,6 +65,9 @@ CACHE_VERSION = 4          # bump to invalidate old (thinner) cached results
 # A full company costs roughly 6-10 navigations, so 150/h ~ 15-25 companies/h.
 MAX_NAVS_PER_HOUR = int(os.environ.get("DISCOVERY_NAVS_PER_HOUR", "150"))
 REDIS_RL_KEY = "disc:rl:hour"
+# Budgets are per session owner: a BYOC user's searches can never eat the
+# owner's shared-session budget (and vice versa). Set per job in process_job.
+_SCOPE = "owner"
 REDIS_PROGRESS_PREFIX = "disc:progress:"
 
 CACHE_TTL_DAYS = 30
@@ -228,12 +231,29 @@ def load_google_cookies(path=COOKIES_PATH):
 # ------------------------------------------------------------------
 
 def nav_allowed(md):
-    used = md.redis("INCR", REDIS_RL_KEY)
+    key = f"{REDIS_RL_KEY}:{_SCOPE}"
+    used = md.redis("INCR", key)
     if used in (None, 0):
         return True, 0, MAX_NAVS_PER_HOUR
     if used == 1:
-        md.redis("EXPIRE", REDIS_RL_KEY, "3600")
+        md.redis("EXPIRE", key, "3600")
     return used <= MAX_NAVS_PER_HOUR, used, MAX_NAVS_PER_HOUR
+
+
+def load_user_cookies(md, uid):
+    """A non-owner's BYOC cookies (stored by the bot when they uploaded
+    their Cookie-Editor export). Returns None if missing or fully expired —
+    the caller must NOT fall back to the owner's shared session."""
+    raw = md.redis_get(f"cookies:{uid}:google")
+    if not raw:
+        return None
+    tmp = os.path.join(os.path.dirname(COOKIES_PATH), f"google_{uid}.json")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(raw)
+        return load_google_cookies(tmp)   # None if every cookie is expired
+    except Exception:
+        return None
 
 
 def human_pause(a=MIN_DELAY, b=MAX_DELAY):
@@ -1063,15 +1083,30 @@ def process_job(data):
             "each director on Google/LinkedIn/socials. Results land here...")
         progress["started"] = True
 
-    cookies = load_google_cookies()
-    if not cookies:
-        md.send_telegram(
-            chat_id,
-            f"⚠️ No usable google.com cookies at {COOKIES_PATH}.\n\n"
-            "Export them with the Cookie-Editor extension while logged in to "
-            "google.com, save as cookies/google_cookies.json next to "
-            "maps_daemon.py (or the GOOGLE_COOKIES_JSON secret), then re-send /findco.")
-        return
+    # Session selection: a non-owner job uses the CALLER's own cookies and
+    # their own hourly budget — the owner's shared session is never touched.
+    global _SCOPE
+    uid = str(data.get("user_id") or "")
+    _SCOPE = uid or "owner"
+    if uid:
+        cookies = load_user_cookies(md, uid)
+        if not cookies:
+            md.send_telegram(
+                chat_id,
+                "⚠️ Your saved Google cookies are missing or expired — export "
+                "fresh ones with the Cookie-Editor extension and send the "
+                "cookies.json file to the bot again, then re-run /findco.")
+            return
+    else:
+        cookies = load_google_cookies()
+        if not cookies:
+            md.send_telegram(
+                chat_id,
+                f"⚠️ No usable google.com cookies at {COOKIES_PATH}.\n\n"
+                "Export them with the Cookie-Editor extension while logged in to "
+                "google.com, save as cookies/google_cookies.json next to "
+                "maps_daemon.py (or the GOOGLE_COOKIES_JSON secret), then re-send /findco.")
+            return
 
     if progress.get("blocked"):
         md.send_telegram(

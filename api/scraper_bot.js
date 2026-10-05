@@ -165,6 +165,107 @@ module.exports = async (req, res) => {
     await redis('DEL', `lock:${userId}`)
   }
 
+  // ══════════════════════════════════════════════
+  //  ACCESS TIERS — owner / paid pass / bring-your-own-cookies
+  //  Session-heavy commands (/findco, /find, /scout, /fresh...) run on a
+  //  logged-in Google session. A stranger can use them two ways:
+  //    paid  — a pass bought from the owner (shared session, shared budget)
+  //    byoc  — they uploaded their own google.com cookies (their session,
+  //            their own rate budget — the owner's is never touched)
+  // ══════════════════════════════════════════════
+  const PASS_DAYS = parseInt(process.env.ACCESS_PASS_DAYS || '30')
+  const ACCESS_PRICE = process.env.ACCESS_PRICE_TEXT || '$1'
+  const PAYMENT_LINK = process.env.PAYMENT_LINK || ''
+  const OWNER_SESSION_CMDS = ['/find', '/findco', '/scout', '/fresh', '/freshoff', '/scoutlist', '/autopitch']
+
+  async function passInfo(userId) {
+    const { result } = await redis('GET', `pass:${userId}`)
+    if (!result) return { valid: false, expires: 0 }
+    const exp = parseInt(result) || 0
+    return { valid: exp > Date.now(), expires: exp }
+  }
+
+  async function cookieInfo(userId) {
+    const { result } = await redis('GET', `cookies:${userId}:meta`)
+    if (!result) return { present: false, fresh: false, expires: 0 }
+    try {
+      const m = JSON.parse(result)
+      const exp = parseInt(m.expires) || 0
+      return { present: true, fresh: exp > Date.now() / 1000 + 86400, expires: exp }
+    } catch { return { present: false, fresh: false, expires: 0 } }
+  }
+
+  async function tierOf(userId) {
+    if (isOwner) return 'owner'
+    if ((await passInfo(userId)).valid) return 'paid'
+    if ((await cookieInfo(userId)).fresh) return 'byoc'
+    return 'none'
+  }
+
+  async function grantPass(userId, days = PASS_DAYS) {
+    await redis('SET', `pass:${userId}`, String(Date.now() + days * 86400000))
+  }
+
+  // Is this uploaded file a cookie export (Cookie-Editor or Playwright)?
+  function sniffCookies(text) {
+    try {
+      const arr = JSON.parse(text)
+      if (!Array.isArray(arr) || !arr.length) return null
+      if (!arr.every(c => c && typeof c === 'object' && 'name' in c && 'value' in c && 'domain' in c)) return null
+      const domains = arr.map(c => String(c.domain || '').toLowerCase())
+      if (domains.some(d => d.includes('google.'))) return { kind: 'google' }
+      return null
+    } catch { return null }
+  }
+
+  function cookieExpiry(arr) {
+    let exp = 0
+    for (const c of arr) {
+      const e = parseFloat(c.expirationDate || c.expires || 0)
+      if (e > exp) exp = e
+    }
+    return exp
+  }
+
+  async function sendAccessScreen(chatId, userId) {
+    const pass = await passInfo(userId)
+    const ck = await cookieInfo(userId)
+    let status = 'No access yet.'
+    if (pass.valid) status = `Paid pass active until ${new Date(pass.expires).toISOString().slice(0, 10)}.`
+    else if (ck.present) status = ck.fresh
+      ? `Your own cookies are on file (freshest expires ${new Date(ck.expires * 1000).toISOString().slice(0, 10)}).`
+      : 'Your saved cookies have expired — re-send the file to refresh.'
+    const kb = []
+    if (PAYMENT_LINK) kb.push([B(`💳 Get a ${PASS_DAYS}-day pass (${ACCESS_PRICE})`, 'pay:request')])
+    kb.push([B('🍪 Use my own Google cookies (free)', 'pay:byoc')])
+    kb.push([B('🏠 Main menu', 'menu:main')])
+    await tgCall('sendMessage', {
+      chat_id: chatId, parse_mode: 'HTML',
+      text:
+        `<b>🔒 This feature runs on a logged-in Google session</b>
+
+` +
+        `Two ways in:
+` +
+        `1️⃣ Pay ${ACCESS_PRICE} → a ${PASS_DAYS}-day pass on the shared session
+` +
+        `2️⃣ Upload your own google.com cookies (free, your own limits) — export with the ` +
+        `Cookie-Editor extension while logged into google.com, then send the .json file here
+
+` +
+        `<b>Your status:</b> ${status}`,
+      reply_markup: { inline_keyboard: kb }
+    })
+  }
+
+  async function gateOwnerSession(chatId, userId) {
+    if (isOwner) return true
+    const tier = await tierOf(userId)
+    if (tier === 'paid' || tier === 'byoc') return true
+    await sendAccessScreen(chatId, userId)
+    return false
+  }
+
   // ── URL fixing / dedupe / filtering ──
   const LINK_PATTERN = /https?:\/\/[^\s,"'<>]+|[a-zA-Z0-9\-]+\.myshopify\.com[^\s,"'<>]*/g
 
@@ -406,10 +507,11 @@ module.exports = async (req, res) => {
     return companies
   }
 
-  async function postDiscoveryJob(chatId, companies) {
+  async function postDiscoveryJob(chatId, userId, companies) {
     const jobId = `co-${Date.now()}`
     await redis('RPUSH', 'jobs:find', JSON.stringify({
-      type: 'discovery', chat_id: chatId, job_id: jobId, companies, max: 40
+      type: 'discovery', chat_id: chatId, job_id: jobId, companies, max: 40,
+      user_id: userId          // empty for owner; daemon loads THEIR cookies if set
     }))
     const dispatched = await triggerGithubWorkflow()
     await send(chatId,
@@ -802,7 +904,7 @@ module.exports = async (req, res) => {
   const B = (text, data) => ({ text, callback_data: data })
 
   function screenFor(name, owner) {
-    const go = (label, data) => owner ? B(label, data) : B('🔒 ' + label, 'locked')
+    const go = (label, data) => (owner || PUBLIC_ACCESS) ? B(label, data) : B('🔒 ' + label, 'locked')
     const nav = (back) => [B('⬅️ Back', back || 'menu:main'), B('🏠 Main menu', 'menu:main')]
 
     switch (name) {
@@ -993,7 +1095,8 @@ module.exports = async (req, res) => {
       ['fresh', '🌱 Watch for brand-new stores'], ['freshoff', '🛑 Stop watching new stores'],
       ['campaigns', '📋 Your campaigns'], ['leads', '📂 Leads by status'], ['mark', '✅ Update a lead\'s status'],
       ['others', '🚫 Blacklisted links'], ['black', '🔒 Add to blacklist'], ['scoutlist', '🕵️ Scan a domain list'],
-      ['audit', '🧾 Activity log'], ['cancel', '🧹 Stop what I\'m waiting for']
+      ['audit', '🧾 Activity log'], ['cancel', '🧹 Stop what I\'m waiting for'],
+      ['access', '🔑 My access status'], ['grant', '✅ Give a user access (owner)']
     ].map(([command, description]) => ({ command, description }))
     await tgCall('setMyCommands', { commands: pub.map(([command, description]) => ({ command, description })) })
     await tgCall('setMyCommands', { commands: all, scope: { type: 'chat', chat_id: ownerChatId } })
@@ -1001,7 +1104,7 @@ module.exports = async (req, res) => {
   }
 
   // ── Menu / guided-flow button presses (menu:, run:, wiz:, locked) ──
-  if (body.callback_query && /^(menu:|run:|wiz:|locked)/.test(body.callback_query.data || '')) {
+  if (body.callback_query && /^(menu:|run:|wiz:|locked|pay)/.test(body.callback_query.data || '')) {
     const cq = body.callback_query
     const d = cq.data
     const cbChat = cq.message.chat.id
@@ -1061,10 +1164,73 @@ module.exports = async (req, res) => {
       }
     }
 
+    if (d === 'pay:request') {
+      await answerCb(cq.id)
+      const who = [cq.from?.first_name, cq.from?.last_name].filter(Boolean).join(' ') || ''
+      await redis('SET', `payreq:${actorId}`, String(Date.now()))
+      if (ADMIN_ID) {
+        await tgCall('sendMessage', {
+          chat_id: ADMIN_ID, parse_mode: 'HTML',
+          text:
+            `💳 <b>Access request</b>
+User ID: <code>${actorId}</code>${who ? '\nName: ' + who : ''}
+` +
+            `Price: ${ACCESS_PRICE}${PAYMENT_LINK ? ' → ' + PAYMENT_LINK : ' (set PAYMENT_LINK in Vercel to auto-link)'}
+
+` +
+            `Approve grants ${PASS_DAYS} days on YOUR shared session.`,
+          reply_markup: { inline_keyboard: [[B(`✅ Grant ${PASS_DAYS} days`, `payok:${actorId}`), B('❌ Deny', `payno:${actorId}`)]] }
+        })
+      }
+      await tgCall('sendMessage', {
+        chat_id: cbChat, parse_mode: 'HTML',
+        text: `💳 <b>Access pass — ${ACCESS_PRICE} for ${PASS_DAYS} days</b>\n\n` +
+          (PAYMENT_LINK
+            ? `Pay here — your access switches on as soon as it's confirmed:`
+            : `Payment details will follow from the bot owner.`),
+        reply_markup: PAYMENT_LINK ? { inline_keyboard: [[{ text: `💳 Pay ${ACCESS_PRICE}`, url: PAYMENT_LINK }]] } : undefined
+      })
+      return res.status(200).send('OK')
+    }
+
+    if (d === 'pay:byoc') {
+      await answerCb(cq.id)
+      await tgCall('sendMessage', {
+        chat_id: cbChat, parse_mode: 'HTML',
+        text:
+          `<b>🍪 Bring your own session (free)</b>\n\n` +
+          `1. In Chrome, log into <b>your</b> Google account and open google.com\n` +
+          `2. Install the <b>Cookie-Editor</b> extension\n` +
+          `3. Click Export — it copies the cookies JSON to your clipboard\n` +
+          `4. Paste into a file named <code>cookies.json</code> and send it here as a document\n\n` +
+          `From then on, /findco and /find run with YOUR cookies and YOUR limits — ` +
+          `the shared session is never touched. Re-send the file anytime to refresh ` +
+          `(Google kills sessions every few weeks).`
+      })
+      return res.status(200).send('OK')
+    }
+
+    if (d.startsWith('payok:') || d.startsWith('payno:')) {
+      if (!isOwner) { await answerCb(cq.id, 'Owner only.', true); return res.status(200).send('OK') }
+      const target = d.split(':')[1]
+      if (d.startsWith('payok:')) {
+        await grantPass(target)
+        await tgCall('sendMessage', {
+          chat_id: target,
+          text: `✅ Your ${PASS_DAYS}-day access pass is active! /findco, /find, /scout and /fresh now work for you until ${new Date(Date.now() + PASS_DAYS * 86400000).toISOString().slice(0, 10)}. Send /access anytime to check your status.`
+        })
+        await answerCb(cq.id, `Granted ${target} ${PASS_DAYS} days.`)
+      } else {
+        await tgCall('sendMessage', { chat_id: target, text: 'Your access request was declined. If you already paid, message the bot owner with your proof.' })
+        await answerCb(cq.id, 'Denied.')
+      }
+      return res.status(200).send('OK')
+    }
+
     if (d.startsWith('run:')) {
       const cmd = d.slice(4)
       const base = cmd.split(' ')[0].toLowerCase()
-      if (!isOwner && !PUBLIC_CMDS.includes(base)) {
+      if (!isOwner && !PUBLIC_CMDS.includes(base) && !OWNER_SESSION_CMDS.includes(base)) {
         await answerCb(cq.id, '🔒 Owner-only for now.', true)
         return res.status(200).send('OK')
       }
@@ -1168,7 +1334,10 @@ module.exports = async (req, res) => {
       await send(chatId, 'Tap /start to open the menu 👇')
       return res.status(200).send('OK')
     }
-    if (!PUBLIC_CMDS.includes(baseCmd)) {
+    if (OWNER_SESSION_CMDS.includes(baseCmd)) {
+      // paid pass or own-cookies users get in; everyone else sees the access screen
+      if (!(await gateOwnerSession(chatId, userId))) return res.status(200).send('OK')
+    } else if (!PUBLIC_CMDS.includes(baseCmd)) {
       await tgCall('sendMessage', { chat_id: chatId, text: '🔒 That feature is owner-only for now. Tap below to see what you can use.',
         reply_markup: { inline_keyboard: [[B('🏠 Main menu', 'menu:main')]] } })
       return res.status(200).send('OK')
@@ -1327,7 +1496,7 @@ module.exports = async (req, res) => {
         if (!r.ok) { await send(chatId, `Fetch failed (HTTP ${r.status}).`); return res.status(200).send('OK') }
         const companies = parseCompanyLines(await r.text())
         if (!companies.length) { await send(chatId, `No parseable companies found.`); return res.status(200).send('OK') }
-        return await postDiscoveryJob(chatId, companies)
+        return await postDiscoveryJob(chatId, userId, companies)
       } catch (e) { await send(chatId, `Couldn't fetch that URL.`); return res.status(200).send('OK') }
     }
     // Same-message paste: "/findco <blob>" — parse the rest of THIS message
@@ -1338,7 +1507,7 @@ module.exports = async (req, res) => {
         await send(chatId, `Couldn't parse any companies from that. Send /findco alone, then paste the list as your next message.`)
         return res.status(200).send('OK')
       }
-      return await postDiscoveryJob(chatId, companies)
+      return await postDiscoveryJob(chatId, userId, companies)
     }
     // No URL, no paste — arm the paste-catcher and wait for their list
     const q = await getUserQueue(userId)
@@ -1418,6 +1587,28 @@ module.exports = async (req, res) => {
     await send(chatId, reply)
     await tgCall('sendMessage', { chat_id: chatId, text: 'Next step 👇  Copy the list above, then tap Find Contacts and paste it.',
       reply_markup: { inline_keyboard: [[isOwner ? B('🕵️ Find Contacts', 'menu:findco') : B('🔒 Find Contacts', 'locked')], [B('🏠 Main menu', 'menu:main')]] } })
+    return res.status(200).send('OK')
+  }
+
+  // ── /access — anyone: check own access status / buy / upload cookies ──
+  if (/^\/access(@\w+)?$/.test(text)) {
+    await sendAccessScreen(chatId, userId)
+    return res.status(200).send('OK')
+  }
+
+  // ── /grant <userId> [days] — owner only: activate a paid pass ──
+  if (text.startsWith('/grant')) {
+    if (!isOwner) { await send(chatId, 'Owner only.'); return res.status(200).send('OK') }
+    const parts = text.split(' ').slice(1)
+    const target = parts[0] || ''
+    const days = Math.min(Math.max(parseInt(parts[1]) || PASS_DAYS, 1), 365)
+    if (!/^\d+$/.test(target)) {
+      await send(chatId, `Usage: /grant <telegram user id> [days]\ne.g. /grant 123456789 30`)
+      return res.status(200).send('OK')
+    }
+    await grantPass(target, days)
+    await tgCall('sendMessage', { chat_id: target, text: `✅ Access granted: ${days} days. Send /access anytime to check your status.` })
+    await send(chatId, `✓ ${target} now has ${days} days of access.`)
     return res.status(200).send('OK')
   }
 
@@ -1602,7 +1793,7 @@ module.exports = async (req, res) => {
         await send(chatId, `Couldn't parse any companies from that. One per line, e.g.:\n  Acme Ltd, London\n  WidgetCo, Manchester\nSend /findco to try again.`)
         return res.status(200).send('OK')
       }
-      return await postDiscoveryJob(chatId, companies)
+      return await postDiscoveryJob(chatId, userId, companies)
     }
 
     // ── Awaiting review cap for /find ──
@@ -1633,7 +1824,8 @@ module.exports = async (req, res) => {
         chat_id: chatId, city: job.city, niche: job.niche,
         count: job.count, review_cap: reviewCap,
         sample_mode: !!job.sampleMode,
-        include_seen: !!job.includeSeen
+        include_seen: !!job.includeSeen,
+        user_id: userId          // empty for owner; daemon loads THEIR cookies if set
       })
       await redis('RPUSH', 'jobs:find', jobPayload)
       const dispatched = await triggerGithubWorkflow()
@@ -1676,14 +1868,29 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
 
-    // ── File upload (.txt only) ──
+    // ── File upload: .txt of links, OR a cookie export (.json/.txt) ──
     if (doc) {
-      if (doc.file_name && !doc.file_name.endsWith('.txt')) {
-        await send(chatId, 'Only .txt files are supported.')
+      const fname = doc.file_name || ''
+      if (fname && !fname.endsWith('.txt') && !/\.json$/i.test(fname)) {
+        await send(chatId, 'Only .txt and .json files are supported.')
         return res.status(200).send('OK')
       }
       await send(chatId, '📄 Reading file...')
       const content = await getFileContent(doc.file_id)
+      // Cookie export? Store it as THIS user's session instead of scanning links.
+      const sniffed = sniffCookies(content)
+      if (sniffed) {
+        const arr = JSON.parse(content)
+        const exp = cookieExpiry(arr)
+        await redis('SET', `cookies:${userId}:google`, content)
+        await redis('SET', `cookies:${userId}:meta`, JSON.stringify({
+          saved_at: Math.floor(Date.now() / 1000), expires: exp, count: arr.length }))
+        await send(chatId,
+          `🍪 Cookies saved — /findco and /find will now run with YOUR OWN Google session.\n` +
+          `${arr.length} cookies, freshest expires ${exp ? new Date(exp * 1000).toISOString().slice(0, 10) : 'unknown'}.\n\n` +
+          `Re-send this file anytime to refresh (Google kills sessions every few weeks). Send /access to check status.`)
+        return res.status(200).send('OK')
+      }
       const extraBlacklistSet = await getExtraBlacklistSet()
       const rawLinks = extractAndCleanLinks(content, extraBlacklistSet)
       return await startBatchJob(chatId, userId, rawLinks, `file (${rawLinks.length} links)`, null, null, true)
@@ -1713,7 +1920,7 @@ module.exports = async (req, res) => {
       if (companies.length) {
         userQueue.awaitingMessages = false
         await saveUserQueue(userId, userQueue)
-        return await postDiscoveryJob(chatId, companies)
+        return await postDiscoveryJob(chatId, userId, companies)
       }
     }
 

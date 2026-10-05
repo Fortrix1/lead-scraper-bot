@@ -270,6 +270,51 @@ Without this key set, `/newuk` will tell you it's not configured yet rather than
 
 **Coverage note:** this is UK-only. A US equivalent is possible but more limited — only 5 states (NY, CO, CT, PA, OR) publish free, commercial-use-OK open incorporation data; the largest states (Texas, California, Delaware) don't offer free bulk access at all. Germany's Handelsregister has no free official API for this either — every option is a paid third-party service sitting in front of the same government portal. Ask if you want either of those built; they're real, just not "flip a free switch" the way the UK one is.
 
+### Public Access, Paid Passes & Bring-Your-Own-Cookies
+
+Session-heavy features (`/findco`, `/find`, `/scout`, `/fresh`, `/scoutlist`)
+run on a logged-in Google session. There are now three ways someone can use
+them:
+
+| Tier | Who | How |
+|---|---|---|
+| **Owner** | you | everything, always |
+| **Paid pass** | anyone | pays you → you approve → `PASS_DAYS` days on your shared session |
+| **BYOC** | anyone (free) | uploads their own google.com cookies → runs entirely on *their* session, with *their own* hourly search budget — yours is never touched |
+
+**Turning public mode on** — set `PUBLIC_ACCESS=true` in Vercel. Strangers
+can then use `/newuk`, the menus, and anything else in `PUBLIC_CMDS`; the
+moment they tap a session-heavy feature they hit the access gate.
+
+**Vercel environment variables for this system:**
+
+| Name | What |
+|---|---|
+| `PUBLIC_ACCESS` | `true` to let strangers use the bot at all |
+| `PAYMENT_LINK` | your payment URL (Stripe Payment Link, Gumroad, etc.) — shown on the "Get access" screen |
+| `ACCESS_PRICE_TEXT` | e.g. `$1` (display only) |
+| `ACCESS_PASS_DAYS` | days a paid pass lasts (default 30) |
+
+**How a paid sale works (no Stripe integration needed):**
+1. User taps 💳 "Get a pass" on the access screen → sees your `PAYMENT_LINK`
+2. You get a DM with their user ID and **Approve / Deny** buttons
+3. Tap Approve → their pass activates instantly; they get a confirmation DM
+4. You can also grant manually anytime: `/grant <user id> [days]`
+
+**How BYOC works:**
+1. User sends their `cookies.json` (Cookie-Editor export, google.com) as a
+   document — the bot sniffs the file, stores it under their user ID, and
+   confirms with the expiry date
+2. Their `/findco` and `/find` jobs run with **their** cookies; the hourly
+   Google budget is per-user (`disc:rl:hour:<userId>`) so they can never
+   burn your session
+3. When Google eventually kills their session, the job tells them to
+   re-upload — your shared session is never used as a fallback for them
+
+**Checking status:** anyone can send `/access`; the owner can grant with
+`/grant`. Cookie files and passes live in Redis (`cookies:{id}:google`,
+`pass:{id}`) — nothing sensitive is written to the repo.
+
 ### Fresh Shopify Stores — real-time mode (CertStream, runs locally)
 
 `certstream_watcher.py` is a companion to the crt.sh tick system above, not a replacement. It connects to [CertStream](https://certstream.calidog.io/) — a live push feed of every certificate as it's issued across public Certificate Transparency logs — and watches for anything under `myshopify.com`. Instead of polling an overloaded server (crt.sh) and hoping it answers, certificates are pushed to it the moment they're issued, so a genuinely new store can get reported within seconds rather than however long it takes the next GitHub Actions tick to stumble onto it.

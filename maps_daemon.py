@@ -205,13 +205,13 @@ def safe_int(text, default=0):
 
 # ── Google Maps Scraping ──
 
-def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen=False):
+def scrape_google_maps(city, niche, max_results=30, review_cap=200, include_seen=False, cookie_path=None):
     search_query = f"{niche} in {city}"
     results = []
     seen_names = set()
     seen_addresses = set()
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    cookie_path = os.path.join(script_dir, "gm_cookies.json")
+    cookie_path = cookie_path or os.path.join(script_dir, "gm_cookies.json")
     dedup_key = "seen_maps:global"
 
     scrape_start_time = time.time()
@@ -1183,7 +1183,24 @@ def process_job(data):
     print(f"  Job: {niche} in {city} (max {count}, cap {review_cap}, sample={sample_mode}, rescan={include_seen})")
     send_telegram(chat_id, f"🗺️ Scraping Google Maps for {niche} in {city} — up to {count} leads. This takes a while...")
 
-    raw = scrape_google_maps(city, niche, max_results=count, review_cap=review_cap, include_seen=include_seen)
+    # A non-owner job must run with the CALLER's own cookies, never the
+    # owner's session — their BYOC cookies were stored on the bot side at
+    # cookies:{user_id}:google. Missing/expired cookies stop the job with
+    # a clear re-upload message instead of silently using the shared session.
+    uid = str(data.get("user_id") or "")
+    cookie_path = None
+    if uid:
+        raw_cookies = redis_get(f"cookies:{uid}:google")
+        if not raw_cookies:
+            send_telegram(chat_id, "⚠️ Your saved Google cookies are missing — send your cookies.json file to the bot again, then re-run /find.")
+            return
+        cookie_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   f"gm_cookies_{uid}.json")
+        with open(cookie_path, "w", encoding="utf-8") as f:
+            f.write(raw_cookies)
+
+    raw = scrape_google_maps(city, niche, max_results=count, review_cap=review_cap,
+                             include_seen=include_seen, cookie_path=cookie_path)
     if not raw:
         send_telegram(chat_id,
             f"No leads collected for {niche} in {city} — either blocked (check the Actions log for "
