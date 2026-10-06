@@ -31,7 +31,11 @@ jobs:
       # 403 = hard IP block -> add a CRTSH_RELAY_URL secret (Cloudflare
       # Worker relay) and everything routes through it automatically.
       - name: Probe crt.sh from this IP
-        run: curl -s -o /dev/null -w "crt.sh says HTTP %{http_code}\n" --max-time 25 "https://crt.sh/json?q=shops.myshopify.com"
+        # Informational only — crt.sh is a free, occasionally-slow public service.
+        # Never let this step fail the whole run; the daemon's own retry logic
+        # (and CRTSH_RELAY_URL if you've set one) handles a flaky crt.sh already.
+        continue-on-error: true
+        run: curl -s -o /dev/null -w "crt.sh says HTTP %{http_code}\n" --max-time 25 "https://crt.sh/json?q=shops.myshopify.com" || echo "crt.sh probe failed/timed out — continuing anyway, this step is informational only"
 
       - name: Set up Python
         uses: actions/setup-python@v5
