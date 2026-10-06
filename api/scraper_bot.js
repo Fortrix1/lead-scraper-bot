@@ -189,15 +189,18 @@ module.exports = async (req, res) => {
   // Pay contact/price/pass-length are owner-editable from inside the bot (🧰 Tools →
   // 👥 Access requests) — stored in Redis so no Vercel redeploy is ever needed.
   // The env vars above are only the very-first-run default.
+  let AUTO_TRIAL = process.env.AUTO_TRIAL === 'true'
   async function loadPayConfig() {
-    const [{ result: c }, { result: p }, { result: d }] = await Promise.all([
+    const [{ result: c }, { result: p }, { result: d }, { result: at }] = await Promise.all([
       redis('GET', 'config:pay_contact'),
       redis('GET', 'config:pay_price'),
-      redis('GET', 'config:pay_days')
+      redis('GET', 'config:pay_days'),
+      redis('GET', 'config:auto_trial')
     ])
     if (c) PAY_CONTACT = c
     if (p) ACCESS_PRICE = p
     if (d && parseInt(d) > 0) PASS_DAYS = parseInt(d)
+    if (at !== null && at !== undefined) AUTO_TRIAL = at === 'true'
     if (PAY_CONTACT) PAYMENT_LINK = payUrlFrom(PAY_CONTACT)
   }
   await loadPayConfig()
@@ -251,9 +254,15 @@ module.exports = async (req, res) => {
     } catch { return { present: false, fresh: false, expires: 0 } }
   }
 
+  async function oneTimeInfo(userId) {
+    const { result } = await redis('GET', `onetime:${userId}`)
+    return { remaining: parseInt(result) || 0 }
+  }
+
   async function tierOf(userId) {
     if (isOwner) return 'owner'
     if ((await passInfo(userId)).valid) return 'paid'
+    if ((await oneTimeInfo(userId)).remaining > 0) return 'onetime'
     if ((await cookieInfo(userId)).fresh) return 'byoc'
     return 'none'
   }
@@ -263,6 +272,17 @@ module.exports = async (req, res) => {
     await redis('SADD', 'access:granted:ids', userId)
     if (who) await redis('SET', `access:meta:${userId}`, JSON.stringify({ who }))
     await removePendingRequest(userId)
+  }
+
+  // A "once in a lifetime" search — exactly one /find or /findco run on the
+  // shared session, spent the moment the job actually gets queued (not merely
+  // when they start the command), so an abandoned flow never burns the credit.
+  async function grantOneTime(userId, count = 1, who = '') {
+    const { result } = await redis('INCRBY', `onetime:${userId}`, String(count))
+    await redis('SADD', 'access:onetime:ids', userId)
+    if (who) await redis('SET', `access:meta:${userId}`, JSON.stringify({ who }))
+    await removePendingRequest(userId)
+    return parseInt(result) || count
   }
 
   // Is this uploaded file a cookie export (Cookie-Editor or Playwright)?
@@ -288,9 +308,11 @@ module.exports = async (req, res) => {
 
   async function sendAccessScreen(chatId, userId) {
     const pass = await passInfo(userId)
+    const ot = await oneTimeInfo(userId)
     const ck = await cookieInfo(userId)
     let status = 'No access yet.'
     if (pass.valid) status = `Paid pass active until ${new Date(pass.expires).toISOString().slice(0, 10)}.`
+    else if (ot.remaining > 0) status = `🎟️ ${ot.remaining} one-time search${ot.remaining === 1 ? '' : 'es'} available (covers /find or /findco).`
     else if (ck.present) status = ck.fresh
       ? `Your own cookies are on file (freshest expires ${new Date(ck.expires * 1000).toISOString().slice(0, 10)}).`
       : 'Your saved cookies have expired — re-send the file to refresh.'
@@ -301,28 +323,79 @@ module.exports = async (req, res) => {
     await tgCall('sendMessage', {
       chat_id: chatId, parse_mode: 'HTML',
       text:
-        `<b>🔒 This feature runs on a logged-in Google session</b>
-
-` +
-        `Two ways in:
-` +
-        `1️⃣ Pay ${ACCESS_PRICE} → a ${PASS_DAYS}-day pass on the shared session
-` +
-        `2️⃣ Upload your own google.com cookies (free, your own limits) — export with the ` +
-        `Cookie-Editor extension while logged into google.com, then send the .json file here
-
-` +
+        `<b>🔒 This feature runs on a logged-in Google session</b>\n\n` +
+        `Ways in:\n` +
+        `1️⃣ Pay ${ACCESS_PRICE} → a ${PASS_DAYS}-day pass on the shared session\n` +
+        `2️⃣ Ask the owner for a one-time search — covers exactly one /find or /findco run\n` +
+        `3️⃣ Upload your own google.com cookies (free, your own limits) — export with the ` +
+        `Cookie-Editor extension while logged into google.com, then send the .json file here\n\n` +
+        `Only one search runs at a time on the shared session, so if you're not first in line ` +
+        `I'll tell you your place in the queue and message you the moment yours starts.\n\n` +
         `<b>Your status:</b> ${status}`,
       reply_markup: { inline_keyboard: kb }
     })
   }
 
-  async function gateOwnerSession(chatId, userId) {
+  // cmdBase lets a one-time credit cover exactly what it's meant to (/find,
+  // /findco) without also unlocking /scout, /fresh, etc. for free.
+  async function gateOwnerSession(chatId, userId, cmdBase, who) {
     if (isOwner) return true
     const tier = await tierOf(userId)
     if (tier === 'paid' || tier === 'byoc') return true
+    if (tier === 'onetime' && (cmdBase === '/find' || cmdBase === '/findco')) return true
+    if (tier === 'none' && AUTO_TRIAL && (cmdBase === '/find' || cmdBase === '/findco')) {
+      // One free search per Telegram account, ever — trial:used is permanent, so
+      // flipping auto-trial off/on or even revoking someone never hands out a second.
+      const { result: used } = await redis('GET', `trial:used:${userId}`)
+      if (!used) {
+        await grantOneTime(userId, 1, who || '')
+        await redis('SET', `trial:used:${userId}`, '1')
+        await send(chatId, `🎁 First search is on the house — go ahead, this covers exactly one ${cmdBase} run.`)
+        return true
+      }
+    }
     await sendAccessScreen(chatId, userId)
     return false
+  }
+
+  // One shared Google session -> one job at a time. This both stops a person
+  // flooding the queue with several requests and gives everyone a straight
+  // answer: their place in line, and a ping the moment their turn comes.
+  async function queueJob(chatId, userId, payload, description) {
+    const ownerRunning = !ADMIN_ID || userId === ADMIN_ID
+    if (!ownerRunning) {
+      const { result: existing } = await redis('GET', `inflight:${userId}`)
+      if (existing) {
+        await send(chatId,
+          `⏳ You already have a request queued or running — I'll message you the moment it starts, ` +
+          `and again when it's done. Send another after that; one at a time keeps the queue moving for everyone.`)
+        return false
+      }
+      const tier = await tierOf(userId)
+      if (tier === 'onetime') {
+        const { result } = await redis('DECRBY', `onetime:${userId}`, '1')
+        if ((parseInt(result) || 0) < 0) {
+          await redis('SET', `onetime:${userId}`, '0')
+          await send(chatId, `Your one-time search credit has already been used. Send /access to see other ways in.`)
+          return false
+        }
+      }
+    }
+    if (!payload.job_id) payload.job_id = `job-${Date.now()}`
+    await redis('RPUSH', 'jobs:find', JSON.stringify(payload))
+    if (!ownerRunning) {
+      await redis('SET', `inflight:${userId}`, payload.job_id)
+      const { result: len } = await redis('LLEN', 'jobs:find')
+      const position = parseInt(len) || 1
+      if (position > 1) {
+        await send(chatId,
+          `🔎 You're #${position} in line (${position - 1} request${position - 1 === 1 ? '' : 's'} ahead of you${description ? ' — ' + description : ''}). ` +
+          `Only one search runs at a time on the shared session — I'll message you the moment yours starts.`)
+      } else {
+        await send(chatId, `🔎 You're next in line${description ? ' — ' + description : ''} — should start within a minute or two.`)
+      }
+    }
+    return true
   }
 
   // ── URL fixing / dedupe / filtering ──
@@ -569,17 +642,19 @@ module.exports = async (req, res) => {
   async function postDiscoveryJob(chatId, userId, companies) {
     const jobId = `co-${Date.now()}`
     const ownerRunning = !ADMIN_ID || userId === ADMIN_ID
-    await redis('RPUSH', 'jobs:find', JSON.stringify({
+    const payload = {
       type: 'discovery', chat_id: chatId, job_id: jobId, companies, max: 40,
       // Owner's job -> omit user_id so the daemon uses the shared GOOGLE_COOKIES_JSON
       // session. A non-owner's job -> their own id, so the daemon requires THEIR
       // uploaded cookies (cookies:{id}:google) instead of silently reusing the owner's.
       ...(ownerRunning ? {} : { user_id: userId })
-    }))
+    }
+    const label = `${companies.length} compan${companies.length === 1 ? 'y' : 'ies'}`
+    const queued = await queueJob(chatId, userId, payload, label)
+    if (!queued) return
     const dispatched = await triggerGithubWorkflow()
     await send(chatId,
-      `✅ Discovery job posted: ${companies.length} compan${companies.length === 1 ? 'y' : 'ies'} ` +
-      `(job ${jobId}).\n` +
+      `✅ Discovery job posted: ${label} (job ${jobId}).\n` +
       (dispatched
         ? `Triggered GitHub Actions immediately — should start within a minute or two.\n`
         : `Make sure the daemon is running, or wait for the next scheduled run.\n`) +
@@ -1146,14 +1221,31 @@ module.exports = async (req, res) => {
 
   // Owner-only: who's waiting, who's already in, one tap to approve/deny/revoke,
   // and the two editable fields (contact + price) right at the top.
+  async function listOneTimeHolders() {
+    const { result: ids } = await redis('SMEMBERS', 'access:onetime:ids')
+    if (!ids || !ids.length) return []
+    const out = []
+    for (const oid of ids) {
+      const { remaining } = await oneTimeInfo(oid)
+      if (remaining <= 0) continue
+      const { result: metaRaw } = await redis('GET', `access:meta:${oid}`)
+      let who = ''
+      if (metaRaw) { try { who = JSON.parse(metaRaw).who || '' } catch {} }
+      out.push({ id: oid, who, remaining })
+    }
+    return out
+  }
+
   async function buildAccessListScreen() {
     const pending = await listPendingRequests()
     const granted = (await listGrantedPasses()).filter(g => g.valid)
+    const oneTime = await listOneTimeHolders()
     let text =
       `<b>👥 Access requests</b>\n\n` +
       `💳 Price shown to people: <b>${ACCESS_PRICE}</b>\n` +
       `📇 Payment contact: <b>${PAY_CONTACT ? PAY_CONTACT.replace(/[<>&]/g, '') : '(not set — tap below to add one)'}</b>\n` +
-      `⏳ Pass length: ${PASS_DAYS} days\n`
+      `⏳ Pass length: ${PASS_DAYS} days · 🎟️ one-time credit covers 1 search\n` +
+      `🎁 Free trial (1 search/account, automatic): <b>${AUTO_TRIAL ? 'ON' : 'OFF'}</b>\n`
     const kb = []
     if (pending.length) {
       text += `\n<b>⏳ Pending (${pending.length})</b>\n`
@@ -1161,7 +1253,7 @@ module.exports = async (req, res) => {
         const age = Math.max(0, Math.round((Date.now() - (p.ts || 0)) / 3600000))
         const label = (p.who || p.id).replace(/[<>&]/g, '')
         text += `• <code>${p.id}</code>${p.who ? ' — ' + label : ''} (${age}h ago)\n`
-        kb.push([B(`✅ ${label}`.slice(0, 30), `payok:${p.id}`), B('❌ Deny', `payno:${p.id}`)])
+        kb.push([B(`🎟️ 1 search`, `pay1:${p.id}`), B(`✅ ${PASS_DAYS}d pass`, `payok:${p.id}`), B('❌ Deny', `payno:${p.id}`)])
       }
       if (pending.length > 10) text += `…and ${pending.length - 10} more\n`
     } else {
@@ -1175,7 +1267,16 @@ module.exports = async (req, res) => {
         kb.push([B(`🚫 Revoke ${label}`.slice(0, 30), `payrevoke:${g.id}`)])
       }
     }
+    if (oneTime.length) {
+      text += `\n<b>🎟️ One-time credits (${oneTime.length})</b>\n`
+      for (const o of oneTime.slice(0, 10)) {
+        const label = (o.who || o.id).replace(/[<>&]/g, '')
+        text += `• <code>${o.id}</code>${o.who ? ' — ' + label : ''} — ${o.remaining} remaining\n`
+        kb.push([B(`🚫 Revoke ${label}`.slice(0, 30), `pay1revoke:${o.id}`)])
+      }
+    }
     kb.push([B('✏️ Change contact', 'payset:contact'), B('✏️ Change price', 'payset:price')])
+    kb.push([B(AUTO_TRIAL ? '🎁 Turn free trial OFF' : '🎁 Turn free trial ON', 'payset:trial')])
     kb.push([B('⬅️ Back', 'menu:tools'), B('🏠 Main menu', 'menu:main')])
     return { text, kb }
   }
@@ -1199,8 +1300,8 @@ module.exports = async (req, res) => {
       ['campaigns', '📋 Your campaigns'], ['leads', '📂 Leads by status'], ['mark', '✅ Update a lead\'s status'],
       ['others', '🚫 Blacklisted links'], ['black', '🔒 Add to blacklist'], ['scoutlist', '🕵️ Scan a domain list'],
       ['audit', '🧾 Activity log'], ['cancel', '🧹 Stop what I\'m waiting for'],
-      ['access', '🔑 My access status'], ['grant', '✅ Give a user access (owner)'],
-      ['accesslist', '👥 Pending + active access (owner)']
+      ['access', '🔑 My access status'], ['grant', '✅ Give a user a day-pass (owner)'],
+      ['grant1', '🎟️ Give a user 1 search (owner)'], ['accesslist', '👥 Pending + active access (owner)']
     ].map(([command, description]) => ({ command, description }))
     await tgCall('setMyCommands', { commands: pub.map(([command, description]) => ({ command, description })) })
     await tgCall('setMyCommands', { commands: all, scope: { type: 'chat', chat_id: ownerChatId } })
@@ -1287,8 +1388,13 @@ module.exports = async (req, res) => {
             `💳 <b>Access request</b>\n` +
             `User ID: <code>${actorId}</code>${who ? '\nName: ' + who.replace(/[<>&]/g, '') : ''}\n` +
             `Price: ${ACCESS_PRICE}${PAY_CONTACT ? ' → pay to ' + PAY_CONTACT : ' (set a payment contact in 👥 Access requests)'}\n\n` +
-            `Approve grants ${PASS_DAYS} days on YOUR shared session. This also sits under 🧰 Tools → 👥 Access requests if you miss it here.`,
-          reply_markup: { inline_keyboard: [[B(`✅ Grant ${PASS_DAYS} days`, `payok:${actorId}`), B('❌ Deny', `payno:${actorId}`)]] }
+            `🎟️ 1 search = exactly one /find or /findco run, then they're done.\n` +
+            `✅ ${PASS_DAYS} days = unlimited runs until it expires.\n` +
+            `This also sits under 🧰 Tools → 👥 Access requests if you miss it here.`,
+          reply_markup: { inline_keyboard: [
+            [B(`🎟️ 1 search`, `pay1:${actorId}`), B(`✅ ${PASS_DAYS} days`, `payok:${actorId}`)],
+            [B('❌ Deny', `payno:${actorId}`)]
+          ] }
         })
       }
       await tgCall('sendMessage', {
@@ -1343,9 +1449,45 @@ module.exports = async (req, res) => {
       const target = d.split(':')[1]
       await redis('DEL', `pass:${target}`)
       await redis('SREM', 'access:granted:ids', target)
+      await redis('SET', `trial:used:${target}`, '1')  // a revoke is a full block — no auto-trial fallback in
       await tgCall('sendMessage', { chat_id: target, text: 'Your access pass was revoked by the bot owner.' })
       await pushScreen(cbChat, cbMsg, await buildAccessListScreen())
       await answerCb(cq.id, `Revoked ${target}.`)
+      return res.status(200).send('OK')
+    }
+
+    if (d.startsWith('pay1revoke:')) {
+      if (!isOwner) { await answerCb(cq.id, 'Owner only.', true); return res.status(200).send('OK') }
+      const target = d.split(':')[1]
+      await redis('SET', `onetime:${target}`, '0')
+      await redis('SREM', 'access:onetime:ids', target)
+      await redis('SET', `trial:used:${target}`, '1')  // a revoke is a full block — no auto-trial fallback in
+      await tgCall('sendMessage', { chat_id: target, text: 'Your one-time search credit was revoked by the bot owner.' })
+      await pushScreen(cbChat, cbMsg, await buildAccessListScreen())
+      await answerCb(cq.id, `Revoked ${target}'s credit.`)
+      return res.status(200).send('OK')
+    }
+
+    if (d.startsWith('pay1:')) {
+      if (!isOwner) { await answerCb(cq.id, 'Owner only.', true); return res.status(200).send('OK') }
+      const target = d.split(':')[1]
+      const match = (await listPendingRequests()).find(p => p.id === target)
+      await grantOneTime(target, 1, match?.who || '')
+      await tgCall('sendMessage', {
+        chat_id: target,
+        text: `✅ You've been granted one search! Send /find or /findco whenever you're ready — it covers exactly one of those, then it's used up. Send /access anytime to check your status.`
+      })
+      await pushScreen(cbChat, cbMsg, await buildAccessListScreen())
+      await answerCb(cq.id, `Granted ${target} 1 search.`)
+      return res.status(200).send('OK')
+    }
+
+    if (d === 'payset:trial') {
+      if (!isOwner) { await answerCb(cq.id, '🔒 Owner-only.', true); return res.status(200).send('OK') }
+      AUTO_TRIAL = !AUTO_TRIAL
+      await redis('SET', 'config:auto_trial', AUTO_TRIAL ? 'true' : 'false')
+      await pushScreen(cbChat, cbMsg, await buildAccessListScreen())
+      await answerCb(cq.id, `Free trial turned ${AUTO_TRIAL ? 'ON' : 'OFF'}.`)
       return res.status(200).send('OK')
     }
 
@@ -1471,7 +1613,18 @@ module.exports = async (req, res) => {
   // and then only the safe commands in PUBLIC_CMDS. /access is the one exception: it's
   // the paid door in, so it always works even while the rest of the bot stays private.
   const isAccessCmd = /^\/access(@\w+)?$/.test(text)
-  if (!isOwner && !isAccessCmd) {
+  // A non-command reply (pasting a company list, answering "what's the review cap?",
+  // a wizard answer, a cookies.json upload...) must NOT hit the "type a command"
+  // wall below — those flows only ever start after the real gate already passed,
+  // so a reply to one of them is always legitimate, command or not.
+  const midFlowQueue = (!isOwner && text && !text.startsWith('/')) ? await getUserQueue(userId) : null
+  const midFlow = !!(midFlowQueue && (
+    midFlowQueue.awaitingCompanyList || midFlowQueue.awaitingReviewCap ||
+    midFlowQueue.awaitingMessages || midFlowQueue.awaitingCustomQuery ||
+    midFlowQueue.awaitingLeadCount || midFlowQueue.awaitingLockedFilter ||
+    midFlowQueue.wizard
+  ))
+  if (!isOwner && !isAccessCmd && !midFlow && !doc) {
     if (!PUBLIC_ACCESS) {
       await send(chatId, 'Private bot.')
       return res.status(200).send('OK')
@@ -1483,7 +1636,9 @@ module.exports = async (req, res) => {
     }
     if (OWNER_SESSION_CMDS.includes(baseCmd)) {
       // paid pass or own-cookies users get in; everyone else sees the access screen
-      if (!(await gateOwnerSession(chatId, userId))) return res.status(200).send('OK')
+      const whoName = [msg.from?.first_name, msg.from?.last_name, msg.from?.username ? '@' + msg.from.username : '']
+        .filter(Boolean).join(' ')
+      if (!(await gateOwnerSession(chatId, userId, baseCmd, whoName))) return res.status(200).send('OK')
     } else if (!PUBLIC_CMDS.includes(baseCmd)) {
       await tgCall('sendMessage', { chat_id: chatId, text: '🔒 That feature is owner-only for now. Tap below to see what you can use.',
         reply_markup: { inline_keyboard: [[B('🏠 Main menu', 'menu:main')]] } })
@@ -1801,6 +1956,41 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK')
   }
 
+  // ── /revoke <id> — owner only: cut someone off right now, pass or one-time ──
+  if (text.startsWith('/revoke')) {
+    if (!isOwner) { await send(chatId, 'Owner only.'); return res.status(200).send('OK') }
+    const target = text.split(' ')[1] || ''
+    if (!/^\d+$/.test(target)) {
+      await send(chatId, `Usage: /revoke <telegram user id>`)
+      return res.status(200).send('OK')
+    }
+    await redis('DEL', `pass:${target}`)
+    await redis('SREM', 'access:granted:ids', target)
+    await redis('SET', `onetime:${target}`, '0')
+    await redis('SREM', 'access:onetime:ids', target)
+    await redis('SET', `trial:used:${target}`, '1')  // a revoke is a full block — no auto-trial fallback in
+    await tgCall('sendMessage', { chat_id: target, text: 'Your access was revoked by the bot owner.' })
+    await send(chatId, `✓ ${target}'s access has been revoked (pass + one-time credit cleared, free-trial blocked too).`)
+    return res.status(200).send('OK')
+  }
+
+  // ── /grant1 <id> [count] — owner only: N one-time search credits (default 1) ──
+  if (text.startsWith('/grant1')) {
+    if (!isOwner) { await send(chatId, 'Owner only.'); return res.status(200).send('OK') }
+    const parts = text.split(' ').slice(1)
+    const target = parts[0] || ''
+    const count = Math.min(Math.max(parseInt(parts[1]) || 1, 1), 50)
+    if (!/^\d+$/.test(target)) {
+      await send(chatId, `Usage: /grant1 <telegram user id> [count]\ne.g. /grant1 123456789  or  /grant1 123456789 3`)
+      return res.status(200).send('OK')
+    }
+    const match = (await listPendingRequests()).find(p => p.id === target)
+    const total = await grantOneTime(target, count, match?.who || '')
+    await tgCall('sendMessage', { chat_id: target, text: `✅ You've been granted ${count} search${count === 1 ? '' : 'es'}. Send /find or /findco whenever you're ready. Send /access anytime to check your status.` })
+    await send(chatId, `✓ ${target} now has ${total} one-time search${total === 1 ? '' : 'es'} available.`)
+    return res.status(200).send('OK')
+  }
+
   // ── /accesslist — owner only: pending requests + active passes, one place ──
   if (/^\/accesslist(@\w+)?$/.test(text)) {
     if (!isOwner) { await send(chatId, 'Owner only.'); return res.status(200).send('OK') }
@@ -2018,17 +2208,19 @@ module.exports = async (req, res) => {
         return res.status(200).send('OK')
       }
       const ownerRunning = !ADMIN_ID || userId === ADMIN_ID
-      const jobPayload = JSON.stringify({
+      const payload = {
         chat_id: chatId, city: job.city, niche: job.niche,
         count: job.count, review_cap: reviewCap,
         sample_mode: !!job.sampleMode,
         include_seen: !!job.includeSeen,
+        job_id: `find-${Date.now()}`,
         // Owner's job -> omit user_id so the daemon uses the shared GM_COOKIES_JSON
         // session (gm_cookies.json). A non-owner's job -> their own id, so the daemon
         // requires THEIR uploaded cookies instead of silently reusing the owner's.
         ...(ownerRunning ? {} : { user_id: userId })
-      })
-      await redis('RPUSH', 'jobs:find', jobPayload)
+      }
+      const queued = await queueJob(chatId, userId, payload, `${job.niche} in ${job.city}`)
+      if (!queued) return res.status(200).send('OK')
       const dispatched = await triggerGithubWorkflow()
       await send(chatId,
         `✅ Job posted: ${job.niche} in ${job.city} (max ${job.count}` +

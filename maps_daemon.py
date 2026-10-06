@@ -1586,38 +1586,68 @@ BANNER = r"""
 └──────────────────────────────────┘
 """
 
+def _job_description(data):
+    if data.get("type") == "discovery":
+        n = len(data.get("companies") or [])
+        return f"{n} compan{'y' if n == 1 else 'ies'}"
+    niche = data.get("niche")
+    if niche:
+        return f"{niche} in {data.get('city', '')}"
+    return "your request"
+
+
 def handle_job(job_raw):
     try:
         data = json.loads(job_raw)
     except Exception as e:
         print(f"  Bad job payload: {e}")
         return
-    if data.get("type") == "discovery":
-        # Company web-presence discovery via authenticated Google searches
-        # (web_discovery.py). Runs on the same daemon schedule as /find.
+
+    # user_id is only ever set on a non-owner's job (see scraper_bot.js) —
+    # that's also our signal that this person is in the shared queue and
+    # waiting to hear when their turn actually starts.
+    user_id = str(data.get("user_id") or "")
+    chat_id = str(data.get("chat_id", ""))
+    if user_id and data.get("type") != "fresh":
         try:
-            import web_discovery
-            web_discovery.process_job(data)
+            send_telegram(chat_id, f"▶️ Your request is starting now — you're up! ({_job_description(data)})")
         except Exception as e:
-            print(f"  Discovery job failed: {e}")
-            try:
-                send_telegram(str(data.get("chat_id", "")),
-                              f"⚠️ Discovery job failed: {str(e)[:150]}")
-            except Exception:
-                pass
-        return
-    if data.get("type") == "fresh":
-        # Legacy leftover from the old /fresh — the new system is automatic.
-        print("  Ignoring legacy 'fresh' job — fresh runs as automatic ticks now.")
-        return
+            print(f"  couldn't send 'starting now' ping: {e}")
+
     try:
-        process_job(data)
-    except Exception as e:
-        print(f"  Job failed: {e}")
-        try:
-            send_telegram(str(data.get("chat_id", "")), f"⚠️ Job failed: {str(e)[:150]}")
-        except Exception:
-            pass
+        if data.get("type") == "discovery":
+            # Company web-presence discovery via authenticated Google searches
+            # (web_discovery.py). Runs on the same daemon schedule as /find.
+            try:
+                import web_discovery
+                web_discovery.process_job(data)
+            except Exception as e:
+                print(f"  Discovery job failed: {e}")
+                try:
+                    send_telegram(chat_id, f"⚠️ Discovery job failed: {str(e)[:150]}")
+                except Exception:
+                    pass
+        elif data.get("type") == "fresh":
+            # Legacy leftover from the old /fresh — the new system is automatic.
+            print("  Ignoring legacy 'fresh' job — fresh runs as automatic ticks now.")
+        else:
+            try:
+                process_job(data)
+            except Exception as e:
+                print(f"  Job failed: {e}")
+                try:
+                    send_telegram(chat_id, f"⚠️ Job failed: {str(e)[:150]}")
+                except Exception:
+                    pass
+    finally:
+        # Free this person's one queue slot now the job is actually done (success,
+        # failure, or a thrown exception all count) — unblocks their next request
+        # and is what makes a one-time lifetime credit's spend final.
+        if user_id:
+            try:
+                redis("DEL", f"inflight:{user_id}")
+            except Exception as e:
+                print(f"  couldn't clear inflight marker for {user_id}: {e}")
 
 def main():
     print(BANNER)
