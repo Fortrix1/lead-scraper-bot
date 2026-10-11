@@ -645,13 +645,15 @@ module.exports = async (req, res) => {
 
   async function postDiscoveryJob(chatId, userId, companies) {
     const jobId = `co-${Date.now()}`
-    const ownerRunning = !ADMIN_ID || userId === ADMIN_ID
+    // Only a genuine BYOC (own-cookies) user gets user_id attached, so the daemon
+    // looks for THEIR uploaded cookies. The owner, a paid-pass holder, a one-time
+    // credit, or an auto-trial grant all borrow the owner's shared session instead —
+    // that's the whole point of granting someone access rather than them uploading
+    // their own cookies.
+    const useOwnCookies = (await tierOf(userId)) === 'byoc'
     const payload = {
       type: 'discovery', chat_id: chatId, job_id: jobId, companies, max: 40,
-      // Owner's job -> omit user_id so the daemon uses the shared GOOGLE_COOKIES_JSON
-      // session. A non-owner's job -> their own id, so the daemon requires THEIR
-      // uploaded cookies (cookies:{id}:google) instead of silently reusing the owner's.
-      ...(ownerRunning ? {} : { user_id: userId })
+      ...(useOwnCookies ? { user_id: userId } : {})
     }
     const label = `${companies.length} compan${companies.length === 1 ? 'y' : 'ies'}`
     const queued = await queueJob(chatId, userId, payload, label)
@@ -2258,17 +2260,19 @@ module.exports = async (req, res) => {
         await send(chatId, `Something went wrong — run /find again.`)
         return res.status(200).send('OK')
       }
-      const ownerRunning = !ADMIN_ID || userId === ADMIN_ID
+      // Only a genuine BYOC (own-cookies) user gets user_id attached, so the daemon
+      // looks for THEIR uploaded cookies (gm_cookies_{id}.json). The owner, a paid-pass
+      // holder, a one-time credit, or an auto-trial grant all borrow the owner's shared
+      // gm_cookies.json instead — that's the whole point of granting someone access
+      // rather than them uploading their own.
+      const useOwnCookies = (await tierOf(userId)) === 'byoc'
       const payload = {
         chat_id: chatId, city: job.city, niche: job.niche,
         count: job.count, review_cap: reviewCap,
         sample_mode: !!job.sampleMode,
         include_seen: !!job.includeSeen,
         job_id: `find-${Date.now()}`,
-        // Owner's job -> omit user_id so the daemon uses the shared GM_COOKIES_JSON
-        // session (gm_cookies.json). A non-owner's job -> their own id, so the daemon
-        // requires THEIR uploaded cookies instead of silently reusing the owner's.
-        ...(ownerRunning ? {} : { user_id: userId })
+        ...(useOwnCookies ? { user_id: userId } : {})
       }
       const queued = await queueJob(chatId, userId, payload, `${job.niche} in ${job.city}`)
       if (!queued) return res.status(200).send('OK')
