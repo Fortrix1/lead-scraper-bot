@@ -190,17 +190,20 @@ module.exports = async (req, res) => {
   // 👥 Access requests) — stored in Redis so no Vercel redeploy is ever needed.
   // The env vars above are only the very-first-run default.
   let AUTO_TRIAL = process.env.AUTO_TRIAL === 'true'
+  let TRIAL_SIZE = parseInt(process.env.AUTO_TRIAL_SIZE || '2') || 2   // free searches per new account
   async function loadPayConfig() {
-    const [{ result: c }, { result: p }, { result: d }, { result: at }] = await Promise.all([
+    const [{ result: c }, { result: p }, { result: d }, { result: at }, { result: ts }] = await Promise.all([
       redis('GET', 'config:pay_contact'),
       redis('GET', 'config:pay_price'),
       redis('GET', 'config:pay_days'),
-      redis('GET', 'config:auto_trial')
+      redis('GET', 'config:auto_trial'),
+      redis('GET', 'config:trial_size')
     ])
     if (c) PAY_CONTACT = c
     if (p) ACCESS_PRICE = p
     if (d && parseInt(d) > 0) PASS_DAYS = parseInt(d)
     if (at !== null && at !== undefined) AUTO_TRIAL = at === 'true'
+    if (ts && parseInt(ts) > 0) TRIAL_SIZE = parseInt(ts)
     if (PAY_CONTACT) PAYMENT_LINK = payUrlFrom(PAY_CONTACT)
   }
   await loadPayConfig()
@@ -348,9 +351,10 @@ module.exports = async (req, res) => {
       // flipping auto-trial off/on or even revoking someone never hands out a second.
       const { result: used } = await redis('GET', `trial:used:${userId}`)
       if (!used) {
-        await grantOneTime(userId, 1, who || '')
+        await grantOneTime(userId, TRIAL_SIZE, who || '')
         await redis('SET', `trial:used:${userId}`, '1')
-        await send(chatId, `🎁 First search is on the house — go ahead, this covers exactly one ${cmdBase} run.`)
+        await send(chatId, `🎁 You've got ${TRIAL_SIZE} free search${TRIAL_SIZE === 1 ? '' : 'es'} on the house — go ahead, ` +
+          `each covers one /find or /findco run. After that you'll need a pass or another grant.`)
         return true
       }
     }
@@ -1038,11 +1042,18 @@ module.exports = async (req, res) => {
   const PUBLIC_CMDS = ['/start', '/menu', '/help', '/cancel', '/newuk', '/access']
   const actorId = String(body.callback_query?.from?.id || body.message?.from?.id || '')
   const isOwner = !ADMIN_ID || actorId === ADMIN_ID
+  // The SAME tier check /find and /findco use (gateOwnerSession), computed once
+  // and reused everywhere a button or menu screen needs to know "can this
+  // specific person actually use the paid/granted features" — not just
+  // "is the free preview switched on." A granted user is never blocked by
+  // PUBLIC_ACCESS being off, and never sees a 🔒 on something they can use.
+  const actorTier = isOwner ? 'owner' : await tierOf(actorId)
+  const hasAccess = isOwner || actorTier !== 'none'
 
   const B = (text, data) => ({ text, callback_data: data })
 
-  function screenFor(name, owner) {
-    const go = (label, data) => (owner || PUBLIC_ACCESS) ? B(label, data) : B('🔒 ' + label, 'locked')
+  function screenFor(name, owner, hasAccessFlag) {
+    const go = (label, data) => hasAccessFlag ? B(label, data) : B('🔒 ' + label, 'locked')
     const nav = (back) => [B('⬅️ Back', back || 'menu:main'), B('🏠 Main menu', 'menu:main')]
 
     switch (name) {
@@ -1129,6 +1140,8 @@ module.exports = async (req, res) => {
             `🧹 <b>Cancel / reset</b> — use this if the bot seems stuck waiting for something.`,
           kb: [
             [go('🚫 Blacklisted links', 'run:/others'), go('🧾 Activity log', 'run:/audit')],
+            // Owner-only, deliberately — this is the real admin screen (grant/revoke/pricing),
+            // so it checks true isOwner, never the broader "has access" flag.
             [owner ? B('👥 Access requests', 'menu:accesslist') : B('🔒 Access requests', 'locked')],
             [B('🧹 Cancel / reset', 'run:/cancel')],
             [B('📜 All commands', 'menu:cmds')],
@@ -1184,7 +1197,7 @@ module.exports = async (req, res) => {
             `<b>👋 Lead Scraper Bot</b>\n\n` +
             `Find businesses that need your services — and the contact details to reach them.\n\n` +
             `<b>New here?</b> Tap 🇬🇧 New UK Companies, then 🕵️ Find Contacts. That's the whole flow.\n\n` +
-            (owner ? '' : `🔒 = owner-only for now.\n\n`) +
+            (hasAccessFlag ? '' : `🔒 = needs access — tap 💳 Get Access below.\n\n`) +
             `<b>What do you want to do?</b>`,
           kb: [
             [B('🇬🇧 New UK Companies', 'menu:uk'), go('🕵️ Find Contacts', 'menu:findco')],
@@ -1215,8 +1228,8 @@ module.exports = async (req, res) => {
     }
     await tgCall('sendMessage', base)
   }
-  async function showScreen(chatId, messageId, name, owner) {
-    await pushScreen(chatId, messageId, screenFor(name, owner))
+  async function showScreen(chatId, messageId, name, owner, hasAccessFlag) {
+    await pushScreen(chatId, messageId, screenFor(name, owner, hasAccessFlag))
   }
 
   // Owner-only: who's waiting, who's already in, one tap to approve/deny/revoke,
@@ -1245,7 +1258,7 @@ module.exports = async (req, res) => {
       `💳 Price shown to people: <b>${ACCESS_PRICE}</b>\n` +
       `📇 Payment contact: <b>${PAY_CONTACT ? PAY_CONTACT.replace(/[<>&]/g, '') : '(not set — tap below to add one)'}</b>\n` +
       `⏳ Pass length: ${PASS_DAYS} days · 🎟️ one-time credit covers 1 search\n` +
-      `🎁 Free trial (1 search/account, automatic): <b>${AUTO_TRIAL ? 'ON' : 'OFF'}</b>\n`
+      `🎁 Free trial (${TRIAL_SIZE} search${TRIAL_SIZE === 1 ? '' : 'es'}/account, automatic): <b>${AUTO_TRIAL ? 'ON' : 'OFF'}</b>\n`
     const kb = []
     if (pending.length) {
       text += `\n<b>⏳ Pending (${pending.length})</b>\n`
@@ -1276,7 +1289,7 @@ module.exports = async (req, res) => {
       }
     }
     kb.push([B('✏️ Change contact', 'payset:contact'), B('✏️ Change price', 'payset:price')])
-    kb.push([B(AUTO_TRIAL ? '🎁 Turn free trial OFF' : '🎁 Turn free trial ON', 'payset:trial')])
+    kb.push([B(AUTO_TRIAL ? '🎁 Turn free trial OFF' : '🎁 Turn free trial ON', 'payset:trial'), B('✏️ Change trial size', 'payset:trialsize')])
     kb.push([B('⬅️ Back', 'menu:tools'), B('🏠 Main menu', 'menu:main')])
     return { text, kb }
   }
@@ -1316,7 +1329,9 @@ module.exports = async (req, res) => {
     const cbMsg = cq.message.message_id
 
     const isPayCb = d === 'pay:request' || d === 'pay:byoc'
-    if (!isOwner && !PUBLIC_ACCESS && !isPayCb) {
+    // Same rule as the text gate: a granted user's taps always work, whether or
+    // not PUBLIC_ACCESS is on — that toggle only governs a totally un-granted stranger.
+    if (!isOwner && !PUBLIC_ACCESS && !isPayCb && !hasAccess) {
       await answerCb(cq.id, 'Private bot.', true)
       return res.status(200).send('OK')
     }
@@ -1335,12 +1350,12 @@ module.exports = async (req, res) => {
         await pushScreen(cbChat, cbMsg, await buildAccessListScreen())
         return res.status(200).send('OK')
       }
-      await showScreen(cbChat, cbMsg, screenName, isOwner)
+      await showScreen(cbChat, cbMsg, screenName, isOwner, hasAccess)
       return res.status(200).send('OK')
     }
 
     if (d.startsWith('wiz:')) {
-      if (!isOwner) { await answerCb(cq.id, '🔒 Owner-only for now.', true); return res.status(200).send('OK') }
+      if (!hasAccess) { await answerCb(cq.id, '🔒 Tap 💳 Get Access first.', true); return res.status(200).send('OK') }
       await answerCb(cq.id)
       const wq = await getUserQueue(actorId)
       const parts = d.split(':')
@@ -1491,7 +1506,7 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
 
-    if (d === 'payset:contact' || d === 'payset:price') {
+    if (d === 'payset:contact' || d === 'payset:price' || d === 'payset:trialsize') {
       if (!isOwner) { await answerCb(cq.id, '🔒 Owner-only.', true); return res.status(200).send('OK') }
       await answerCb(cq.id)
       const pq = await getUserQueue(actorId)
@@ -1503,12 +1518,19 @@ module.exports = async (req, res) => {
           text: `<b>✏️ New payment contact</b>\n\nSend a Telegram username (e.g. <code>@zammynn</code>) or a full payment link ` +
                 `(PayPal.me, bank link, etc).\n\nCurrent: ${PAY_CONTACT ? PAY_CONTACT.replace(/[<>&]/g, '') : '(not set)'}\n\n(/cancel to stop)`
         })
-      } else {
+      } else if (d === 'payset:price') {
         pq.awaitingPayPrice = true
         await saveUserQueue(actorId, pq)
         await tgCall('sendMessage', {
           chat_id: cbChat, parse_mode: 'HTML',
           text: `<b>✏️ New price</b>\n\nSend the price text to show people, e.g. <code>$1</code> or <code>£2.50</code>.\n\nCurrent: ${ACCESS_PRICE}\n\n(/cancel to stop)`
+        })
+      } else {
+        pq.awaitingTrialSize = true
+        await saveUserQueue(actorId, pq)
+        await tgCall('sendMessage', {
+          chat_id: cbChat, parse_mode: 'HTML',
+          text: `<b>✏️ Free searches per new account</b>\n\nSend a number, e.g. <code>2</code>.\n\nCurrent: ${TRIAL_SIZE}\n\n(/cancel to stop)`
         })
       }
       return res.status(200).send('OK')
@@ -1625,22 +1647,34 @@ module.exports = async (req, res) => {
     midFlowQueue.wizard
   ))
   if (!isOwner && !isAccessCmd && !midFlow && !doc) {
-    if (!PUBLIC_ACCESS) {
+    // A granted user (paid pass / one-time credit / own cookies) always gets through,
+    // whether or not PUBLIC_ACCESS is on — that toggle only governs whether a complete
+    // stranger with no grant at all can browse the free preview.
+    const baseCmd = text.split(/[\s@]/)[0].toLowerCase()
+    // A brand-new stranger's very first /find or /findco still needs to reach
+    // gateOwnerSession below — that's where the free trial actually gets granted,
+    // so auto-trial has to work even while the rest of the bot stays private.
+    const couldAutoTrial = AUTO_TRIAL && (baseCmd === '/find' || baseCmd === '/findco')
+    if (!PUBLIC_ACCESS && !hasAccess && !couldAutoTrial) {
       await send(chatId, 'Private bot.')
       return res.status(200).send('OK')
     }
-    const baseCmd = text.split(/[\s@]/)[0].toLowerCase()
     if (!text.startsWith('/')) {
       await send(chatId, 'Tap /start to open the menu 👇')
       return res.status(200).send('OK')
     }
     if (OWNER_SESSION_CMDS.includes(baseCmd)) {
-      // paid pass or own-cookies users get in; everyone else sees the access screen
+      // Still the precise per-tier check — a one-time credit only ever covers /find or
+      // /findco, never /scout, /fresh, etc., so this stays even for a hasAccess user.
       const whoName = [msg.from?.first_name, msg.from?.last_name, msg.from?.username ? '@' + msg.from.username : '']
         .filter(Boolean).join(' ')
       if (!(await gateOwnerSession(chatId, userId, baseCmd, whoName))) return res.status(200).send('OK')
-    } else if (!PUBLIC_CMDS.includes(baseCmd)) {
-      await tgCall('sendMessage', { chat_id: chatId, text: '🔒 That feature is owner-only for now. Tap below to see what you can use.',
+    } else if (!PUBLIC_CMDS.includes(baseCmd) && !hasAccess) {
+      // Not a free-tier command and this person has no grant at all -> locked.
+      // A granted user reaches everything else here (campaigns, leads, mark, black,
+      // others, audit...) — only the truly admin-only commands further down (grant,
+      // revoke, accesslist, pricing) still check isOwner on their own and stay closed.
+      await tgCall('sendMessage', { chat_id: chatId, text: '🔒 That feature needs access. Tap below to see how.',
         reply_markup: { inline_keyboard: [[B('🏠 Main menu', 'menu:main')]] } })
       return res.status(200).send('OK')
     }
@@ -1666,6 +1700,23 @@ module.exports = async (req, res) => {
       await tgCall('sendMessage', {
         chat_id: chatId, parse_mode: 'HTML',
         text: `✅ Payment contact updated to <b>${saved.replace(/[<>&]/g, '')}</b>. New access requests will point here.`,
+        reply_markup: { inline_keyboard: [[B('👥 Access requests', 'menu:accesslist')]] }
+      })
+      return res.status(200).send('OK')
+    }
+    if (pq.awaitingTrialSize) {
+      const n = parseInt(text.trim())
+      if (!n || n < 1 || n > 20) {
+        await send(chatId, 'Send a number from 1 to 20 — or /cancel.')
+        return res.status(200).send('OK')
+      }
+      await redis('SET', 'config:trial_size', String(n))
+      TRIAL_SIZE = n
+      pq.awaitingTrialSize = false
+      await saveUserQueue(userId, pq)
+      await tgCall('sendMessage', {
+        chat_id: chatId, parse_mode: 'HTML',
+        text: `✅ Free trial updated to <b>${n} search${n === 1 ? '' : 'es'}</b> per new account.`,
         reply_markup: { inline_keyboard: [[B('👥 Access requests', 'menu:accesslist')]] }
       })
       return res.status(200).send('OK')
@@ -1729,11 +1780,11 @@ module.exports = async (req, res) => {
   // ── /start, /menu, /help ──
   if (/^\/(start|menu)(@\w+)?(\s|$)/.test(text)) {
     if (isOwner) await registerCommands(chatId)     // makes "/" show the command list + Menu button
-    await showScreen(chatId, null, 'main', isOwner)
+    await showScreen(chatId, null, 'main', isOwner, hasAccess)
     return res.status(200).send('OK')
   }
   if (/^\/help(@\w+)?$/.test(text)) {
-    await showScreen(chatId, null, 'help', isOwner)
+    await showScreen(chatId, null, 'help', isOwner, hasAccess)
     return res.status(200).send('OK')
   }
 
@@ -1809,7 +1860,7 @@ module.exports = async (req, res) => {
     const q = await getUserQueue(userId)
     q.awaitingMessages = false; q.awaitingReviewCap = false; q.awaitingCompanyList = false
     q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false
-    q.awaitingPayContact = false; q.awaitingPayPrice = false
+    q.awaitingPayContact = false; q.awaitingPayPrice = false; q.awaitingTrialSize = false
     q.pendingFindJob = null; q.pending = []; q.results = []; q.messages = []
     await saveUserQueue(userId, q)
     await send(chatId, '🧹 Cleared. The bot is no longer waiting for anything — old scout results and pending batches were dropped.')
