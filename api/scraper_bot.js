@@ -191,6 +191,7 @@ module.exports = async (req, res) => {
   // The env vars above are only the very-first-run default.
   let AUTO_TRIAL = process.env.AUTO_TRIAL === 'true'
   let TRIAL_SIZE = parseInt(process.env.AUTO_TRIAL_SIZE || '2') || 2   // free searches per new account
+  const FREE_RESULT_CAP = parseInt(process.env.FREE_RESULT_CAP || '10') || 10   // max results per free (one-time) search
   async function loadPayConfig() {
     const [{ result: c }, { result: p }, { result: d }, { result: at }, { result: ts }] = await Promise.all([
       redis('GET', 'config:pay_contact'),
@@ -650,7 +651,15 @@ module.exports = async (req, res) => {
     // credit, or an auto-trial grant all borrow the owner's shared session instead —
     // that's the whole point of granting someone access rather than them uploading
     // their own cookies.
-    const useOwnCookies = (await tierOf(userId)) === 'byoc'
+    const tier = await tierOf(userId)
+    const useOwnCookies = tier === 'byoc'
+    // A free (one-time/trial) search is capped — unlimited use is what the paid
+    // pass is for.
+    let capped = false
+    if (tier === 'onetime' && companies.length > FREE_RESULT_CAP) {
+      companies = companies.slice(0, FREE_RESULT_CAP)
+      capped = true
+    }
     const payload = {
       type: 'discovery', chat_id: chatId, job_id: jobId, companies, max: 40,
       ...(useOwnCookies ? { user_id: userId } : {})
@@ -661,6 +670,8 @@ module.exports = async (req, res) => {
     const dispatched = await triggerGithubWorkflow()
     await send(chatId,
       `✅ Discovery job posted: ${label} (job ${jobId}).\n` +
+      (capped ? `🎟️ Free searches are capped at ${FREE_RESULT_CAP} companies — only the first ${FREE_RESULT_CAP} from your list are included. ` +
+                `Get a pass (/access) for the full list.\n` : '') +
       (dispatched
         ? `Triggered GitHub Actions immediately — should start within a minute or two.\n`
         : `Make sure the daemon is running, or wait for the next scheduled run.\n`) +
@@ -2265,10 +2276,19 @@ module.exports = async (req, res) => {
       // holder, a one-time credit, or an auto-trial grant all borrow the owner's shared
       // gm_cookies.json instead — that's the whole point of granting someone access
       // rather than them uploading their own.
-      const useOwnCookies = (await tierOf(userId)) === 'byoc'
+      const tier = await tierOf(userId)
+      const useOwnCookies = tier === 'byoc'
+      // A free (one-time/trial) search is capped — unlimited results is what the
+      // paid pass is for.
+      let count = job.count
+      let capped = false
+      if (tier === 'onetime' && count > FREE_RESULT_CAP) {
+        count = FREE_RESULT_CAP
+        capped = true
+      }
       const payload = {
         chat_id: chatId, city: job.city, niche: job.niche,
-        count: job.count, review_cap: reviewCap,
+        count, review_cap: reviewCap,
         sample_mode: !!job.sampleMode,
         include_seen: !!job.includeSeen,
         job_id: `find-${Date.now()}`,
@@ -2278,10 +2298,11 @@ module.exports = async (req, res) => {
       if (!queued) return res.status(200).send('OK')
       const dispatched = await triggerGithubWorkflow()
       await send(chatId,
-        `✅ Job posted: ${job.niche} in ${job.city} (max ${job.count}` +
+        `✅ Job posted: ${job.niche} in ${job.city} (max ${count}` +
         `${reviewCap ? `, review cap ${reviewCap}` : ', no review cap'}` +
         `${job.sampleMode ? ', SAMPLE mode' : ''}` +
         `${job.includeSeen ? ', including previously-seen' : ''})\n\n` +
+        (capped ? `🎟️ Free searches are capped at ${FREE_RESULT_CAP} results (you asked for ${job.count}) — get a pass (/access) for more.\n\n` : '') +
         (dispatched
           ? `Triggered GitHub Actions immediately — should start within a minute or two.\n`
           : `Make sure maps_daemon.py is running on your PC, or wait for the next scheduled GitHub Actions run.\n`) +
