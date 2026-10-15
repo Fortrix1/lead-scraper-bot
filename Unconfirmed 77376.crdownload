@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""web_discovery.py — contact-discovery engine (v3).
+
+For each company (typically pasted from /newuk), builds the fullest possible
+contact picture, in this order:
+
+  Phase C  Companies House (free official API)  -> company number (looked up
+           by name if the paste didn't include one), registered town, and
+           the CURRENT directors (the founders).
+  Phase A  Google web search, several angles     -> official website,
+           LinkedIn company page, every social profile, plus any emails /
+           phone numbers visible in result snippets, plus directory pages
+           that mention the company ("mentions").
+  Phase A2 Website crawl (no Google budget used)  -> emails, phones and
+           social links from the home / contact / about pages.
+  Phase B  Google Maps, searching JUST the name   -> phone, website, rating,
+           address. Falls back to name + town. A listing is only accepted if
+           its title actually matches the company name.
+  Phase D  Google search per director             -> personal LinkedIn,
+           Instagram, Facebook, X, TikTok. Each hit is marked verified
+           (company name appears next to the person) or possible.
+
+Everything is cached in SQLite for 30 days, progress checkpoints to Redis
+after every company, page navigations are counted against a shared hourly
+budget, and a CAPTCHA wall pauses the job instead of burning the list.
+Unfinished companies are automatically re-queued.
+
+Cookie setup (one-time / when Google logs you out):
+  Cookie-Editor extension -> export google.com cookies ->
+  cookies/google_cookies.json next to this script.
+"""
+
+import os
+import re
+import json
+import time
+import html
+import random
+import base64
+import sqlite3
+from datetime import datetime, timezone
+from urllib.parse import urlparse, quote_plus, parse_qs, unquote
+
+import requests
+from playwright.sync_api import sync_playwright
+
+# ------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------
+
+COOKIES_PATH = os.environ.get(
+    "GOOGLE_COOKIES_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "cookies", "google_cookies.json"),
+)
+DB_PATH = os.environ.get(
+    "DISCOVERY_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "discovery_cache.db"),
+)
+COMPANIES_HOUSE_API_KEY = os.environ.get("COMPANIES_HOUSE_API_KEY", "")
+
+CACHE_VERSION = 4          # bump to invalidate old (thinner) cached results
+
+# Page navigations per hour across ALL runners (PC + GitHub Actions).
+# A full company costs roughly 6-10 navigations, so 150/h ~ 15-25 companies/h.
+MAX_NAVS_PER_HOUR = int(os.environ.get("DISCOVERY_NAVS_PER_HOUR", "150"))
+REDIS_RL_KEY = "disc:rl:hour"
+# Budgets are per session owner: a BYOC user's searches can never eat the
+# owner's shared-session budget (and vice versa). Set per job in process_job.
+_SCOPE = "owner"
+REDIS_PROGRESS_PREFIX = "disc:progress:"
+
+CACHE_TTL_DAYS = 30
+MIN_DELAY, MAX_DELAY = 3, 7
+MAX_DIRECTORS = 3                  # directors searched per company
+MAX_WEB_QUERIES = 4                # Google web queries per company
+MAX_PERSON_QUERIES = 3             # Google queries per director
+MAX_RUN_SECONDS = int(os.environ.get("DISCOVERY_MAX_RUN_SECONDS", str(20 * 60)))
+
+JUNK_DOMAINS = [
+    "facebook.com", "instagram.com", "twitter.com", "x.com", "linkedin.com",
+    "youtube.c

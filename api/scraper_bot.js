@@ -30,7 +30,7 @@ module.exports = async (req, res) => {
   const CONCURRENCY = 4
 
   const SAVED_SEARCHES = {
-    '1': { label: 'All myshopify.com (newest first)', query: 'page.domain:myshopify.com' },
+    '1': { label: 'All Shopify stores (newest first)', query: 'page.domain:myshopify.com' },
     '2': { label: 'Skincare/beauty niche',            query: 'page.domain:myshopify.com AND page.title:(skincare OR beauty OR cosmetics)' },
     '3': { label: 'Jewelry niche',                     query: 'page.domain:myshopify.com AND page.title:jewelry' },
     '4': { label: 'Pet products niche',                query: 'page.domain:myshopify.com AND page.title:pet' },
@@ -193,7 +193,8 @@ module.exports = async (req, res) => {
   // Pay contact/price/pass-length are owner-editable from inside the bot (🧰 Tools →
   // 👥 Access requests) — stored in Redis so no Vercel redeploy is ever needed.
   // The env vars above are only the very-first-run default.
-  let AUTO_TRIAL = process.env.AUTO_TRIAL === 'true'
+  // ON by default now — set AUTO_TRIAL=false in Vercel to switch the free trial off.
+  let AUTO_TRIAL = process.env.AUTO_TRIAL !== 'false'
   let TRIAL_SIZE = parseInt(process.env.AUTO_TRIAL_SIZE || '2') || 2   // free searches per new account
   const FREE_RESULT_CAP = parseInt(process.env.FREE_RESULT_CAP || '10') || 10   // max results per free (one-time) search
   const DAILY_RESULT_CAP = parseInt(process.env.DAILY_RESULT_CAP || '5') || 5   // max results for the ongoing once-a-day free search
@@ -360,27 +361,26 @@ module.exports = async (req, res) => {
     }
     if (status.startsWith('No access') && ck.present) {
       status = ck.fresh
-        ? `Your own cookies are on file (freshest expires ${new Date(ck.expires * 1000).toISOString().slice(0, 10)}).`
-        : 'Your saved cookies have expired — re-send the file to refresh.'
+        ? `Your own connection is active (refreshes until ${new Date(ck.expires * 1000).toISOString().slice(0, 10)}).`
+        : 'Your connection has expired — re-send your session file to refresh.'
     }
     const kb = []
-    if (PAYMENT_LINK) kb.push([B(`💳 Get a ${PASS_DAYS}-day pass (${ACCESS_PRICE})`, 'pay:request')])
-    kb.push([B('🍪 Use my own Google cookies (free)', 'pay:byoc')])
+    if (PAYMENT_LINK) kb.push([B(`💳 Go unlimited — ${PASS_DAYS} days (${ACCESS_PRICE})`, 'pay:request')])
+    kb.push([B('🔌 Connect my own account (free)', 'pay:byoc')])
     kb.push([B('🏠 Main menu', 'menu:main')])
     await tgCall('sendMessage', {
       chat_id: chatId, parse_mode: 'HTML',
       text:
-        `<b>🔒 This feature runs on a logged-in Google session</b>\n\n` +
-        `Ways in:\n` +
-        (AUTO_TRIAL ? `🎁 Brand new? Just try /find, /findco or /scout — you get ${TRIAL_SIZE} free search${TRIAL_SIZE === 1 ? '' : 'es'} ` +
-                      `(max ${FREE_RESULT_CAP} results each) automatically, no asking needed. After that, one free search a ` +
-                      `day (max ${DAILY_RESULT_CAP} results), forever. ${RESULTS_ARE_YOURS_LINE}\n\n` : '') +
-        `1️⃣ Pay ${ACCESS_PRICE} → a ${PASS_DAYS}-day pass on the shared session, no result caps\n` +
+        `<b>💎 This feature is part of the full version</b>\n\n` +
+        (AUTO_TRIAL ? `🎁 Free plan: your first ${TRIAL_SIZE} searches are on us (up to ${FREE_RESULT_CAP} fresh results each) — ` +
+                      `no card and no request needed, just run /find, /findco or /scout. After that you get one free ` +
+                      `search every day (up to ${DAILY_RESULT_CAP} results), forever. ${RESULTS_ARE_YOURS_LINE}\n\n` : '') +
+        `To unlock everything:\n` +
+        `1️⃣ ${PASS_DAYS}-day all-access pass — ${ACCESS_PRICE}, every feature, no result caps\n` +
         `2️⃣ Ask the owner for extra one-time searches\n` +
-        `3️⃣ Upload your own google.com cookies (free, your own limits) — export with the ` +
-        `Cookie-Editor extension while logged into google.com, then send the .json file here\n\n` +
-        `Only one search runs at a time on the shared session, so if you're not first in line ` +
-        `I'll tell you your place in the queue and message you the moment yours starts.\n\n` +
+        `3️⃣ Connect your own account (free) and search on your own private connection\n\n` +
+        `Searches run one at a time so every result stays accurate — if there's a line, ` +
+        `I'll hold your spot and message you the moment yours starts.\n\n` +
         `<b>Your status:</b> ${status}`,
       reply_markup: { inline_keyboard: kb }
     })
@@ -474,7 +474,7 @@ module.exports = async (req, res) => {
       if (position > 1) {
         await send(chatId,
           `🔎 You're #${position} in line (${position - 1} request${position - 1 === 1 ? '' : 's'} ahead of you${description ? ' — ' + description : ''}). ` +
-          `Only one search runs at a time on the shared session — I'll message you the moment yours starts.`)
+          `Only one search runs at a time so results stay accurate — I'll message you the moment yours starts.`)
       } else {
         await send(chatId, `🔎 You're next in line${description ? ' — ' + description : ''} — should start within a minute or two.`)
       }
@@ -753,12 +753,11 @@ module.exports = async (req, res) => {
       (capped ? `🎟️ You're on the free trial — capped at ${cap} companies per search, so only the first ${cap} from your list are included. ` +
                 `${tier === 'daily' ? RESULTS_ARE_YOURS_LINE + ' ' : ''}Get a pass (/access) for the full list.\n` : '') +
       (dispatched
-        ? `Triggered the runner immediately — should start within a minute or two.\n`
-        : `The runner picks this up on its next scheduled pass.\n`) +
-      `⏱️ Give it a few minutes per company (~15–25/hour) — everything is looked up live and fresh: the official ` +
-      `registry, Google, their website, Google Maps, and each director's LinkedIn/socials. Nothing from a stale database.\n` +
-      `Per company: Companies House directors → Google (name, town, contact, socials) → their website → Maps (name only) → each director on Google/LinkedIn. ` +
-      `~15-25 companies/hour (shared Google budget), cached 30 days; leftovers resume automatically. Results arrive here as they're found.`)
+        ? `⚡ Starting now — first results land here within a couple of minutes.\n`
+        : `⏳ Queued — it starts automatically on the next pass.\n`) +
+      `⏱️ Give it a few minutes per company (~15-25/hour) — each one gets a full live profile built from scratch: ` +
+      `the people behind the company, their website, phone and location, socials, and the best way to reach them. ` +
+      `Nothing comes from a stale database; leftovers continue automatically and results arrive here as they're found.`)
   }
 
   async function getSpeedIndexSeconds(url) {
@@ -1168,7 +1167,7 @@ module.exports = async (req, res) => {
         return {
           text:
             `<b>🇬🇧 New UK Companies</b>\n\n` +
-            `<b>What it does:</b> pulls brand-new companies from Companies House, the official UK register. Free and 100% real.\n\n` +
+            `<b>What it does:</b> pulls brand-new companies straight from the official UK company register. Free and 100% real.\n\n` +
             `<b>Why it's useful:</b> a company this new has no suppliers, website or marketing yet — the perfect moment to pitch it.\n\n` +
             `<b>Pick how far back to look</b> (more days = bigger list):`,
           kb: [
@@ -1187,7 +1186,7 @@ module.exports = async (req, res) => {
             `1️⃣ Get a list from 🇬🇧 New UK Companies\n` +
             `2️⃣ Tap ▶️ Start below\n` +
             `3️⃣ Copy that whole list and paste it here\n\n` +
-            `<b>For each company I check:</b> its directors (the founders) → Google → its website → Google Maps → each director's LinkedIn, Instagram and Facebook.\n\n` +
+            `<b>For each company I check:</b> the people behind it (the founders) → their website → their business listing → each person's LinkedIn, Instagram and Facebook.\n\n` +
             `⏱ Roughly 15–25 companies per hour. Results arrive here as they're found; anything left continues automatically.\n\n` +
             `💡 A company only a day old often has nothing online yet. When that happens, the directors' profiles are your best lead.`,
           kb: [
@@ -1200,7 +1199,7 @@ module.exports = async (req, res) => {
         return {
           text:
             `<b>🗺️ Local Businesses</b>\n\n` +
-            `Finds real businesses in any city from Google Maps — restaurants, salons, gyms, car repair, real estate — with phone, website and email when available. You get a .txt report.\n\n` +
+            `Finds real businesses in any city — restaurants, salons, gyms, car repair, real estate — with phone, website and email when available. You get a .txt report.\n\n` +
             `Tap Start and I'll ask 3 quick questions:\n` +
             `<b>city → type of business → how many</b>\n\n` +
             `Good to know: every run is fresh — businesses you already have are skipped.`,
@@ -1281,7 +1280,7 @@ module.exports = async (req, res) => {
             `/start — main menu\n` +
             `/newuk [days] [count] — new UK companies\n` +
             `/findco — find contacts for a pasted company list\n` +
-            `/find &lt;city&gt; &lt;niche&gt; [count] — Google Maps businesses\n` +
+            `/find &lt;city&gt; &lt;niche&gt; [count] — local businesses\n` +
             `/scout — search Shopify stores\n` +
             `/fresh [age_days] [count] — watch for new Shopify stores\n` +
             `/freshoff — stop watching\n` +
@@ -1416,7 +1415,7 @@ module.exports = async (req, res) => {
     const all = [
       ['start', '🏠 Open the main menu'], ['menu', '🏠 Main menu'], ['help', '❓ How this bot works'],
       ['newuk', '🇬🇧 New UK companies'], ['findco', '🕵️ Find contacts for companies'],
-      ['find', '🗺️ Local businesses (Google Maps)'], ['scout', '🛍️ Search Shopify stores'],
+      ['find', '🗺️ Local businesses'], ['scout', '🛍️ Search Shopify stores'],
       ['fresh', '🌱 Watch for brand-new stores'], ['freshoff', '🛑 Stop watching new stores'],
       ['campaigns', '📋 Your campaigns'], ['leads', '📂 Leads by status'], ['mark', '✅ Update a lead\'s status'],
       ['others', '🚫 Blacklisted links'], ['black', '🔒 Add to blacklist'], ['scoutlist', '🕵️ Scan a domain list'],
@@ -1536,14 +1535,13 @@ module.exports = async (req, res) => {
       await tgCall('sendMessage', {
         chat_id: cbChat, parse_mode: 'HTML',
         text:
-          `<b>🍪 Bring your own session (free)</b>\n\n` +
-          `1. In Chrome, log into <b>your</b> Google account and open google.com\n` +
-          `2. Install the <b>Cookie-Editor</b> extension\n` +
-          `3. Click Export — it copies the cookies JSON to your clipboard\n` +
-          `4. Paste into a file named <code>cookies.json</code> and send it here as a document\n\n` +
-          `From then on, /findco and /find run with YOUR cookies and YOUR limits — ` +
-          `the shared session is never touched. Re-send the file anytime to refresh ` +
-          `(Google kills sessions every few weeks).`
+          `<b>🔌 Connect your own account (free)</b>\n\n` +
+          `1. In your browser, log into the account you normally search with\n` +
+          `2. Export your session file with any cookie-export extension and save it as <code>cookies.json</code>\n` +
+          `3. Send the file here as a document\n\n` +
+          `From then on, your searches run privately through your own connection with your own ` +
+          `limits — the shared one is never touched. Re-send the file anytime to refresh ` +
+          `(sessions expire every few weeks).`
       })
       return res.status(200).send('OK')
     }
@@ -2421,11 +2419,11 @@ module.exports = async (req, res) => {
                   `so this run returns ${cap}. ${tier === 'daily' ? RESULTS_ARE_YOURS_LINE + ' ' : ''}` +
                   `Get a pass (/access) for unlimited runs and bigger batches.\n\n` : '') +
         (dispatched
-          ? `Triggered the runner immediately — should start within a minute or two.\n`
-          : `The runner picks this up on its next scheduled pass.\n`) +
-        `\n⏱️ Give it a few minutes — every lead is scraped live, right now, just for you. ` +
-        `Nothing is served from an old database: each business is pulled fresh from Google Maps, ` +
-        `then its real website is opened and checked for email, booking, socials and speed, one by one. ` +
+          ? `⚡ Starting now — first results land here within a couple of minutes.\n`
+          : `⏳ Queued — it starts automatically on the next pass.\n`) +
+        `\n⏱️ Give it a few minutes — every lead is gathered live, right now, just for you. ` +
+        `Nothing is served from an old database: each business is found fresh, then its real website is ` +
+        `opened and checked for email, booking, socials and speed, one by one. ` +
         `Results land here in batches, plus downloadable .txt/.html reports at the end.`
       )
       return res.status(200).send('OK')
@@ -2482,9 +2480,9 @@ module.exports = async (req, res) => {
         await redis('SET', `cookies:${userId}:meta`, JSON.stringify({
           saved_at: Math.floor(Date.now() / 1000), expires: exp, count: arr.length }))
         await send(chatId,
-          `🍪 Cookies saved — /findco and /find will now run with YOUR OWN Google session.\n` +
-          `${arr.length} cookies, freshest expires ${exp ? new Date(exp * 1000).toISOString().slice(0, 10) : 'unknown'}.\n\n` +
-          `Re-send this file anytime to refresh (Google kills sessions every few weeks). Send /access to check status.`)
+          `🔌 Your own connection is saved — /findco and /find now run privately through your account.\n` +
+          `${arr.length} session entries, active until ${exp ? new Date(exp * 1000).toISOString().slice(0, 10) : 'unknown'}.\n\n` +
+          `Re-send this file anytime to refresh (sessions expire every few weeks). Send /access to check status.`)
         return res.status(200).send('OK')
       }
       const extraBlacklistSet = await getExtraBlacklistSet()

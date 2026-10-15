@@ -1181,7 +1181,7 @@ def process_job(data):
     campaign = f"{niche.replace('_', ' ').title()} — {city.title()}"
 
     print(f"  Job: {niche} in {city} (max {count}, cap {review_cap}, sample={sample_mode}, rescan={include_seen})")
-    send_telegram(chat_id, f"🗺️ Scraping Google Maps for {niche} in {city} — up to {count} leads. This takes a while...")
+    send_telegram(chat_id, f"🔎 Searching live for {niche} in {city} — up to {count} fresh leads. Give it a few minutes; every business is checked one by one just for you.")
 
     # A non-owner job must run with the CALLER's own cookies, never the
     # owner's session — their BYOC cookies were stored on the bot side at
@@ -1192,7 +1192,7 @@ def process_job(data):
     if uid:
         raw_cookies = redis_get(f"cookies:{uid}:google")
         if not raw_cookies:
-            send_telegram(chat_id, "⚠️ Your saved Google cookies are missing — send your cookies.json file to the bot again, then re-run /find.")
+            send_telegram(chat_id, "⚠️ Your saved session file is missing — send it to the bot again, then re-run /find.")
             return
         cookie_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    f"gm_cookies_{uid}.json")
@@ -1203,8 +1203,8 @@ def process_job(data):
                              include_seen=include_seen, cookie_path=cookie_path)
     if not raw:
         send_telegram(chat_id,
-            f"No leads collected for {niche} in {city} — either blocked (check the Actions log for "
-            f"a CAPTCHA message) or everything in range was already scraped. Try again later, "
+            f"No leads collected for {niche} in {city} — either the live search was interrupted "
+            f"or everything in range was already gathered. Try again later, "
             f"another city, or add 'rescan'.")
         return
 
