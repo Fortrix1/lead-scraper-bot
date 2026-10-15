@@ -1141,7 +1141,16 @@ module.exports = async (req, res) => {
   // "is the free preview switched on." A granted user is never blocked by
   // PUBLIC_ACCESS being off, and never sees a 🔒 on something they can use.
   const actorTier = isOwner ? 'owner' : await tierOf(actorId)
-  const hasAccess = isOwner || actorTier !== 'none'
+  // The bot is open to everyone by default — nobody has to request access or
+  // upload cookies just to reach the menu or try /find, /findco, /scout. The
+  // ACTUAL enforcement (2 lifetime free searches, then 1/day, caps, and the
+  // lock once that's used up) still lives entirely in gateOwnerSession below,
+  // which checks actorTier directly — that logic is unchanged. This flag only
+  // ever controlled whether someone could REACH a command at all, not what
+  // they're allowed to do once there, so opening it up here doesn't loosen
+  // any of the trial/daily/cap rules — it just removes a second, separate
+  // wall that used to sit in front of all of them.
+  const hasAccess = true
 
   const B = (text, data) => ({ text, callback_data: data })
 
