@@ -178,6 +178,10 @@ module.exports = async (req, res) => {
   let PAY_CONTACT = process.env.PAY_CONTACT || ''     // e.g. "@zammynn" or a full payment link
   let PAYMENT_LINK = process.env.PAYMENT_LINK || ''   // legacy raw-URL env var, still honoured
   const OWNER_SESSION_CMDS = ['/find', '/findco', '/scout', '/fresh', '/freshoff', '/scoutlist', '/autopitch']
+  // Of those, only these three are bounded, one-shot searches a free credit can safely
+  // cover — /fresh turns on INDEFINITE background monitoring (not a search that finishes),
+  // /freshoff/scoutlist/autopitch stay paid/owner-only too.
+  const FREE_TIER_CMDS = ['/find', '/findco', '/scout']
 
   // "@name" -> a clickable t.me link; a full URL is used as-is.
   function payUrlFrom(contact) {
@@ -192,6 +196,22 @@ module.exports = async (req, res) => {
   let AUTO_TRIAL = process.env.AUTO_TRIAL === 'true'
   let TRIAL_SIZE = parseInt(process.env.AUTO_TRIAL_SIZE || '2') || 2   // free searches per new account
   const FREE_RESULT_CAP = parseInt(process.env.FREE_RESULT_CAP || '10') || 10   // max results per free (one-time) search
+  const DAILY_RESULT_CAP = parseInt(process.env.DAILY_RESULT_CAP || '5') || 5   // max results for the ongoing once-a-day free search
+  const RESULTS_ARE_YOURS_LINE =
+    `🔥 These are pulled live, right now, just for you — nobody else gets your run, and tomorrow's pull is a whole new batch.`
+  // UTC calendar date, e.g. "2026-10-15" — the daily free search resets at midnight UTC,
+  // not the person's local time.
+  function todayKey() {
+    return new Date().toISOString().slice(0, 10)
+  }
+
+  // A free-tier user picking "50" would just get silently capped anyway — showing
+  // the real number up front is more honest than offering choices that don't apply.
+  function countButtons(tier) {
+    if (tier === 'daily') return [[B(`🎁 Free search (${DAILY_RESULT_CAP})`, `wiz:count:${DAILY_RESULT_CAP}`)]]
+    if (tier === 'onetime') return [[B(`🎁 Free search (${FREE_RESULT_CAP})`, `wiz:count:${FREE_RESULT_CAP}`)]]
+    return [[B('10', 'wiz:count:10'), B('20', 'wiz:count:20'), B('50', 'wiz:count:50')]]
+  }
   async function loadPayConfig() {
     const [{ result: c }, { result: p }, { result: d }, { result: at }, { result: ts }] = await Promise.all([
       redis('GET', 'config:pay_contact'),
@@ -267,6 +287,16 @@ module.exports = async (req, res) => {
     if (isOwner) return 'owner'
     if ((await passInfo(userId)).valid) return 'paid'
     if ((await oneTimeInfo(userId)).remaining > 0) return 'onetime'
+    // Once someone's used up their lifetime trial, they graduate to one free
+    // /find or /findco a day (capped at DAILY_RESULT_CAP) for as long as the
+    // owner keeps the free program (AUTO_TRIAL) switched on.
+    if (AUTO_TRIAL) {
+      const { result: everUsed } = await redis('GET', `trial:used:${userId}`)
+      if (everUsed) {
+        const { result: usedToday } = await redis('GET', `daily:used:${userId}:${todayKey()}`)
+        if (!usedToday) return 'daily'
+      }
+    }
     if ((await cookieInfo(userId)).fresh) return 'byoc'
     return 'none'
   }
@@ -314,12 +344,25 @@ module.exports = async (req, res) => {
     const pass = await passInfo(userId)
     const ot = await oneTimeInfo(userId)
     const ck = await cookieInfo(userId)
-    let status = 'No access yet.'
-    if (pass.valid) status = `Paid pass active until ${new Date(pass.expires).toISOString().slice(0, 10)}.`
-    else if (ot.remaining > 0) status = `🎟️ ${ot.remaining} one-time search${ot.remaining === 1 ? '' : 'es'} available (covers /find or /findco).`
-    else if (ck.present) status = ck.fresh
-      ? `Your own cookies are on file (freshest expires ${new Date(ck.expires * 1000).toISOString().slice(0, 10)}).`
-      : 'Your saved cookies have expired — re-send the file to refresh.'
+    let status = `No access yet${AUTO_TRIAL ? ' — try /find or /findco to start your free trial' : ''}.`
+    if (pass.valid) {
+      status = `Paid pass active until ${new Date(pass.expires).toISOString().slice(0, 10)}.`
+    } else if (ot.remaining > 0) {
+      status = `🎟️ ${ot.remaining} free search${ot.remaining === 1 ? '' : 'es'} left (covers /find, /findco or /scout, max ${FREE_RESULT_CAP} results each).`
+    } else if (AUTO_TRIAL) {
+      const { result: everUsed } = await redis('GET', `trial:used:${userId}`)
+      if (everUsed) {
+        const { result: usedToday } = await redis('GET', `daily:used:${userId}:${todayKey()}`)
+        status = usedToday
+          ? `⏳ Today's free search is used — resets at midnight UTC.`
+          : `🎁 Your free daily search is ready — /find, /findco or /scout, max ${DAILY_RESULT_CAP} results.`
+      }
+    }
+    if (status.startsWith('No access') && ck.present) {
+      status = ck.fresh
+        ? `Your own cookies are on file (freshest expires ${new Date(ck.expires * 1000).toISOString().slice(0, 10)}).`
+        : 'Your saved cookies have expired — re-send the file to refresh.'
+    }
     const kb = []
     if (PAYMENT_LINK) kb.push([B(`💳 Get a ${PASS_DAYS}-day pass (${ACCESS_PRICE})`, 'pay:request')])
     kb.push([B('🍪 Use my own Google cookies (free)', 'pay:byoc')])
@@ -329,8 +372,11 @@ module.exports = async (req, res) => {
       text:
         `<b>🔒 This feature runs on a logged-in Google session</b>\n\n` +
         `Ways in:\n` +
-        `1️⃣ Pay ${ACCESS_PRICE} → a ${PASS_DAYS}-day pass on the shared session\n` +
-        `2️⃣ Ask the owner for a one-time search — covers exactly one /find or /findco run\n` +
+        (AUTO_TRIAL ? `🎁 Brand new? Just try /find, /findco or /scout — you get ${TRIAL_SIZE} free search${TRIAL_SIZE === 1 ? '' : 'es'} ` +
+                      `(max ${FREE_RESULT_CAP} results each) automatically, no asking needed. After that, one free search a ` +
+                      `day (max ${DAILY_RESULT_CAP} results), forever. ${RESULTS_ARE_YOURS_LINE}\n\n` : '') +
+        `1️⃣ Pay ${ACCESS_PRICE} → a ${PASS_DAYS}-day pass on the shared session, no result caps\n` +
+        `2️⃣ Ask the owner for extra one-time searches\n` +
         `3️⃣ Upload your own google.com cookies (free, your own limits) — export with the ` +
         `Cookie-Editor extension while logged into google.com, then send the .json file here\n\n` +
         `Only one search runs at a time on the shared session, so if you're not first in line ` +
@@ -346,8 +392,11 @@ module.exports = async (req, res) => {
     if (isOwner) return true
     const tier = await tierOf(userId)
     if (tier === 'paid' || tier === 'byoc') return true
-    if (tier === 'onetime' && (cmdBase === '/find' || cmdBase === '/findco')) return true
-    if (tier === 'none' && AUTO_TRIAL && (cmdBase === '/find' || cmdBase === '/findco')) {
+    // The lifetime trial and the once-a-day follow-on both only ever cover /find and
+    // /findco — never /scout, /fresh (which turns on INDEFINITE background monitoring,
+    // not a bounded search), /freshoff, /scoutlist or /autopitch. Those stay paid/owner-only.
+    if ((tier === 'onetime' || tier === 'daily') && FREE_TIER_CMDS.includes(cmdBase)) return true
+    if (tier === 'none' && AUTO_TRIAL && FREE_TIER_CMDS.includes(cmdBase)) {
       // One free search per Telegram account, ever — trial:used is permanent, so
       // flipping auto-trial off/on or even revoking someone never hands out a second.
       const { result: used } = await redis('GET', `trial:used:${userId}`)
@@ -355,8 +404,17 @@ module.exports = async (req, res) => {
         await grantOneTime(userId, TRIAL_SIZE, who || '')
         await redis('SET', `trial:used:${userId}`, '1')
         await send(chatId, `🎁 You've got ${TRIAL_SIZE} free search${TRIAL_SIZE === 1 ? '' : 'es'} on the house — go ahead, ` +
-          `each covers one /find or /findco run. After that you'll need a pass or another grant.`)
+          `each covers one /find, /findco or /scout run (max ${FREE_RESULT_CAP} results). After that you'll get one free ` +
+          `search a day instead (max ${DAILY_RESULT_CAP} results), or get a pass for unlimited. ${RESULTS_ARE_YOURS_LINE}`)
         return true
+      }
+      // Already had the lifetime trial — are they just between daily uses?
+      const { result: usedToday } = await redis('GET', `daily:used:${userId}:${todayKey()}`)
+      if (usedToday) {
+        await send(chatId,
+          `⏳ You've already used today's free search (${DAILY_RESULT_CAP} results, /find, /findco or /scout). ` +
+          `One free shot per account per day — resets at midnight UTC. Grab a pass for unlimited any time: /access`)
+        return false
       }
     }
     await sendAccessScreen(chatId, userId)
@@ -366,6 +424,34 @@ module.exports = async (req, res) => {
   // One shared Google session -> one job at a time. This both stops a person
   // flooding the queue with several requests and gives everyone a straight
   // answer: their place in line, and a ping the moment their turn comes.
+  // Spends one unit of free access at the exact moment a search actually runs —
+  // not just when the command starts — so an abandoned flow never burns a credit.
+  // Shared by every FREE_TIER_CMDS entry: /find and /findco spend it right before
+  // queueing (queueJob below); /scout, which never touches the job queue at all,
+  // spends it right before its own search actually executes.
+  async function spendFreeCredit(chatId, tier, userId) {
+    if (tier === 'onetime') {
+      const { result } = await redis('DECRBY', `onetime:${userId}`, '1')
+      if ((parseInt(result) || 0) < 0) {
+        await redis('SET', `onetime:${userId}`, '0')
+        await send(chatId, `Your one-time search credit has already been used. Send /access to see other ways in.`)
+        return false
+      }
+      return true
+    }
+    if (tier === 'daily') {
+      // Atomic claim via SET...NX: two near-simultaneous taps can't both slip
+      // through and double-spend the same day's single free use.
+      const { result: claimed } = await redis('SET', `daily:used:${userId}:${todayKey()}`, '1', 'NX', 'EX', '172800')
+      if (claimed !== 'OK') {
+        await send(chatId, `Your free daily search was just used — come back tomorrow, or grab a pass: /access`)
+        return false
+      }
+      return true
+    }
+    return true   // owner / paid / byoc -> nothing to spend
+  }
+
   async function queueJob(chatId, userId, payload, description) {
     const ownerRunning = !ADMIN_ID || userId === ADMIN_ID
     if (!ownerRunning) {
@@ -377,14 +463,7 @@ module.exports = async (req, res) => {
         return false
       }
       const tier = await tierOf(userId)
-      if (tier === 'onetime') {
-        const { result } = await redis('DECRBY', `onetime:${userId}`, '1')
-        if ((parseInt(result) || 0) < 0) {
-          await redis('SET', `onetime:${userId}`, '0')
-          await send(chatId, `Your one-time search credit has already been used. Send /access to see other ways in.`)
-          return false
-        }
-      }
+      if (!(await spendFreeCredit(chatId, tier, userId))) return false
     }
     if (!payload.job_id) payload.job_id = `job-${Date.now()}`
     await redis('RPUSH', 'jobs:find', JSON.stringify(payload))
@@ -653,11 +732,12 @@ module.exports = async (req, res) => {
     // their own cookies.
     const tier = await tierOf(userId)
     const useOwnCookies = tier === 'byoc'
-    // A free (one-time/trial) search is capped — unlimited use is what the paid
-    // pass is for.
+    // A free search (lifetime trial, or the once-a-day follow-on) is capped —
+    // unlimited is what the paid pass is for.
+    const cap = tier === 'onetime' ? FREE_RESULT_CAP : tier === 'daily' ? DAILY_RESULT_CAP : null
     let capped = false
-    if (tier === 'onetime' && companies.length > FREE_RESULT_CAP) {
-      companies = companies.slice(0, FREE_RESULT_CAP)
+    if (cap && companies.length > cap) {
+      companies = companies.slice(0, cap)
       capped = true
     }
     const payload = {
@@ -670,8 +750,8 @@ module.exports = async (req, res) => {
     const dispatched = await triggerGithubWorkflow()
     await send(chatId,
       `✅ Discovery job posted: ${label} (job ${jobId}).\n` +
-      (capped ? `🎟️ Free searches are capped at ${FREE_RESULT_CAP} companies — only the first ${FREE_RESULT_CAP} from your list are included. ` +
-                `Get a pass (/access) for the full list.\n` : '') +
+      (capped ? `🎟️ Free searches are capped at ${cap} companies — only the first ${cap} from your list are included. ` +
+                `${tier === 'daily' ? RESULTS_ARE_YOURS_LINE + ' ' : ''}Get a pass (/access) for the full list.\n` : '') +
       (dispatched
         ? `Triggered GitHub Actions immediately — should start within a minute or two.\n`
         : `Make sure the daemon is running, or wait for the next scheduled run.\n`) +
@@ -1271,7 +1351,8 @@ module.exports = async (req, res) => {
       `💳 Price shown to people: <b>${ACCESS_PRICE}</b>\n` +
       `📇 Payment contact: <b>${PAY_CONTACT ? PAY_CONTACT.replace(/[<>&]/g, '') : '(not set — tap below to add one)'}</b>\n` +
       `⏳ Pass length: ${PASS_DAYS} days · 🎟️ one-time credit covers 1 search\n` +
-      `🎁 Free trial (${TRIAL_SIZE} search${TRIAL_SIZE === 1 ? '' : 'es'}/account, automatic): <b>${AUTO_TRIAL ? 'ON' : 'OFF'}</b>\n`
+      `🎁 Free trial (${TRIAL_SIZE} search${TRIAL_SIZE === 1 ? '' : 'es'}/account, max ${FREE_RESULT_CAP} results each, automatic): <b>${AUTO_TRIAL ? 'ON' : 'OFF'}</b>\n` +
+      `📅 After that, free daily search: max ${DAILY_RESULT_CAP} results, once per account per day, same ${AUTO_TRIAL ? 'ON' : 'OFF'} switch, resets midnight UTC\n`
     const kb = []
     if (pending.length) {
       text += `\n<b>⏳ Pending (${pending.length})</b>\n`
@@ -1390,7 +1471,7 @@ module.exports = async (req, res) => {
         await saveUserQueue(actorId, wq)
         await tgCall('sendMessage', { chat_id: cbChat, parse_mode: 'HTML',
           text: `<b>🗺️ Step 3 of 3 — How many?</b>\n\n${wq.wizard.niche.replace(/_/g, ' ')} in ${wq.wizard.city}`,
-          reply_markup: { inline_keyboard: [[B('10', 'wiz:count:10'), B('20', 'wiz:count:20'), B('50', 'wiz:count:50')]] } })
+          reply_markup: { inline_keyboard: countButtons(actorTier) } })
         return res.status(200).send('OK')
       }
       if (parts[1] === 'count' && wq.wizard && wq.wizard.city && wq.wizard.niche) {
@@ -1577,8 +1658,10 @@ module.exports = async (req, res) => {
     await redis('RPUSH', 'audit:commands', JSON.stringify({ ts: new Date().toISOString(), user: cbUserId, text: '/cb ' + data.slice(0, 90) }))
     await redis('LTRIM', 'audit:commands', 0, 499)
 
-    // Admin lock
-    if (ADMIN_ID && cbUserId !== ADMIN_ID) {
+    // This block is the /scout flow only — same access rule as everywhere else:
+    // owner always in, anyone else needs an actual tier (paid/trial/daily/byoc),
+    // independent of whether PUBLIC_ACCESS happens to be on.
+    if (!isOwner && !hasAccess) {
       await send(cbChatId, 'Private bot.')
       return res.status(200).send('OK')
     }
@@ -1598,6 +1681,13 @@ module.exports = async (req, res) => {
         if (search.isDirectList) {
           const batchLinks = search.rawLinks.slice(0, search.wantCount)
           return await startBatchJob(cbChatId, cbUserId, batchLinks, search.label, null, null, includeLocked)
+        }
+        // /scout doesn't go through the shared job queue (it runs right here, hitting
+        // URLScan.io directly) — so this is the actual "the search is happening now"
+        // moment, same role as queueJob plays for /find and /findco.
+        if (!isOwner) {
+          const scoutTier = await tierOf(cbUserId)
+          if (!(await spendFreeCredit(cbChatId, scoutTier, cbUserId))) return res.status(200).send('OK')
         }
         return await startScoutJob(cbChatId, cbUserId, search.query, search.label, search.wantCount, includeLocked)
       }
@@ -1667,7 +1757,7 @@ module.exports = async (req, res) => {
     // A brand-new stranger's very first /find or /findco still needs to reach
     // gateOwnerSession below — that's where the free trial actually gets granted,
     // so auto-trial has to work even while the rest of the bot stays private.
-    const couldAutoTrial = AUTO_TRIAL && (baseCmd === '/find' || baseCmd === '/findco')
+    const couldAutoTrial = AUTO_TRIAL && FREE_TIER_CMDS.includes(baseCmd)
     if (!PUBLIC_ACCESS && !hasAccess && !couldAutoTrial) {
       await send(chatId, 'Private bot.')
       return res.status(200).send('OK')
@@ -1780,7 +1870,7 @@ module.exports = async (req, res) => {
             await saveUserQueue(userId, wq)
             await tgCall('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
               text: `<b>🗺️ Step 3 of 3 — How many?</b>\n\n${wq.wizard.niche} in ${wq.wizard.city.replace(/[<>&]/g, '')}`,
-              reply_markup: { inline_keyboard: [[B('10', 'wiz:count:10'), B('20', 'wiz:count:20'), B('50', 'wiz:count:50')]] } })
+              reply_markup: { inline_keyboard: countButtons(actorTier) } })
           }
         } else {
           await send(chatId, 'Please tap one of the buttons above — or /cancel to stop.')
@@ -1947,7 +2037,17 @@ module.exports = async (req, res) => {
     }
     const parts = text.split(' ').slice(1)
     const days = Math.min(Math.max(parseInt(parts[0]) || 1, 1), 30)
-    const count = Math.min(Math.max(parseInt(parts[1]) || 20, 1), 100)
+    const requestedCount = Math.min(Math.max(parseInt(parts[1]) || 20, 1), 100)
+    // /newuk is always free to run (free government API, costs the owner nothing) and
+    // never spends a search credit — but the RESULT SIZE still follows the same free-vs-
+    // paid shape as everything else, so a free account can't pull the full 100 at once.
+    const newukTier = isOwner ? 'owner' : await tierOf(userId)
+    const newukCap = (newukTier === 'paid' || newukTier === 'owner' || newukTier === 'byoc')
+      ? null : (newukTier === 'onetime' ? FREE_RESULT_CAP : DAILY_RESULT_CAP)
+    const count = newukCap ? Math.min(requestedCount, newukCap) : requestedCount
+    if (newukCap && requestedCount > count) {
+      await send(chatId, `🎟️ Free accounts see up to ${newukCap} at a time — showing ${count} of the ${requestedCount} you asked for. Get a pass (/access) for more.`)
+    }
 
     const today = new Date()
     const fromDate = new Date(today)
@@ -2278,12 +2378,13 @@ module.exports = async (req, res) => {
       // rather than them uploading their own.
       const tier = await tierOf(userId)
       const useOwnCookies = tier === 'byoc'
-      // A free (one-time/trial) search is capped — unlimited results is what the
-      // paid pass is for.
+      // A free search (lifetime trial, or the once-a-day follow-on) is capped —
+      // unlimited is what the paid pass is for.
+      const cap = tier === 'onetime' ? FREE_RESULT_CAP : tier === 'daily' ? DAILY_RESULT_CAP : null
       let count = job.count
       let capped = false
-      if (tier === 'onetime' && count > FREE_RESULT_CAP) {
-        count = FREE_RESULT_CAP
+      if (cap && count > cap) {
+        count = cap
         capped = true
       }
       const payload = {
@@ -2302,7 +2403,8 @@ module.exports = async (req, res) => {
         `${reviewCap ? `, review cap ${reviewCap}` : ', no review cap'}` +
         `${job.sampleMode ? ', SAMPLE mode' : ''}` +
         `${job.includeSeen ? ', including previously-seen' : ''})\n\n` +
-        (capped ? `🎟️ Free searches are capped at ${FREE_RESULT_CAP} results (you asked for ${job.count}) — get a pass (/access) for more.\n\n` : '') +
+        (capped ? `🎟️ Free searches are capped at ${cap} results (you asked for ${job.count}) — ` +
+                  `${tier === 'daily' ? RESULTS_ARE_YOURS_LINE + ' ' : ''}get a pass (/access) for more.\n\n` : '') +
         (dispatched
           ? `Triggered GitHub Actions immediately — should start within a minute or two.\n`
           : `Make sure maps_daemon.py is running on your PC, or wait for the next scheduled GitHub Actions run.\n`) +
@@ -2325,7 +2427,14 @@ module.exports = async (req, res) => {
     if (userQueue.awaitingLeadCount) {
       const n = parseInt(text.replace(/[^0-9]/g, ''), 10)
       if (!n || n < 1) { await send(chatId, `Reply with just a number, e.g. 30.`); return res.status(200).send('OK') }
-      const wantCount = Math.min(n, 300)
+      // A free (trial/daily) search shares the same cap as /find and /findco — capped
+      // here, up front, so there's no "ask for 50, silently get 5" surprise later.
+      const scoutTier = isOwner ? 'owner' : await tierOf(userId)
+      const scoutCap = scoutTier === 'onetime' ? FREE_RESULT_CAP : scoutTier === 'daily' ? DAILY_RESULT_CAP : null
+      const wantCount = Math.min(n, scoutCap || 300)
+      if (scoutCap && n > scoutCap) {
+        await send(chatId, `🎟️ Free searches are capped at ${scoutCap} leads — searching for ${scoutCap} instead of ${n}. Get a pass (/access) for more.`)
+      }
       userQueue.awaitingLeadCount = false
       userQueue.pendingSearch.wantCount = wantCount
       userQueue.awaitingLockedFilter = true
