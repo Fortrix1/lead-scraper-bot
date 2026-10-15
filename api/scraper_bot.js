@@ -139,7 +139,7 @@ module.exports = async (req, res) => {
 
   async function getUserQueue(userId) {
     const { result: v } = await redis('GET', `queue:${userId}`)
-    return v ? JSON.parse(v) : { pending: [], results: [], awaitingMessages: false, messages: [], awaitingCustomQuery: false, awaitingReviewCap: false, awaitingCompanyList: false, pendingFindJob: null }
+    return v ? JSON.parse(v) : { pending: [], results: [], awaitingMessages: false, messages: [], awaitingCustomQuery: false, awaitingReviewCap: false, awaitingCompanyList: false, pendingFindJob: null, answeringGift: null, giftDraft: null, awaitingStartText: false }
   }
 
   async function saveUserQueue(userId, queue) {
@@ -195,6 +195,7 @@ module.exports = async (req, res) => {
   // The env vars above are only the very-first-run default.
   // ON by default now — set AUTO_TRIAL=false in Vercel to switch the free trial off.
   let AUTO_TRIAL = process.env.AUTO_TRIAL !== 'false'
+  let START_TEXT = ''   // custom /start message (owner-editable via /admin)
   let TRIAL_SIZE = parseInt(process.env.AUTO_TRIAL_SIZE || '2') || 2   // free searches per new account
   const FREE_RESULT_CAP = parseInt(process.env.FREE_RESULT_CAP || '10') || 10   // max results per free (one-time) search
   const DAILY_RESULT_CAP = parseInt(process.env.DAILY_RESULT_CAP || '5') || 5   // max results for the ongoing once-a-day free search
@@ -214,18 +215,20 @@ module.exports = async (req, res) => {
     return [[B('10', 'wiz:count:10'), B('20', 'wiz:count:20'), B('50', 'wiz:count:50')]]
   }
   async function loadPayConfig() {
-    const [{ result: c }, { result: p }, { result: d }, { result: at }, { result: ts }] = await Promise.all([
+    const [{ result: c }, { result: p }, { result: d }, { result: at }, { result: ts }, { result: stx }] = await Promise.all([
       redis('GET', 'config:pay_contact'),
       redis('GET', 'config:pay_price'),
       redis('GET', 'config:pay_days'),
       redis('GET', 'config:auto_trial'),
-      redis('GET', 'config:trial_size')
+      redis('GET', 'config:trial_size'),
+      redis('GET', 'config:start_text')
     ])
     if (c) PAY_CONTACT = c
     if (p) ACCESS_PRICE = p
     if (d && parseInt(d) > 0) PASS_DAYS = parseInt(d)
     if (at !== null && at !== undefined) AUTO_TRIAL = at === 'true'
     if (ts && parseInt(ts) > 0) TRIAL_SIZE = parseInt(ts)
+    if (stx) START_TEXT = stx
     if (PAY_CONTACT) PAYMENT_LINK = payUrlFrom(PAY_CONTACT)
   }
   await loadPayConfig()
@@ -318,6 +321,115 @@ module.exports = async (req, res) => {
     if (who) await redis('SET', `access:meta:${userId}`, JSON.stringify({ who }))
     await removePendingRequest(userId)
     return parseInt(result) || count
+  }
+
+  // ══════════════════════════════════════════════
+  //  GIFT SYSTEM — owner-created gifts of searches or time-passes.
+  //  A gift = a prize (N searches with a result cap, OR a days-pass)
+  //  + an optional personal message + one of three distribution modes:
+  //    everyone — every user can claim it once (optional max-claims cap)
+  //    first    — exactly one winner: whoever taps Claim first
+  //    quiz     — the gift shows a question; first correct answer wins
+  //               (owner can also review attempts and award by hand)
+  //  Winners are granted one-time credits (with a per-user result-cap
+  //  override stored in giftcap:<uid>) or a pass, and get the gift
+  //  message delivered by DM.
+  // ══════════════════════════════════════════════
+  async function resultCapFor(uid, base) {
+    // A gift can raise a user's per-search result cap; it never lowers it.
+    const { result } = await redis('GET', `giftcap:${uid}`)
+    const g = parseInt(result) || 0
+    return Math.max(base, g)
+  }
+  async function giftIds() {
+    const { result } = await redis('ZRANGE', 'gifts:index', 0, -1)
+    return result || []
+  }
+  async function getGift(id) {
+    const { result } = await redis('GET', `gift:${id}`)
+    if (!result) return null
+    try { return JSON.parse(result) } catch { return null }
+  }
+  async function saveGift(g) {
+    await redis('SET', `gift:${g.id}`, JSON.stringify(g))
+    await redis('ZADD', 'gifts:index', String(g.created || Date.now()), g.id)
+  }
+  function normAnswer(s) {
+    return String(s || '').toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim()
+  }
+  function giftPrizeText(g) {
+    if (g.kind === 'pass') return `${g.days || 30} days of full access`
+    const n = g.searches || 1
+    return `${n} search${n === 1 ? '' : 'es'} (up to ${g.cap || FREE_RESULT_CAP} results each)`
+  }
+  async function awardGiftTo(g, uid) {
+    if (g.kind === 'pass') {
+      await grantPass(uid, g.days || 30, '')
+    } else {
+      await redis('INCRBY', `onetime:${uid}`, String(g.searches || 1))
+      await redis('SADD', 'access:onetime:ids', uid)
+      const want = parseInt(g.cap) || 0
+      if (want > FREE_RESULT_CAP) {
+        const { result: cur } = await redis('GET', `giftcap:${uid}`)
+        if ((parseInt(cur) || 0) < want) await redis('SET', `giftcap:${uid}`, String(want))
+      }
+    }
+  }
+  async function deliverGift(uid, g, extra) {
+    await send(uid,
+      `🎁 You won a gift!\n\n🎟️ ${giftPrizeText(g)}` +
+      (g.message ? `\n\n💌 Message from the owner:\n${g.message}` : '') +
+      (extra ? `\n\n${extra}` : '') +
+      `\n\nSend /access anytime to check your status.`)
+  }
+  async function notifyOwnerGiftLine(g, uid, what) {
+    if (!ADMIN_ID) return
+    await tgCall('sendMessage', { chat_id: ADMIN_ID,
+      text: `🎁 Gift "${(g.label || g.id).slice(0, 40)}" — ${what} — user ${uid}.` })
+  }
+  async function openGiftList() {
+    const ids = await giftIds()
+    const out = []
+    for (const id of ids.slice(-30)) {
+      const g = await getGift(id)
+      if (g && g.status === 'open') out.push(g)
+    }
+    return out.reverse()
+  }
+  async function claimGift(chatId, uid, giftId) {
+    const g = await getGift(giftId)
+    if (!g || g.status !== 'open') { await send(chatId, `That gift is no longer available.`); return }
+    if (g.mode === 'quiz') { await send(chatId, `That one needs you to answer its question first — tap it in 🎁 Gifts and send your answer.`); return }
+    if ((g.winners || []).some(w => w.uid === uid)) { await send(chatId, `You already claimed this one 🎁`); return }
+    if (g.mode === 'first' && (g.winners || []).length >= 1) { await send(chatId, `Someone already grabbed this one — check the other open gifts!`); return }
+    if (g.mode === 'everyone' && g.maxClaims > 0 && (g.winners || []).length >= g.maxClaims) { await send(chatId, `This gift is all claimed out — check back for the next one!`); return }
+    g.winners = g.winners || []
+    g.winners.push({ uid, ts: Date.now() })
+    if (g.mode === 'first') g.status = 'closed'
+    await saveGift(g)
+    await awardGiftTo(g, uid)
+    await deliverGift(uid, g)
+    await notifyOwnerGiftLine(g, uid, 'claimed')
+    await send(chatId, `🎁 Gift claimed — check your DMs from the bot!`)
+  }
+  async function answerGift(chatId, uid, giftId, text) {
+    const g = await getGift(giftId)
+    if (!g || g.status !== 'open') { await send(chatId, `That gift is no longer available.`); return }
+    if ((g.winners || []).length >= 1) { await send(chatId, `Someone already won this one!`); return }
+    g.attempts = g.attempts || {}
+    g.attempts[String(uid)] = text.slice(0, 200)
+    await saveGift(g)
+    if (normAnswer(text) === normAnswer(g.answer)) {
+      g.winners = [{ uid, ts: Date.now() }]
+      g.status = 'closed'
+      await saveGift(g)
+      await awardGiftTo(g, uid)
+      await deliverGift(uid, g)
+      await notifyOwnerGiftLine(g, uid, 'WON (correct answer)')
+      await send(chatId, `🎉 Correct! You won — the gift is in your DMs.`)
+    } else {
+      await send(chatId, `❌ Not quite — think it over and send another answer. (Wrong answers land on the owner's screen, who can also award the gift by hand.)`)
+    }
   }
 
   // Is this uploaded file a cookie export (Cookie-Editor or Playwright)?
@@ -734,7 +846,7 @@ module.exports = async (req, res) => {
     const useOwnCookies = tier === 'byoc'
     // A free search (lifetime trial, or the once-a-day follow-on) is capped —
     // unlimited is what the paid pass is for.
-    const cap = tier === 'onetime' ? FREE_RESULT_CAP : tier === 'daily' ? DAILY_RESULT_CAP : null
+    const cap = tier === 'onetime' ? await resultCapFor(userId, FREE_RESULT_CAP) : tier === 'daily' ? DAILY_RESULT_CAP : null
     let capped = false
     if (cap && companies.length > cap) {
       companies = companies.slice(0, cap)
@@ -1258,17 +1370,17 @@ module.exports = async (req, res) => {
         return {
           text:
             `<b>❓ How this bot works</b>\n\n` +
-            `In one line: it finds new businesses, then finds a way to contact them.\n\n` +
-            `<b>The easiest path</b>\n` +
-            `1️⃣ 🇬🇧 New UK Companies — get a fresh list\n` +
-            `2️⃣ 🕵️ Find Contacts — paste the list; get websites, emails, phones, socials and the owners' LinkedIn\n` +
-            `3️⃣ Reach out, then track it in 📂 My Leads\n\n` +
+            `In one line: it finds businesses around the world — then finds a way to contact them.\n\n` +
+            `<b>The main paths</b>\n` +
+            `1️⃣ 🗺️ Local Businesses — scout any city worldwide; each lead comes with phone, website, email, reviews, socials and an opportunity score\n` +
+            `2️⃣ 🇬🇧 New UK Companies — freshly incorporated UK companies, straight from the official register\n` +
+            `3️⃣ 🕵️ Find Contacts — paste any company list; get websites, emails, phones, socials and the owners' LinkedIn\n\n` +
             `<b>Words used here</b>\n` +
             `• <b>Lead</b> — a business you could sell to\n` +
             `• <b>Director</b> — the person who started the company (the founder)\n\n` +
             `Stuck? Tap 🧹 Cancel in Tools, or send /start.`,
           kb: [
-            [B('🇬🇧 Start with UK companies', 'menu:uk')],
+            [B('🗺️ Start with Local Businesses', 'menu:local')],
             [B('📜 All commands', 'menu:cmds')],
             nav()
           ]
@@ -1291,27 +1403,34 @@ module.exports = async (req, res) => {
             `/black &lt;url&gt; — add to the blacklist\n` +
             `/scoutlist &lt;url&gt; — scan a domain list\n` +
             `/audit — activity log\n` +
-            `/cancel — stop whatever I'm waiting for\n\n` +
+            `/cancel — stop whatever I'm waiting for\n` +
+            `/gift — open the gift box (free searches/passes from the owner)\n` +
+            `/admin — owner admin panel\n\n` +
             `📄 Send a .txt file of links and I'll extract, dedupe and check them.\n` +
             `When a scout finishes, send outreach messages separated by / and I'll pair them with emails.`,
           kb: [nav('menu:tools')]
         }
       case 'main':
-      default:
+      default: {
+        const custom = START_TEXT
         return {
-          text:
+          text: custom
+            ? (custom + (hasAccessFlag ? '' : `\n\n🔒 = needs access — tap 💳 Get Access below.`))
+            : (
             `<b>👋 Lead Scraper Bot</b>\n\n` +
-            `Find businesses that need your services — and the contact details to reach them.\n\n` +
-            `<b>New here?</b> Tap 🇬🇧 New UK Companies, then 🕵️ Find Contacts. That's the whole flow.\n\n` +
+            `Find businesses around the world — their contact info, reviews, socials, and everything you need to reach them.\n\n` +
+            `<b>New here?</b> Try 🗺️ Local Businesses to scout any city on Earth, or 🕵️ Find Contacts to turn a company list into real emails, phones and socials.\n\n` +
             (hasAccessFlag ? '' : `🔒 = needs access — tap 💳 Get Access below.\n\n`) +
-            `<b>What do you want to do?</b>`,
+            `<b>What do you want to do?</b>`),
           kb: [
-            [B('🇬🇧 New UK Companies', 'menu:uk'), go('🕵️ Find Contacts', 'menu:findco')],
-            [go('🗺️ Local Businesses', 'menu:local'), go('🛍️ Shopify Stores', 'menu:shopify')],
-            [go('📂 My Leads', 'menu:leads'), B('🧰 Tools', 'menu:tools')],
-            owner ? [B('❓ How it works', 'menu:help')] : [B('❓ How it works', 'menu:help'), B('💳 Get Access', 'run:/access')]
+            [go('🗺️ Local Businesses', 'menu:local'), go('🕵️ Find Contacts', 'menu:findco')],
+            [B('🇬🇧 New UK Companies', 'menu:uk'), go('🛍️ Shopify Stores', 'menu:shopify')],
+            [go('📂 My Leads', 'menu:leads'), B('🎁 Gifts', 'menu:gifts')],
+            [B('🧰 Tools', 'menu:tools'), B('❓ How it works', 'menu:help')],
+            owner ? [B('🛠 Admin', 'menu:admin')] : [B('💳 Get Access', 'run:/access')]
           ]
         }
+      }
     }
   }
 
@@ -1401,6 +1520,118 @@ module.exports = async (req, res) => {
     return { text, kb }
   }
 
+
+  // ── Admin panel + gift screens (async builders, like buildAccessListScreen) ──
+  async function buildAdminScreen() {
+    const [{ result: qlen }, pending, granted, oneTime, giftsOpen] = await Promise.all([
+      redis('LLEN', 'jobs:find'),
+      listPendingRequests(),
+      listGrantedPasses(),
+      listOneTimeHolders(),
+      openGiftList()
+    ])
+    const activePasses = (granted || []).filter(g => g.valid).length
+    const text =
+      `<b>🛠 Admin panel</b>\n\n` +
+      `📊 Queue: ${parseInt(qlen) || 0} job(s) waiting · ⏳ ${(pending || []).length} access request(s)\n` +
+      `✅ ${activePasses} active pass(es) · 🎟️ ${(oneTime || []).length} one-time holder(s)\n` +
+      `🎁 ${(giftsOpen || []).length} open gift(s)\n\n` +
+      `Everything owner-only lives here. Tap a section:`
+    const kb = [
+      [B('👥 Access requests', 'menu:accesslist')],
+      [B('🎁 Gifts', 'menu:admingifts')],
+      [B('📜 Command reference', 'menu:admincmds')],
+      [B('✏️ Edit /start message', 'adminedit:start')],
+      [B('⬅️ Back', 'menu:tools'), B('🏠 Main menu', 'menu:main')]
+    ]
+    return { text, kb }
+  }
+
+  async function buildGiftAdminScreen() {
+    const ids = (await giftIds()).slice(-20).reverse()
+    let text =
+      `<b>🎁 Gift admin</b>\n\n` +
+      `A gift = a bundle of searches (with a result cap) or a days-pass, plus an optional personal message.\n` +
+      `Modes: 👥 everyone (each user claims once) · ⚡ first (one winner, first tap) · ❓ quiz (question — first correct answer wins, or you pick the winner yourself).\n`
+    const kb = [[B('➕ Create a gift', 'giftnew')]]
+    for (const id of ids) {
+      const g = await getGift(id)
+      if (!g) continue
+      const claims = (g.winners || []).length
+      text += `\n• <code>${g.id}</code> — ${g.status === 'open' ? '🟢 open' : '🔴 closed'} — ${g.mode} — ${giftPrizeText(g)} — ${claims} winner(s)`
+      if (g.message) text += `\n   💌 "${g.message.slice(0, 60)}"`
+      if (g.mode === 'quiz' && g.question) text += `\n   ❓ ${g.question.slice(0, 80)}`
+      if (g.status === 'open') kb.push([B(`🔒 Close ${g.id}`, `giftclose:${g.id}`)])
+      if (g.mode === 'quiz') kb.push([B(`📝 Attempts (${Object.keys(g.attempts || {}).length})`, `giftatt:${g.id}`)])
+    }
+    if (ids.length === 0) text += `\n\nNo gifts yet — tap ➕ Create a gift.`
+    kb.push([B('⬅️ Back', 'menu:admin'), B('🏠 Main menu', 'menu:main')])
+    return { text, kb }
+  }
+
+  async function buildGiftAttemptsScreen(gid) {
+    const g = await getGift(gid)
+    if (!g) return null
+    const attempts = g.attempts || {}
+    const uids = Object.keys(attempts)
+    let text = `<b>📝 Attempts — ${gid}</b>\n\n❓ ${g.question || ''}\n✅ Correct answer: ${g.answer || ''}\n`
+    const kb = []
+    if (!uids.length) text += `\nNo attempts yet.`
+    for (const uid of uids.slice(-20)) {
+      const won = (g.winners || []).some(w => w.uid === uid)
+      text += `\n• <code>${uid}</code>: "${String(attempts[uid]).slice(0, 80)}" ${won ? '🏆 winner' : ''}`
+      if (!won && g.status === 'open') kb.push([B(`🏆 Mark ${uid} as winner`, `giftwin:${gid}:${uid}`)])
+    }
+    kb.push([B('⬅️ Back', 'menu:admingifts')])
+    return { text, kb }
+  }
+
+  async function buildGiftsScreen(userId) {
+    const open = await openGiftList()
+    if (!open.length) {
+      return { text: `<b>🎁 Gifts</b>\n\nNo open gifts right now — check back soon!`, kb: [[B('🏠 Main menu', 'menu:main')]] }
+    }
+    let text = `<b>🎁 Open gifts</b>\n\nFirst come, first served — tap to claim.`
+    const kb = []
+    for (const g of open) {
+      const mine = (g.winners || []).some(w => w.uid === userId)
+      const taken = g.mode === 'first' && (g.winners || []).length >= 1
+      const exhausted = g.mode === 'everyone' && g.maxClaims > 0 && (g.winners || []).length >= g.maxClaims
+      text += `\n\n🎁 <b>${giftPrizeText(g)}</b>`
+      if (g.message) text += `\n💌 ${g.message}`
+      if (g.mode === 'quiz') text += `\n❓ ${g.question}`
+      if (mine) { text += `\n✅ You already claimed this one.`; continue }
+      if (taken || exhausted) { text += `\n🔴 Already taken.`; continue }
+      kb.push(g.mode === 'quiz'
+        ? [B(`✏️ Answer for: ${giftPrizeText(g)}`, `giftans:${g.id}`)]
+        : [B(`🎁 Claim: ${giftPrizeText(g)}`, `giftclaim:${g.id}`)])
+    }
+    kb.push([B('🏠 Main menu', 'menu:main')])
+    return { text, kb }
+  }
+
+  function adminCommandsScreen() {
+    return {
+      text:
+        `<b>📜 Admin command reference</b>\n\n` +
+        `<b>/admin</b> — this panel (stats + shortcuts)\n` +
+        `<b>/accesslist</b> — pending requests, active passes, one-time credits — approve / deny / revoke with buttons\n` +
+        `<b>/grant &lt;user id&gt; [days]</b> — give a user a paid pass (default ${PASS_DAYS}d)\n` +
+        `<b>/grant1 &lt;user id&gt; [count]</b> — give one-time search credits\n` +
+        `<b>/revoke &lt;user id&gt;</b> — strip pass + credits and block their free trial\n\n` +
+        `<b>🎁 Gifts</b> (also: /gift → 🎁 Gifts)\n` +
+        `Create a gift in 4 taps: prize (searches with a result cap, or a days-pass) → who gets it (everyone / first claim / quiz question) → optional personal message. Winners get it by DM; you get a DM on every claim. For quiz gifts, open 📝 Attempts to read answers and 🏆 mark a winner by hand.\n\n` +
+        `<b>✏️ Text editing</b>\n` +
+        `✏️ Edit /start message — replace the welcome text shown on /start for everyone ("clear" resets it)\n\n` +
+        `<b>Other owner tools</b>\n` +
+        `<b>/audit</b> — last 50 commands, who & when\n` +
+        `<b>/others</b> — links filtered out of the last scout\n` +
+        `<b>/black &lt;url&gt;</b> — import a raw domain blacklist\n` +
+        `<b>/scoutlist &lt;url&gt;</b> — check a hosted domain list as leads`,
+      kb: [[B('⬅️ Back', 'menu:admin'), B('🏠 Main menu', 'menu:main')]]
+    }
+  }
+
   async function answerCb(id, text, alert) {
     await tgCall('answerCallbackQuery', { callback_query_id: id, ...(text ? { text, show_alert: !!alert } : {}) })
   }
@@ -1409,7 +1640,7 @@ module.exports = async (req, res) => {
   async function registerCommands(ownerChatId) {
     const pub = [
       ['start', '🏠 Open the main menu'], ['menu', '🏠 Main menu'], ['newuk', '🇬🇧 New UK companies'],
-      ['access', '💳 Get access / check status'],
+      ['access', '💳 Get access / check status'], ['gift', '🎁 Open the gift box'],
       ['help', '❓ How this bot works'], ['cancel', '🧹 Stop what I\'m waiting for']
     ]
     const all = [
@@ -1420,6 +1651,7 @@ module.exports = async (req, res) => {
       ['campaigns', '📋 Your campaigns'], ['leads', '📂 Leads by status'], ['mark', '✅ Update a lead\'s status'],
       ['others', '🚫 Blacklisted links'], ['black', '🔒 Add to blacklist'], ['scoutlist', '🕵️ Scan a domain list'],
       ['audit', '🧾 Activity log'], ['cancel', '🧹 Stop what I\'m waiting for'],
+      ['gift', '🎁 Gifts (manage, owner)'], ['admin', '🛠 Admin panel (owner)'],
       ['access', '🔑 My access status'], ['grant', '✅ Give a user a day-pass (owner)'],
       ['grant1', '🎟️ Give a user 1 search (owner)'], ['accesslist', '👥 Pending + active access (owner)']
     ].map(([command, description]) => ({ command, description }))
@@ -1429,7 +1661,7 @@ module.exports = async (req, res) => {
   }
 
   // ── Menu / guided-flow button presses (menu:, run:, wiz:, locked) ──
-  if (body.callback_query && /^(menu:|run:|wiz:|locked|pay)/.test(body.callback_query.data || '')) {
+  if (body.callback_query && /^(menu:|run:|wiz:|locked|pay|gift|adminedit)/.test(body.callback_query.data || '')) {
     const cq = body.callback_query
     const d = cq.data
     const cbChat = cq.message.chat.id
@@ -1455,6 +1687,17 @@ module.exports = async (req, res) => {
       if (screenName === 'accesslist') {
         if (!isOwner) { await answerCb(cq.id, '🔒 Owner-only.', true); return res.status(200).send('OK') }
         await pushScreen(cbChat, cbMsg, await buildAccessListScreen())
+        return res.status(200).send('OK')
+      }
+      if (screenName === 'gifts') {
+        await pushScreen(cbChat, cbMsg, await buildGiftsScreen(actorId))
+        return res.status(200).send('OK')
+      }
+      if (screenName === 'admin' || screenName === 'admingifts' || screenName === 'admincmds') {
+        if (!isOwner) { await answerCb(cq.id, '🔒 Owner-only.', true); return res.status(200).send('OK') }
+        if (screenName === 'admin') await pushScreen(cbChat, cbMsg, await buildAdminScreen())
+        else if (screenName === 'admingifts') await pushScreen(cbChat, cbMsg, await buildGiftAdminScreen())
+        else await pushScreen(cbChat, cbMsg, adminCommandsScreen())
         return res.status(200).send('OK')
       }
       await showScreen(cbChat, cbMsg, screenName, isOwner, hasAccess)
@@ -1642,6 +1885,110 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
 
+    if (d.startsWith('giftclaim:')) {
+      await answerCb(cq.id)
+      await claimGift(cbChat, actorId, d.slice(12))
+      return res.status(200).send('OK')
+    }
+
+    if (d.startsWith('giftans:')) {
+      await answerCb(cq.id)
+      const gid = d.slice(9)
+      const g0 = await getGift(gid)
+      if (!g0 || g0.status !== 'open') { await send(cbChat, 'That gift is no longer available.'); return res.status(200).send('OK') }
+      const gq2 = await getUserQueue(actorId)
+      gq2.answeringGift = gid
+      await saveUserQueue(actorId, gq2)
+      await send(cbChat, `✏️ Send your answer as a normal message (one message = one answer).\n\n❓ ${g0.question}`)
+      return res.status(200).send('OK')
+    }
+
+    if (d === 'giftnew') {
+      if (!isOwner) { await answerCb(cq.id, 'Owner only.', true); return res.status(200).send('OK') }
+      await answerCb(cq.id)
+      const gq3 = await getUserQueue(actorId)
+      gq3.giftDraft = { step: 'kind' }
+      await saveUserQueue(actorId, gq3)
+      await tgCall('sendMessage', { chat_id: cbChat, parse_mode: 'HTML',
+        text: `<b>➕ New gift — step 1 of 4</b>\n\nWhat does the winner get?`,
+        reply_markup: { inline_keyboard: [
+          [B('🎟️ A bundle of searches', 'gifttype:credits'), B('⏳ A days-pass', 'gifttype:pass')]
+        ] } })
+      return res.status(200).send('OK')
+    }
+
+    if (d.startsWith('gifttype:') || d.startsWith('giftmode:')) {
+      if (!isOwner) { await answerCb(cq.id, 'Owner only.', true); return res.status(200).send('OK') }
+      await answerCb(cq.id)
+      const gq5 = await getUserQueue(actorId)
+      if (!gq5.giftDraft) return res.status(200).send('OK')
+      if (d.startsWith('gifttype:')) {
+        gq5.giftDraft.kind = d.split(':')[1]
+        gq5.giftDraft.step = gq5.giftDraft.kind === 'pass' ? 'days' : 'searches'
+        await saveUserQueue(actorId, gq5)
+        await send(cbChat, gq5.giftDraft.kind === 'pass'
+          ? `➕ How many days should the pass last? Send a number 1–365.`
+          : `➕ How many searches should the gift include? Send a number 1–100.`)
+        return res.status(200).send('OK')
+      }
+      const mode = d.split(':')[1]
+      gq5.giftDraft.mode = mode
+      if (mode === 'everyone') {
+        gq5.giftDraft.step = 'maxclaims'
+        await saveUserQueue(actorId, gq5)
+        await send(cbChat, `👥 Max number of claims? Send 0 for unlimited, or a number (e.g. 10).`)
+      } else if (mode === 'quiz') {
+        gq5.giftDraft.step = 'question'
+        await saveUserQueue(actorId, gq5)
+        await send(cbChat, `❓ Send the quiz question as one message.`)
+      } else {
+        gq5.giftDraft.step = 'message'
+        await saveUserQueue(actorId, gq5)
+        await send(cbChat, `⚡ First claim wins.\n\nAttach a personal message for the winner? Send it now, or reply "skip".`)
+      }
+      return res.status(200).send('OK')
+    }
+
+    if (d.startsWith('giftclose:') || d.startsWith('giftatt:') || d.startsWith('giftwin:')) {
+      if (!isOwner) { await answerCb(cq.id, 'Owner only.', true); return res.status(200).send('OK') }
+      await answerCb(cq.id)
+      const parts = d.split(':')
+      const gid = parts[1]
+      if (parts[0] === 'giftclose') {
+        const g = await getGift(gid)
+        if (g) { g.status = 'closed'; await saveGift(g) }
+        await pushScreen(cbChat, cbMsg, await buildGiftAdminScreen())
+      } else if (parts[0] === 'giftatt') {
+        const s = await buildGiftAttemptsScreen(gid)
+        if (s) await pushScreen(cbChat, cbMsg, s)
+      } else {
+        const uid2 = parts.slice(2).join(':')
+        const g = await getGift(gid)
+        if (g && g.status === 'open' && !(g.winners || []).some(w => w.uid === uid2)) {
+          g.winners = g.winners || []
+          g.winners.push({ uid: uid2, ts: Date.now() })
+          g.status = 'closed'
+          await saveGift(g)
+          await awardGiftTo(g, uid2)
+          await deliverGift(uid2, g, '🏆 Awarded by the owner.')
+          await notifyOwnerGiftLine(g, uid2, 'awarded manually')
+        }
+        await pushScreen(cbChat, cbMsg, await buildGiftAdminScreen())
+      }
+      return res.status(200).send('OK')
+    }
+
+    if (d === 'adminedit:start') {
+      if (!isOwner) { await answerCb(cq.id, '🔒 Owner-only.', true); return res.status(200).send('OK') }
+      await answerCb(cq.id)
+      const gq6 = await getUserQueue(actorId)
+      gq6.awaitingStartText = true
+      await saveUserQueue(actorId, gq6)
+      await tgCall('sendMessage', { chat_id: cbChat, parse_mode: 'HTML',
+        text: `<b>✏️ Edit the /start message</b>\n\nSend the new welcome text (plain text, up to ~900 characters) — it replaces the default intro shown to everyone on /start.\n\nCurrent: ${START_TEXT ? '"' + START_TEXT.slice(0, 120) + '"' : '(default)'}\n\nSend "clear" via this same button to reset to default. (/cancel to stop)` })
+      return res.status(200).send('OK')
+    }
+
     if (d.startsWith('run:')) {
       const cmd = d.slice(4)
       const base = cmd.split(' ')[0].toLowerCase()
@@ -1750,6 +2097,7 @@ module.exports = async (req, res) => {
   // and then only the safe commands in PUBLIC_CMDS. /access is the one exception: it's
   // the paid door in, so it always works even while the rest of the bot stays private.
   const isAccessCmd = /^\/access(@\w+)?$/.test(text)
+  const isGiftCmd = /^\/gift(@\w+)?$/.test(text)
   // A non-command reply (pasting a company list, answering "what's the review cap?",
   // a wizard answer, a cookies.json upload...) must NOT hit the "type a command"
   // wall below — those flows only ever start after the real gate already passed,
@@ -1759,9 +2107,9 @@ module.exports = async (req, res) => {
     midFlowQueue.awaitingCompanyList || midFlowQueue.awaitingReviewCap ||
     midFlowQueue.awaitingMessages || midFlowQueue.awaitingCustomQuery ||
     midFlowQueue.awaitingLeadCount || midFlowQueue.awaitingLockedFilter ||
-    midFlowQueue.wizard
+    midFlowQueue.wizard || midFlowQueue.answeringGift
   ))
-  if (!isOwner && !isAccessCmd && !midFlow && !doc) {
+  if (!isOwner && !isAccessCmd && !isGiftCmd && !midFlow && !doc) {
     // A granted user (paid pass / one-time credit / own cookies) always gets through,
     // whether or not PUBLIC_ACCESS is on — that toggle only governs whether a complete
     // stranger with no grant at all can browse the free preview.
@@ -1849,6 +2197,109 @@ module.exports = async (req, res) => {
         reply_markup: { inline_keyboard: [[B('👥 Access requests', 'menu:accesslist')]] }
       })
       return res.status(200).send('OK')
+    }
+  }
+
+  // ── Owner: gift-creation wizard + /start text editing ──
+  if (isOwner && text && !text.startsWith('/')) {
+    const gq = await getUserQueue(userId)
+    if (gq.awaitingStartText) {
+      if (/^clear$/i.test(text.trim())) {
+        await redis('DEL', 'config:start_text')
+        START_TEXT = ''
+        gq.awaitingStartText = false
+        await saveUserQueue(userId, gq)
+        await send(chatId, '✅ /start text reset to the default.')
+        return res.status(200).send('OK')
+      }
+      const v = text.trim().slice(0, 900)
+      await redis('SET', 'config:start_text', v)
+      START_TEXT = v
+      gq.awaitingStartText = false
+      await saveUserQueue(userId, gq)
+      await tgCall('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+        text: `✅ /start message updated (${v.length} chars) — it now shows for everyone.`,
+        reply_markup: { inline_keyboard: [[B('🛠 Admin', 'menu:admin')]] } })
+      return res.status(200).send('OK')
+    }
+    if (gq.giftDraft) {
+      const dft = gq.giftDraft
+      const numOf = (t) => { const m = String(t).match(/\d+/) ; return m ? parseInt(m[0]) : NaN }
+      if (dft.step === 'searches') {
+        const n = numOf(text)
+        if (!n || n < 1 || n > 100) { await send(chatId, 'Send a number 1–100 — how many searches does the gift include?'); return res.status(200).send('OK') }
+        dft.searches = n; dft.step = 'cap'
+        await saveUserQueue(userId, gq)
+        await send(chatId, `🎁 ${n} searches.\n\nMax results per search? (free default is ${FREE_RESULT_CAP} — e.g. 25 gives bigger reports). Send a number 1–50.`)
+        return res.status(200).send('OK')
+      }
+      if (dft.step === 'cap') {
+        const n = numOf(text)
+        if (!n || n < 1 || n > 50) { await send(chatId, 'Send a number 1–50 — max results per search.'); return res.status(200).send('OK') }
+        dft.cap = n; dft.step = 'mode'
+        await saveUserQueue(userId, gq)
+        await tgCall('sendMessage', { chat_id: chatId, text: `✅ Up to ${n} results per search.\n\nWho gets it?`,
+          reply_markup: { inline_keyboard: [
+            [B('👥 Everyone (each claims once)', 'giftmode:everyone')],
+            [B('⚡ First person to claim', 'giftmode:first')],
+            [B('❓ Quiz — first correct answer wins', 'giftmode:quiz')]
+          ] } })
+        return res.status(200).send('OK')
+      }
+      if (dft.step === 'days') {
+        const n = numOf(text)
+        if (!n || n < 1 || n > 365) { await send(chatId, 'Send a number 1–365 — how many days does the pass last?'); return res.status(200).send('OK') }
+        dft.days = n; dft.step = 'mode'
+        await saveUserQueue(userId, gq)
+        await tgCall('sendMessage', { chat_id: chatId, text: `⏳ ${n}-day pass.\n\nWho gets it?`,
+          reply_markup: { inline_keyboard: [
+            [B('👥 Everyone (each claims once)', 'giftmode:everyone')],
+            [B('⚡ First person to claim', 'giftmode:first')],
+            [B('❓ Quiz — first correct answer wins', 'giftmode:quiz')]
+          ] } })
+        return res.status(200).send('OK')
+      }
+      if (dft.step === 'maxclaims') {
+        const t = text.trim()
+        if (!/^\d+$/.test(t) || parseInt(t) > 10000) { await send(chatId, 'Send 0 for unlimited claims, or a max number (e.g. 10).'); return res.status(200).send('OK') }
+        dft.maxClaims = parseInt(t); dft.step = 'message'
+        await saveUserQueue(userId, gq)
+        await send(chatId, `👥 ${dft.maxClaims === 0 ? 'Unlimited claims' : 'Up to ' + dft.maxClaims + ' claims'}.\n\nAttach a personal message for the winners? Send it now (it lands in their DMs), or reply "skip".`)
+        return res.status(200).send('OK')
+      }
+      if (dft.step === 'question') {
+        if (text.trim().length < 5) { await send(chatId, 'Send the quiz question (at least a few words).'); return res.status(200).send('OK') }
+        dft.question = text.trim().slice(0, 300); dft.step = 'answer'
+        await saveUserQueue(userId, gq)
+        await send(chatId, `❓ "${dft.question}"\n\nNow send the CORRECT answer (case & punctuation don't matter).`)
+        return res.status(200).send('OK')
+      }
+      if (dft.step === 'answer') {
+        if (!text.trim()) { await send(chatId, 'Send the correct answer.'); return res.status(200).send('OK') }
+        dft.answer = text.trim().slice(0, 200); dft.step = 'message'
+        await saveUserQueue(userId, gq)
+        await send(chatId, `✅ Answer saved.\n\nAttach a personal message for the winner? Send it now, or reply "skip".`)
+        return res.status(200).send('OK')
+      }
+      if (dft.step === 'message') {
+        if (!/^skip$/i.test(text.trim())) dft.message = text.trim().slice(0, 500)
+        const gid = 'gift-' + Date.now().toString(36)
+        const gift = {
+          id: gid, kind: dft.kind, searches: dft.searches || 0,
+          cap: dft.cap || FREE_RESULT_CAP, days: dft.days || 0,
+          mode: dft.mode, maxClaims: dft.maxClaims || 0,
+          question: dft.question || '', answer: dft.answer || '',
+          message: dft.message || '', status: 'open', winners: [], attempts: {},
+          created: Date.now()
+        }
+        await saveGift(gift)
+        gq.giftDraft = null
+        await saveUserQueue(userId, gq)
+        await tgCall('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+          text: `✅ Gift <code>${gid}</code> is LIVE.\n\n🎁 ${giftPrizeText(gift)} · mode: ${gift.mode}${gift.message ? '\n💌 "' + gift.message.slice(0, 80) + '"' : ''}\n\nUsers see it under 🎁 Gifts on the main menu (or /gift). You get a DM every time someone claims or wins.`,
+          reply_markup: { inline_keyboard: [[B('🎁 Gift admin', 'menu:admingifts')]] } })
+        return res.status(200).send('OK')
+      }
     }
   }
 
@@ -1976,6 +2427,7 @@ module.exports = async (req, res) => {
     q.awaitingMessages = false; q.awaitingReviewCap = false; q.awaitingCompanyList = false
     q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false
     q.awaitingPayContact = false; q.awaitingPayPrice = false; q.awaitingTrialSize = false
+    q.answeringGift = null; q.giftDraft = null; q.awaitingStartText = false
     q.pendingFindJob = null; q.pending = []; q.results = []; q.messages = []
     await saveUserQueue(userId, q)
     await send(chatId, '🧹 Cleared. The bot is no longer waiting for anything — old scout results and pending batches were dropped.')
@@ -2106,6 +2558,23 @@ module.exports = async (req, res) => {
     await send(chatId, reply)
     await tgCall('sendMessage', { chat_id: chatId, text: 'Next step 👇  Copy the list above, then tap Find Contacts and paste it.',
       reply_markup: { inline_keyboard: [[isOwner ? B('🕵️ Find Contacts', 'menu:findco') : B('🔒 Find Contacts', 'locked')], [B('🏠 Main menu', 'menu:main')]] } })
+    return res.status(200).send('OK')
+  }
+
+  // ── /gift — users: open gift box · owner: gift admin ──
+  if (/^\/gift(@\w+)?$/.test(text)) {
+    const s = isOwner ? await buildGiftAdminScreen() : await buildGiftsScreen(userId)
+    await tgCall('sendMessage', { chat_id: chatId, text: s.text, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: s.kb }, disable_web_page_preview: true })
+    return res.status(200).send('OK')
+  }
+
+  // ── /admin — owner-only control panel ──
+  if (/^\/admin(@\w+)?$/.test(text)) {
+    if (!isOwner) { await send(chatId, 'Owner only.'); return res.status(200).send('OK') }
+    const s = await buildAdminScreen()
+    await tgCall('sendMessage', { chat_id: chatId, text: s.text, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: s.kb }, disable_web_page_preview: true })
     return res.status(200).send('OK')
   }
 
@@ -2347,6 +2816,15 @@ module.exports = async (req, res) => {
   try {
     const userQueue = await getUserQueue(userId)
 
+    // ── Answering a gift quiz question ──
+    if (userQueue.answeringGift && text) {
+      const gid = userQueue.answeringGift
+      userQueue.answeringGift = null
+      await saveUserQueue(userId, userQueue)
+      await answerGift(chatId, userId, gid, text)
+      return res.status(200).send('OK')
+    }
+
     // ── Awaiting pasted company list for /findco ──
     if (userQueue.awaitingCompanyList) {
       const companies = parseCompanyLines(text)
@@ -2392,7 +2870,7 @@ module.exports = async (req, res) => {
       const useOwnCookies = tier === 'byoc'
       // A free search (lifetime trial, or the once-a-day follow-on) is capped —
       // unlimited is what the paid pass is for.
-      const cap = tier === 'onetime' ? FREE_RESULT_CAP : tier === 'daily' ? DAILY_RESULT_CAP : null
+      const cap = tier === 'onetime' ? await resultCapFor(userId, FREE_RESULT_CAP) : tier === 'daily' ? DAILY_RESULT_CAP : null
       let count = job.count
       let capped = false
       if (cap && count > cap) {
@@ -2446,7 +2924,7 @@ module.exports = async (req, res) => {
       // A free (trial/daily) search shares the same cap as /find and /findco — capped
       // here, up front, so there's no "ask for 50, silently get 5" surprise later.
       const scoutTier = isOwner ? 'owner' : await tierOf(userId)
-      const scoutCap = scoutTier === 'onetime' ? FREE_RESULT_CAP : scoutTier === 'daily' ? DAILY_RESULT_CAP : null
+      const scoutCap = scoutTier === 'onetime' ? await resultCapFor(cbUserId, FREE_RESULT_CAP) : scoutTier === 'daily' ? DAILY_RESULT_CAP : null
       const wantCount = Math.min(n, scoutCap || 300)
       if (scoutCap && n > scoutCap) {
         await send(chatId, `🎟️ You're on the free trial — capped at ${scoutCap} leads per search, so I'll search for ${scoutCap} instead of ${n}. Get a pass (/access) for up to 300.`)
