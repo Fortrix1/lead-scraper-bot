@@ -750,11 +750,13 @@ module.exports = async (req, res) => {
     const dispatched = await triggerGithubWorkflow()
     await send(chatId,
       `✅ Discovery job posted: ${label} (job ${jobId}).\n` +
-      (capped ? `🎟️ Free searches are capped at ${cap} companies — only the first ${cap} from your list are included. ` +
+      (capped ? `🎟️ You're on the free trial — capped at ${cap} companies per search, so only the first ${cap} from your list are included. ` +
                 `${tier === 'daily' ? RESULTS_ARE_YOURS_LINE + ' ' : ''}Get a pass (/access) for the full list.\n` : '') +
       (dispatched
-        ? `Triggered GitHub Actions immediately — should start within a minute or two.\n`
-        : `Make sure the daemon is running, or wait for the next scheduled run.\n`) +
+        ? `Triggered the runner immediately — should start within a minute or two.\n`
+        : `The runner picks this up on its next scheduled pass.\n`) +
+      `⏱️ Give it a few minutes per company (~15–25/hour) — everything is looked up live and fresh: the official ` +
+      `registry, Google, their website, Google Maps, and each director's LinkedIn/socials. Nothing from a stale database.\n` +
       `Per company: Companies House directors → Google (name, town, contact, socials) → their website → Maps (name only) → each director on Google/LinkedIn. ` +
       `~15-25 companies/hour (shared Google budget), cached 30 days; leftovers resume automatically. Results arrive here as they're found.`)
   }
@@ -1017,7 +1019,10 @@ module.exports = async (req, res) => {
   }
 
   async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked) {
-    await send(chatId, `🔍 Searching for ${wantCount} fresh leads — "${label}"...`)
+    await send(chatId, `🔍 Searching for ${wantCount} fresh leads — "${label}"...\n\n` +
+      `⏱️ This takes a few minutes: every store is checked live, right now — fetched, opened, scanned for ` +
+      `emails/socials/page speed, and cross-checked against everything you've already seen so what's ` +
+      `returned is genuinely new. Nothing comes from a cached list.`)
     const { urls: cleaned, filteredOut, scanTimes, total, newestScanTime, pagesUsed, gotEnough, exhaustedSource } =
       await scrapeUntilUnseen(query, wantCount, 4)
 
@@ -2055,7 +2060,7 @@ module.exports = async (req, res) => {
       ? null : (newukTier === 'onetime' ? FREE_RESULT_CAP : DAILY_RESULT_CAP)
     const count = newukCap ? Math.min(requestedCount, newukCap) : requestedCount
     if (newukCap && requestedCount > count) {
-      await send(chatId, `🎟️ Free accounts see up to ${newukCap} at a time — showing ${count} of the ${requestedCount} you asked for. Get a pass (/access) for more.`)
+      await send(chatId, `🎟️ You're on the free trial — free accounts see up to ${newukCap} at a time, so showing ${count} of the ${requestedCount} you asked for. Get a pass (/access) for the full list.`)
     }
 
     const today = new Date()
@@ -2412,12 +2417,16 @@ module.exports = async (req, res) => {
         `${reviewCap ? `, review cap ${reviewCap}` : ', no review cap'}` +
         `${job.sampleMode ? ', SAMPLE mode' : ''}` +
         `${job.includeSeen ? ', including previously-seen' : ''})\n\n` +
-        (capped ? `🎟️ Free searches are capped at ${cap} results (you asked for ${job.count}) — ` +
-                  `${tier === 'daily' ? RESULTS_ARE_YOURS_LINE + ' ' : ''}get a pass (/access) for more.\n\n` : '') +
+        (capped ? `🎟️ You're on the free trial — searches are capped at ${cap} results (you asked for ${job.count}), ` +
+                  `so this run returns ${cap}. ${tier === 'daily' ? RESULTS_ARE_YOURS_LINE + ' ' : ''}` +
+                  `Get a pass (/access) for unlimited runs and bigger batches.\n\n` : '') +
         (dispatched
-          ? `Triggered GitHub Actions immediately — should start within a minute or two.\n`
-          : `Make sure maps_daemon.py is running on your PC, or wait for the next scheduled GitHub Actions run.\n`) +
-        `Results will land here as they're found, plus downloadable .txt/.html reports at the end.`
+          ? `Triggered the runner immediately — should start within a minute or two.\n`
+          : `The runner picks this up on its next scheduled pass.\n`) +
+        `\n⏱️ Give it a few minutes — every lead is scraped live, right now, just for you. ` +
+        `Nothing is served from an old database: each business is pulled fresh from Google Maps, ` +
+        `then its real website is opened and checked for email, booking, socials and speed, one by one. ` +
+        `Results land here in batches, plus downloadable .txt/.html reports at the end.`
       )
       return res.status(200).send('OK')
     }
@@ -2442,7 +2451,7 @@ module.exports = async (req, res) => {
       const scoutCap = scoutTier === 'onetime' ? FREE_RESULT_CAP : scoutTier === 'daily' ? DAILY_RESULT_CAP : null
       const wantCount = Math.min(n, scoutCap || 300)
       if (scoutCap && n > scoutCap) {
-        await send(chatId, `🎟️ Free searches are capped at ${scoutCap} leads — searching for ${scoutCap} instead of ${n}. Get a pass (/access) for more.`)
+        await send(chatId, `🎟️ You're on the free trial — capped at ${scoutCap} leads per search, so I'll search for ${scoutCap} instead of ${n}. Get a pass (/access) for up to 300.`)
       }
       userQueue.awaitingLeadCount = false
       userQueue.pendingSearch.wantCount = wantCount
