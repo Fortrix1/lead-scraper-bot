@@ -146,6 +146,18 @@ module.exports = async (req, res) => {
     await redis('SET', `queue:${userId}`, JSON.stringify(queue))
   }
 
+  // True while the user is mid-answer in ANY user-facing flow. Admin-edit
+  // flags (payment contact/price, trial size, start text, broadcast, gift
+  // draft) are deliberately NOT listed — they're guarded separately, below.
+  // Without this, a stuck admin-edit flag silently swallows every plain
+  // message the user sends afterwards (e.g. "20" meant for /scout getting
+  // interpreted as a payment contact).
+  function activeFlowFlags(q) {
+    return !!(q && (q.awaitingReviewCap || q.awaitingCompanyList || q.awaitingMessages ||
+      q.awaitingCustomQuery || q.awaitingLeadCount || q.awaitingLockedFilter ||
+      q.wizard || q.answeringGift))
+  }
+
   async function saveFilteredOut(userId, list) {
     await redis('SET', `filtered:${userId}`, JSON.stringify(list))
   }
@@ -1919,6 +1931,7 @@ module.exports = async (req, res) => {
       await answerCb(cq.id)
       const pq = await getUserQueue(actorId)
       if (d === 'payset:contact') {
+        pq.awaitingPayPrice = false; pq.awaitingTrialSize = false
         pq.awaitingPayContact = true
         await saveUserQueue(actorId, pq)
         await tgCall('sendMessage', {
@@ -1927,6 +1940,7 @@ module.exports = async (req, res) => {
                 `(PayPal.me, bank link, etc).\n\nCurrent: ${PAY_CONTACT ? PAY_CONTACT.replace(/[<>&]/g, '') : '(not set)'}\n\n(/cancel to stop)`
         })
       } else if (d === 'payset:price') {
+        pq.awaitingPayContact = false; pq.awaitingTrialSize = false
         pq.awaitingPayPrice = true
         await saveUserQueue(actorId, pq)
         await tgCall('sendMessage', {
@@ -1934,6 +1948,7 @@ module.exports = async (req, res) => {
           text: `<b>✏️ New price</b>\n\nSend the price text to show people, e.g. <code>$1</code> or <code>£2.50</code>.\n\nCurrent: ${ACCESS_PRICE}\n\n(/cancel to stop)`
         })
       } else {
+        pq.awaitingPayContact = false; pq.awaitingPayPrice = false
         pq.awaitingTrialSize = true
         await saveUserQueue(actorId, pq)
         await tgCall('sendMessage', {
@@ -2042,11 +2057,13 @@ module.exports = async (req, res) => {
       await answerCb(cq.id)
       const gq6 = await getUserQueue(actorId)
       if (d === 'adminedit:start') {
+        gq6.awaitingBroadcast = false
         gq6.awaitingStartText = true
         await saveUserQueue(actorId, gq6)
         await tgCall('sendMessage', { chat_id: cbChat, parse_mode: 'HTML',
           text: `<b>✏️ Edit the /start message</b>\n\nSend the new welcome text (plain text, up to ~900 characters) — it replaces the default intro shown to everyone on /start.\n\nCurrent: ${START_TEXT ? '"' + START_TEXT.slice(0, 120) + '"' : '(default)'}\n\nSend "clear" via this same button to reset to default. (/cancel to stop)` })
       } else {
+        gq6.awaitingStartText = false
         gq6.awaitingBroadcast = true
         await saveUserQueue(actorId, gq6)
         await tgCall('sendMessage', { chat_id: cbChat, parse_mode: 'HTML',
@@ -2212,15 +2229,26 @@ module.exports = async (req, res) => {
   // ── Owner typed a new payment contact / price (from 👥 Access requests) ──
   if (isOwner && text && !text.startsWith('/')) {
     const pq = await getUserQueue(userId)
-    if (pq.awaitingPayContact) {
-      const v = text.trim().slice(0, 120)
-      const okUrl = /^https?:\/\//i.test(v)
-      const okHandle = /^@?[A-Za-z0-9_]{5,32}$/.test(v)
-      if (!okUrl && !okHandle) {
-        await send(chatId, `That doesn't look like a Telegram username or a link. Send e.g. @zammynn or https://paypal.me/you — or /cancel.`)
+    // Yield to any live user flow (scout count, /find review cap, wizard...):
+    // a stale edit flag must never eat an answer meant for another prompt.
+    const adminEditLive = !activeFlowFlags(pq) && (pq.awaitingPayContact || pq.awaitingPayPrice || pq.awaitingTrialSize)
+    if (pq.awaitingPayContact && adminEditLive) {
+      // Pull the first usable token out of whatever was pasted — a full URL,
+      // an @handle, or a bare domain like paypal.me/you buried inside a
+      // multi-line browser copy-paste (which surrounds the link with page
+      // text and whitespace, and used to fail validation and get stuck).
+      let v = text.trim()
+      const urlM = v.match(/https?:\/\/[^\s<>"']+/i)
+      const handleM = !urlM && v.match(/@[A-Za-z0-9_]{5,32}/)
+      const domainM = !urlM && !handleM && v.match(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s<>"']*)?/i)
+      if (urlM) v = urlM[0].slice(0, 120)
+      else if (handleM) v = handleM[0]
+      else if (domainM) v = 'https://' + domainM[0].replace(/[.,;:?!]+$/, '').slice(0, 120)
+      else {
+        await send(chatId, `You're mid-edit of the payment contact (from 👥 Access requests), and that doesn't look like a Telegram username or a link.\n\nSend e.g. @zammynn or https://paypal.me/you — or /cancel to drop the edit and get your bot back.`)
         return res.status(200).send('OK')
       }
-      const saved = okHandle && !v.startsWith('@') ? '@' + v : v
+      const saved = handleM && !v.startsWith('@') ? '@' + v : v
       await redis('SET', 'config:pay_contact', saved)
       PAY_CONTACT = saved
       PAYMENT_LINK = payUrlFrom(saved)
@@ -2233,7 +2261,7 @@ module.exports = async (req, res) => {
       })
       return res.status(200).send('OK')
     }
-    if (pq.awaitingTrialSize) {
+    if (pq.awaitingTrialSize && adminEditLive) {
       const n = parseInt(text.trim())
       if (!n || n < 1 || n > 20) {
         await send(chatId, 'Send a number from 1 to 20 — or /cancel.')
@@ -2250,7 +2278,7 @@ module.exports = async (req, res) => {
       })
       return res.status(200).send('OK')
     }
-    if (pq.awaitingPayPrice) {
+    if (pq.awaitingPayPrice && adminEditLive) {
       const v = text.trim().slice(0, 20)
       if (!v) { await send(chatId, 'Send the price text, e.g. $1 — or /cancel.'); return res.status(200).send('OK') }
       await redis('SET', 'config:pay_price', v)
@@ -2269,7 +2297,7 @@ module.exports = async (req, res) => {
   // ── Owner: gift-creation wizard + /start text editing ──
   if (isOwner && text && !text.startsWith('/')) {
     const gq = await getUserQueue(userId)
-    if (gq.awaitingStartText) {
+    if (gq.awaitingStartText && !activeFlowFlags(gq)) {
       if (/^clear$/i.test(text.trim())) {
         await redis('DEL', 'config:start_text')
         START_TEXT = ''
@@ -2288,7 +2316,7 @@ module.exports = async (req, res) => {
         reply_markup: { inline_keyboard: [[B('🛠 Admin', 'menu:admin')]] } })
       return res.status(200).send('OK')
     }
-    if (gq.awaitingBroadcast) {
+    if (gq.awaitingBroadcast && !activeFlowFlags(gq)) {
       if (!text.trim()) { await send(chatId, 'Send the message text to broadcast (or /cancel).'); return res.status(200).send('OK') }
       gq.awaitingBroadcast = false
       await saveUserQueue(userId, gq)
@@ -2419,7 +2447,21 @@ module.exports = async (req, res) => {
 
   // ── /start, /menu, /help ──
   if (/^\/(start|menu)(@\w+)?(\s|$)/.test(text)) {
-    if (isOwner) await registerCommands(chatId)     // makes "/" show the command list + Menu button
+    if (isOwner) {
+      await registerCommands(chatId)     // makes "/" show the command list + Menu button
+      // Opening the menu also abandons any half-finished admin edit — otherwise
+      // a forgotten edit flag keeps eating every plain message sent afterwards.
+      const q0 = await getUserQueue(userId)
+      let dirty = false
+      for (const f of ['awaitingPayContact', 'awaitingPayPrice', 'awaitingTrialSize', 'awaitingStartText', 'awaitingBroadcast']) {
+        if (q0[f]) { q0[f] = false; dirty = true }
+      }
+      if (q0.giftDraft) { q0.giftDraft = null; dirty = true }
+      if (dirty) {
+        await saveUserQueue(userId, q0)
+        await send(chatId, '🧹 Discarded the unfinished admin edit you had open — the bot is no longer waiting for it.')
+      }
+    }
     if (/^\/start/.test(text)) await redis('INCR', 'stats:starts')
     await showScreen(chatId, null, 'main', isOwner, hasAccess)
     return res.status(200).send('OK')
@@ -2999,7 +3041,7 @@ module.exports = async (req, res) => {
       // A free (trial/daily) search shares the same cap as /find and /findco — capped
       // here, up front, so there's no "ask for 50, silently get 5" surprise later.
       const scoutTier = isOwner ? 'owner' : await tierOf(userId)
-      const scoutCap = scoutTier === 'onetime' ? await resultCapFor(cbUserId, FREE_RESULT_CAP) : scoutTier === 'daily' ? DAILY_RESULT_CAP : null
+      const scoutCap = scoutTier === 'onetime' ? await resultCapFor(userId, FREE_RESULT_CAP) : scoutTier === 'daily' ? DAILY_RESULT_CAP : null
       const wantCount = Math.min(n, scoutCap || 300)
       if (scoutCap && n > scoutCap) {
         await send(chatId, `🎟️ You're on the free trial — capped at ${scoutCap} leads per search, so I'll search for ${scoutCap} instead of ${n}. Get a pass (/access) for up to 300.`)
