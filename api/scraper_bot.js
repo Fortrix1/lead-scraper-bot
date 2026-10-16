@@ -139,7 +139,7 @@ module.exports = async (req, res) => {
 
   async function getUserQueue(userId) {
     const { result: v } = await redis('GET', `queue:${userId}`)
-    return v ? JSON.parse(v) : { pending: [], results: [], awaitingMessages: false, messages: [], awaitingCustomQuery: false, awaitingReviewCap: false, awaitingCompanyList: false, pendingFindJob: null, answeringGift: null, giftDraft: null, awaitingStartText: false }
+    return v ? JSON.parse(v) : { pending: [], results: [], awaitingMessages: false, messages: [], awaitingCustomQuery: false, awaitingReviewCap: false, awaitingCompanyList: false, pendingFindJob: null, answeringGift: null, giftDraft: null, awaitingStartText: false, awaitingBroadcast: false }
   }
 
   async function saveUserQueue(userId, queue) {
@@ -430,6 +430,15 @@ module.exports = async (req, res) => {
     } else {
       await send(chatId, `❌ Not quite — think it over and send another answer. (Wrong answers land on the owner's screen, who can also award the gift by hand.)`)
     }
+  }
+
+  // ── User tracking (stats) ──
+  async function trackUser(uid) {
+    if (!uid) return
+    await redis('SADD', 'bot:users', uid)
+    const dk = `bot:active:${todayKey()}`
+    await redis('SADD', dk, uid)
+    await redis('EXPIRE', dk, '172800')
   }
 
   // Is this uploaded file a cookie export (Cookie-Editor or Playwright)?
@@ -1250,6 +1259,7 @@ module.exports = async (req, res) => {
   const PUBLIC_ACCESS = process.env.PUBLIC_ACCESS === 'true'
   const PUBLIC_CMDS = ['/start', '/menu', '/help', '/cancel', '/newuk', '/access']
   const actorId = String(body.callback_query?.from?.id || body.message?.from?.id || '')
+  await trackUser(actorId)
   const isOwner = !ADMIN_ID || actorId === ADMIN_ID
   // The SAME tier check /find and /findco use (gateOwnerSession), computed once
   // and reused everywhere a button or menu screen needs to know "can this
@@ -1540,6 +1550,7 @@ module.exports = async (req, res) => {
     const kb = [
       [B('👥 Access requests', 'menu:accesslist')],
       [B('🎁 Gifts', 'menu:admingifts')],
+      [B('📈 Stats', 'menu:stats'), B('📣 Broadcast', 'adminedit:broadcast')],
       [B('📜 Command reference', 'menu:admincmds')],
       [B('✏️ Edit /start message', 'adminedit:start')],
       [B('⬅️ Back', 'menu:tools'), B('🏠 Main menu', 'menu:main')]
@@ -1632,6 +1643,53 @@ module.exports = async (req, res) => {
     }
   }
 
+  async function buildStatsScreen() {
+    const [{ result: total }, { result: starts }] = await Promise.all([
+      redis('SCARD', 'bot:users'),
+      redis('GET', 'stats:starts')
+    ])
+    const keys = []
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10)
+      keys.push(`bot:active:${d}`)
+    }
+    await redis('SUNIONSTORE', 'bot:active:7d_tmp', ...keys)
+    const { result: active7 } = await redis('SCARD', 'bot:active:7d_tmp')
+    await redis('DEL', 'bot:active:7d_tmp')
+    const { result: activeToday } = await redis('SCARD', `bot:active:${todayKey()}`)
+    const text =
+      `<b>📈 Bot stats</b>\n\n` +
+      `👥 Total users (ever interacted): <b>${parseInt(total) || 0}</b>\n` +
+      `🚀 /start clicks (all time): <b>${parseInt(starts) || 0}</b>\n` +
+      `📅 Active today: <b>${parseInt(activeToday) || 0}</b>\n` +
+      `🗓 Active in the last 7 days: <b>${parseInt(active7) || 0}</b>\n\n` +
+      `A "user" is anyone who has ever sent a message or tapped a button.`
+    return { text, kb: [
+      [B('📣 Broadcast to all users', 'adminedit:broadcast')],
+      [B('⬅️ Back', 'menu:admin'), B('🏠 Main menu', 'menu:main')]
+    ] }
+  }
+
+  async function broadcastMessage(fromChatId, text) {
+    const { result: ids } = await redis('SMEMBERS', 'bot:users')
+    if (!ids || !ids.length) { await send(fromChatId, 'No users to broadcast to yet.'); return }
+    let ok = 0, failed = 0
+    for (const uid of ids) {
+      try {
+        const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: uid, text: text.slice(0, 4096), disable_web_page_preview: true })
+        })
+        const d = await r.json()
+        if (d.ok) ok++; else failed++
+      } catch { failed++ }
+      await new Promise(r => setTimeout(r, 35))
+    }
+    await send(fromChatId,
+      `📣 Broadcast done — delivered to <b>${ok}</b> user(s)` +
+      (failed ? `, ${failed} failed (they blocked the bot or deleted the chat)` : '') + `.`)
+  }
+
   async function answerCb(id, text, alert) {
     await tgCall('answerCallbackQuery', { callback_query_id: id, ...(text ? { text, show_alert: !!alert } : {}) })
   }
@@ -1693,10 +1751,11 @@ module.exports = async (req, res) => {
         await pushScreen(cbChat, cbMsg, await buildGiftsScreen(actorId))
         return res.status(200).send('OK')
       }
-      if (screenName === 'admin' || screenName === 'admingifts' || screenName === 'admincmds') {
+      if (screenName === 'admin' || screenName === 'admingifts' || screenName === 'admincmds' || screenName === 'stats') {
         if (!isOwner) { await answerCb(cq.id, '🔒 Owner-only.', true); return res.status(200).send('OK') }
         if (screenName === 'admin') await pushScreen(cbChat, cbMsg, await buildAdminScreen())
         else if (screenName === 'admingifts') await pushScreen(cbChat, cbMsg, await buildGiftAdminScreen())
+        else if (screenName === 'stats') await pushScreen(cbChat, cbMsg, await buildStatsScreen())
         else await pushScreen(cbChat, cbMsg, adminCommandsScreen())
         return res.status(200).send('OK')
       }
@@ -1978,14 +2037,21 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
 
-    if (d === 'adminedit:start') {
+    if (d === 'adminedit:start' || d === 'adminedit:broadcast') {
       if (!isOwner) { await answerCb(cq.id, '🔒 Owner-only.', true); return res.status(200).send('OK') }
       await answerCb(cq.id)
       const gq6 = await getUserQueue(actorId)
-      gq6.awaitingStartText = true
-      await saveUserQueue(actorId, gq6)
-      await tgCall('sendMessage', { chat_id: cbChat, parse_mode: 'HTML',
-        text: `<b>✏️ Edit the /start message</b>\n\nSend the new welcome text (plain text, up to ~900 characters) — it replaces the default intro shown to everyone on /start.\n\nCurrent: ${START_TEXT ? '"' + START_TEXT.slice(0, 120) + '"' : '(default)'}\n\nSend "clear" via this same button to reset to default. (/cancel to stop)` })
+      if (d === 'adminedit:start') {
+        gq6.awaitingStartText = true
+        await saveUserQueue(actorId, gq6)
+        await tgCall('sendMessage', { chat_id: cbChat, parse_mode: 'HTML',
+          text: `<b>✏️ Edit the /start message</b>\n\nSend the new welcome text (plain text, up to ~900 characters) — it replaces the default intro shown to everyone on /start.\n\nCurrent: ${START_TEXT ? '"' + START_TEXT.slice(0, 120) + '"' : '(default)'}\n\nSend "clear" via this same button to reset to default. (/cancel to stop)` })
+      } else {
+        gq6.awaitingBroadcast = true
+        await saveUserQueue(actorId, gq6)
+        await tgCall('sendMessage', { chat_id: cbChat, parse_mode: 'HTML',
+          text: `<b>📣 Broadcast</b>\n\nSend the message you want delivered to EVERY user of the bot.\n\nPlain text only (no photos/documents), up to ~4000 characters. Everyone gets it exactly as you send it. (/cancel to stop)` })
+      }
       return res.status(200).send('OK')
     }
 
@@ -2222,6 +2288,14 @@ module.exports = async (req, res) => {
         reply_markup: { inline_keyboard: [[B('🛠 Admin', 'menu:admin')]] } })
       return res.status(200).send('OK')
     }
+    if (gq.awaitingBroadcast) {
+      if (!text.trim()) { await send(chatId, 'Send the message text to broadcast (or /cancel).'); return res.status(200).send('OK') }
+      gq.awaitingBroadcast = false
+      await saveUserQueue(userId, gq)
+      await send(chatId, `📣 Broadcasting to all users — one moment...`)
+      await broadcastMessage(chatId, text.trim())
+      return res.status(200).send('OK')
+    }
     if (gq.giftDraft) {
       const dft = gq.giftDraft
       const numOf = (t) => { const m = String(t).match(/\d+/) ; return m ? parseInt(m[0]) : NaN }
@@ -2346,6 +2420,7 @@ module.exports = async (req, res) => {
   // ── /start, /menu, /help ──
   if (/^\/(start|menu)(@\w+)?(\s|$)/.test(text)) {
     if (isOwner) await registerCommands(chatId)     // makes "/" show the command list + Menu button
+    if (/^\/start/.test(text)) await redis('INCR', 'stats:starts')
     await showScreen(chatId, null, 'main', isOwner, hasAccess)
     return res.status(200).send('OK')
   }
@@ -2427,7 +2502,7 @@ module.exports = async (req, res) => {
     q.awaitingMessages = false; q.awaitingReviewCap = false; q.awaitingCompanyList = false
     q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false
     q.awaitingPayContact = false; q.awaitingPayPrice = false; q.awaitingTrialSize = false
-    q.answeringGift = null; q.giftDraft = null; q.awaitingStartText = false
+    q.answeringGift = null; q.giftDraft = null; q.awaitingStartText = false; q.awaitingBroadcast = false
     q.pendingFindJob = null; q.pending = []; q.results = []; q.messages = []
     await saveUserQueue(userId, q)
     await send(chatId, '🧹 Cleared. The bot is no longer waiting for anything — old scout results and pending batches were dropped.')
