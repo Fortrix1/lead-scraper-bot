@@ -1083,12 +1083,16 @@ def process_job(data):
             "each director on Google/LinkedIn/socials. Results land here...")
         progress["started"] = True
 
-    # Session selection: a non-owner job uses the CALLER's own cookies and
-    # their own hourly budget — the owner's shared session is never touched.
+    # Session selection: user_id rides on EVERY non-owner job (for the
+    # "starting now" ping + inflight cleanup), but only a job explicitly
+    # flagged byoc uses the CALLER's own cookies and bills THEIR hourly
+    # budget. Paid/trial users on the shared session bill the owner's
+    # budget, exactly like the owner themself does.
     global _SCOPE
     uid = str(data.get("user_id") or "")
-    _SCOPE = uid or "owner"
-    if uid:
+    byoc = bool(data.get("byoc")) and uid
+    _SCOPE = uid if byoc else "owner"
+    if byoc:
         cookies = load_user_cookies(md, uid)
         if not cookies:
             md.send_telegram(

@@ -587,21 +587,49 @@ module.exports = async (req, res) => {
 
   async function queueJob(chatId, userId, payload, description) {
     const ownerRunning = !ADMIN_ID || userId === ADMIN_ID
+    let tier = null
     if (!ownerRunning) {
+      // Self-healing inflight check. The marker is JSON {job, ts} with a 2h TTL;
+      // anything older than 90 minutes (jobs are hard-capped at 30 min) is a
+      // leftover from a crashed/interrupted run and gets reclaimed instead of
+      // locking the user out forever. Legacy bare-job-id markers (written
+      // before timestamps existed) are reclaimed once their job has left the
+      // queue — if it's not queued anymore, it's not coming back.
       const { result: existing } = await redis('GET', `inflight:${userId}`)
       if (existing) {
-        await send(chatId,
-          `⏳ You already have a request queued or running — I'll message you the moment it starts, ` +
-          `and again when it's done. Send another after that; one at a time keeps the queue moving for everyone.`)
-        return false
+        let stale = false
+        try {
+          const rec = JSON.parse(existing)
+          stale = !rec.ts || (Date.now() - rec.ts) > 90 * 60 * 1000
+        } catch {
+          const { result: queued } = await redis('LRANGE', 'jobs:find', 0, -1)
+          stale = !(queued || []).some(j => String(j).includes(existing))
+        }
+        if (!stale) {
+          await send(chatId,
+            `⏳ You already have a request queued or running — I'll message you the moment it starts, ` +
+            `and again when it's done. Send another after that; one at a time keeps the queue moving for everyone.`)
+          return false
+        }
+        await redis('DEL', `inflight:${userId}`)   // reclaim the stale marker
       }
-      const tier = await tierOf(userId)
+      tier = await tierOf(userId)
       if (!(await spendFreeCredit(chatId, tier, userId))) return false
     }
     if (!payload.job_id) payload.job_id = `job-${Date.now()}`
+    if (!ownerRunning) {
+      // user_id rides on EVERY non-owner job (not just BYOC) so the daemon can
+      // clear this person's inflight marker in its finally block the moment the
+      // job ends. Before this, paid/trial/daily jobs ran without user_id, the
+      // marker was never cleared, and those users were locked out permanently
+      // with "already have a request queued or running". Only BYOC users also
+      // get byoc:true (the daemon uses THEIR cookies and THEIR hourly budget).
+      payload.user_id = userId
+      if (tier === 'byoc') payload.byoc = true
+    }
     await redis('RPUSH', 'jobs:find', JSON.stringify(payload))
     if (!ownerRunning) {
-      await redis('SET', `inflight:${userId}`, payload.job_id)
+      await redis('SET', `inflight:${userId}`, JSON.stringify({ job: payload.job_id, ts: Date.now() }), 'EX', String(2 * 60 * 60))
       const { result: len } = await redis('LLEN', 'jobs:find')
       const position = parseInt(len) || 1
       if (position > 1) {
@@ -858,13 +886,11 @@ module.exports = async (req, res) => {
 
   async function postDiscoveryJob(chatId, userId, companies) {
     const jobId = `co-${Date.now()}`
-    // Only a genuine BYOC (own-cookies) user gets user_id attached, so the daemon
-    // looks for THEIR uploaded cookies. The owner, a paid-pass holder, a one-time
-    // credit, or an auto-trial grant all borrow the owner's shared session instead —
-    // that's the whole point of granting someone access rather than them uploading
-    // their own cookies.
+    // queueJob attaches user_id to every non-owner job (so the daemon can clear
+    // their inflight marker when the job ends) and byoc:true only for genuine
+    // BYOC users, whose own cookies + own hourly budget the discovery run then
+    // uses. Everyone else borrows the owner's shared session.
     const tier = await tierOf(userId)
-    const useOwnCookies = tier === 'byoc'
     // A free search (lifetime trial, or the once-a-day follow-on) is capped —
     // unlimited is what the paid pass is for.
     const cap = tier === 'onetime' ? await resultCapFor(userId, FREE_RESULT_CAP) : tier === 'daily' ? DAILY_RESULT_CAP : null
@@ -874,8 +900,7 @@ module.exports = async (req, res) => {
       capped = true
     }
     const payload = {
-      type: 'discovery', chat_id: chatId, job_id: jobId, companies, max: 40,
-      ...(useOwnCookies ? { user_id: userId } : {})
+      type: 'discovery', chat_id: chatId, job_id: jobId, companies, max: 40
     }
     const label = `${companies.length} compan${companies.length === 1 ? 'y' : 'ies'}`
     const queued = await queueJob(chatId, userId, payload, label)
@@ -2978,13 +3003,10 @@ module.exports = async (req, res) => {
         await send(chatId, `Something went wrong — run /find again.`)
         return res.status(200).send('OK')
       }
-      // Only a genuine BYOC (own-cookies) user gets user_id attached, so the daemon
-      // looks for THEIR uploaded cookies (gm_cookies_{id}.json). The owner, a paid-pass
-      // holder, a one-time credit, or an auto-trial grant all borrow the owner's shared
-      // gm_cookies.json instead — that's the whole point of granting someone access
-      // rather than them uploading their own.
+      // queueJob attaches user_id (and byoc:true only for genuine BYOC users) —
+      // free/trial users borrow the owner's shared gm_cookies.json, BYOC users
+      // get their own session and their own hourly search budget.
       const tier = await tierOf(userId)
-      const useOwnCookies = tier === 'byoc'
       // A free search (lifetime trial, or the once-a-day follow-on) is capped —
       // unlimited is what the paid pass is for.
       const cap = tier === 'onetime' ? await resultCapFor(userId, FREE_RESULT_CAP) : tier === 'daily' ? DAILY_RESULT_CAP : null
@@ -2999,8 +3021,7 @@ module.exports = async (req, res) => {
         count, review_cap: reviewCap,
         sample_mode: !!job.sampleMode,
         include_seen: !!job.includeSeen,
-        job_id: `find-${Date.now()}`,
-        ...(useOwnCookies ? { user_id: userId } : {})
+        job_id: `find-${Date.now()}`
       }
       const queued = await queueJob(chatId, userId, payload, `${job.niche} in ${job.city}`)
       if (!queued) return res.status(200).send('OK')

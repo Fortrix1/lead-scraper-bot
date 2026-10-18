@@ -1183,13 +1183,15 @@ def process_job(data):
     print(f"  Job: {niche} in {city} (max {count}, cap {review_cap}, sample={sample_mode}, rescan={include_seen})")
     send_telegram(chat_id, f"🔎 Searching live for {niche} in {city} — up to {count} fresh leads. Give it a few minutes; every business is checked one by one just for you.")
 
-    # A non-owner job must run with the CALLER's own cookies, never the
-    # owner's session — their BYOC cookies were stored on the bot side at
-    # cookies:{user_id}:google. Missing/expired cookies stop the job with
-    # a clear re-upload message instead of silently using the shared session.
+    # user_id rides on EVERY non-owner job (so handle_job can clear their
+    # inflight marker in its finally block and ping them when their turn
+    # starts) — but only a job explicitly flagged byoc may use the caller's
+    # own cookies. Missing/expired BYOC cookies stop the job with a clear
+    # re-upload message instead of silently using the shared session.
     uid = str(data.get("user_id") or "")
+    byoc = bool(data.get("byoc")) and uid
     cookie_path = None
-    if uid:
+    if byoc:
         raw_cookies = redis_get(f"cookies:{uid}:google")
         if not raw_cookies:
             send_telegram(chat_id, "⚠️ Your saved session file is missing — send it to the bot again, then re-run /find.")
