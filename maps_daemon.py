@@ -1381,8 +1381,8 @@ def wayback_first_snapshot(session, host):
     try:
         r = session.get(
             "https://web.archive.org/cdx/search/cdx",
-            params={"url": host, "output": "json", "fl": "timestamp",
-                    "filter": "statuscode:200", "limit": 1},
+            params={"url": host, "matchType": "domain", "output": "json",
+                    "fl": "timestamp", "filter": "statuscode:200", "limit": 1},
             timeout=15)
         if r.status_code != 200:
             return None
@@ -1395,22 +1395,33 @@ def wayback_first_snapshot(session, host):
         return None
 
 
-def shopify_oldest_product(session, domain):
+def shopify_oldest_product(session, domain, max_age_days):
     """Oldest created_at among the store's own products. Stores running for
     years almost always have products created years ago; a genuinely new
-    store's oldest product is weeks old. Returns None when unreachable."""
+    store's oldest product is weeks old. Paginates (up to 4 pages) so big
+    catalogs can't hide their old items on later pages, and stops early the
+    moment it finds something provably older than the window. Returns None
+    when unreachable (locked/password stores block this endpoint)."""
+    now = datetime.now(timezone.utc)
+    earliest = None
     try:
-        r = session.get(f"https://{domain}/products.json?limit=250", timeout=12)
-        if r.status_code != 200 or "json" not in r.headers.get("content-type", ""):
-            return None
-        earliest = None
-        for p in r.json().get("products") or []:
-            t = parse_ts(p.get("created_at", ""))
-            if t and (earliest is None or t < earliest):
-                earliest = t
-        return earliest
+        for page in range(1, 5):
+            r = session.get(f"https://{domain}/products.json?limit=250&page={page}",
+                            timeout=12)
+            if r.status_code != 200 or "json" not in r.headers.get("content-type", ""):
+                break
+            prods = r.json().get("products") or []
+            if not prods:
+                break
+            for p in prods:
+                t = parse_ts(p.get("created_at", ""))
+                if t and (earliest is None or t < earliest):
+                    earliest = t
+            if earliest and (now - earliest).days > max_age_days:
+                break   # already provably old — no point paging further
     except Exception:
-        return None
+        pass
+    return earliest
 
 
 def urlscan_first_seen(domain):
@@ -1465,15 +1476,17 @@ def rdap_creation_date(session, domain):
     return None
 
 
-def is_provably_old(session, domain, max_age_days, custom_domain=""):
+def is_provably_old(session, domain, max_age_days, custom_domain="", copyright_year=None):
     """(True, reason) if ANY independent source proves the store is older than
     the window — in which case it must NOT be reported as new."""
     now = datetime.now(timezone.utc)
+    if copyright_year and copyright_year <= now.year - 2:
+        return True, f"site footer shows © {copyright_year}"
     for h in [h for h in {domain, (custom_domain or "").lower()} if h]:
         t = wayback_first_snapshot(session, h)
         if t and (now - t).days > max_age_days:
             return True, f"wayback snapshot since {t:%Y-%m-%d}"
-    t = shopify_oldest_product(session, domain)
+    t = shopify_oldest_product(session, domain, max_age_days)
     if t and (now - t).days > max_age_days:
         return True, f"products on sale since {t:%Y-%m-%d}"
     t = urlscan_first_seen(domain)
@@ -1491,7 +1504,8 @@ def is_provably_old(session, domain, max_age_days, custom_domain=""):
 def quick_store_check(domain):
     """Live store / locked 'coming soon' / dead? Also catches the custom
     domain most stores point to within days of launching."""
-    out = {"status": "dead", "custom_domain": "", "title": "", "email": "", "socials": {}}
+    out = {"status": "dead", "custom_domain": "", "title": "", "email": "", "socials": {},
+           "copyright_year": None}
     try:
         r = requests.get(f"https://{domain}",
                          headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
@@ -1510,6 +1524,13 @@ def quick_store_check(domain):
             m = re.search(r"<title[^>]*>([^<]+)</title>", text, re.I)
             if m:
                 out["title"] = html.unescape(m.group(1)).split("|")[0].split("–")[0].strip()[:60]
+            # Old sites leave old years in their footer ("© 2024 ..."). Shopify
+            # themes auto-insert the CURRENT year, so a year 2+ in the past is
+            # near-certain proof the site content is that old.
+            m = re.search(r"(?:©|&copy;|copyright\s*[^0-9]{0,12})((?:19|20)\d{2})",
+                          text, re.I)
+            if m:
+                out["copyright_year"] = int(m.group(1))
             emails = clean_emails(text)
             if emails:
                 out["email"] = best_email(emails)
@@ -1674,7 +1695,8 @@ def run_fresh_tick(cfg):
                 info.update({"domain": d, "age_days": age_days,
                              "first_cert": first.strftime("%Y-%m-%d")})
                 old, why = is_provably_old(session, d, max_age,
-                                         info.get("custom_domain", ""))
+                                         info.get("custom_domain", ""),
+                                         info.get("copyright_year"))
                 if old:
                     vetoed += 1
                     print(f"  🚫 {d} — vetoes as old: {why}")

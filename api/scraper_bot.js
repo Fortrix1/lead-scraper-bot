@@ -949,7 +949,7 @@ module.exports = async (req, res) => {
   async function waybackFirstSeenMs(host) {
     try {
       const r = await fetch(
-        `https://web.archive.org/cdx/search/cdx?url=${host}&output=json&fl=timestamp&filter=statuscode:200&limit=1`,
+        `https://web.archive.org/cdx/search/cdx?url=${host}&matchType=domain&output=json&fl=timestamp&filter=statuscode:200&limit=1`,
         { signal: AbortSignal.timeout(6000) })
       if (!r.ok) return null
       const data = await r.json()
@@ -967,6 +967,21 @@ module.exports = async (req, res) => {
       if (!r.ok) return null
       const t = (await r.json())?.results?.[0]?.task?.time
       return t ? Date.parse(t) : null
+    } catch { return null }
+  }
+
+  async function productsJsonFirstSeenMs(host) {
+    try {
+      const r = await fetch(`https://${host}/products.json?limit=250`,
+        { signal: AbortSignal.timeout(6000) })
+      if (!r.ok) return null
+      const data = await r.json()
+      let earliest = null
+      for (const p of data?.products || []) {
+        const t = p.created_at ? Date.parse(p.created_at) : NaN
+        if (!isNaN(t) && (earliest === null || t < earliest)) earliest = t
+      }
+      return earliest
     } catch { return null }
   }
 
@@ -1019,6 +1034,8 @@ module.exports = async (req, res) => {
     if (wb) signals.push(wb)
     const us = await urlscanFirstSeenMs(host)
     if (us) signals.push(us)
+    const pj = await productsJsonFirstSeenMs(host)
+    if (pj) signals.push(pj)
     if (!signals.length) { await redis('SET', cacheKey, '-1', 'EX', 21600); return null }
     const earliest = Math.min(...signals)   // oldest answer = the truth
     const age = Math.floor((Date.now() - earliest) / 86400000)

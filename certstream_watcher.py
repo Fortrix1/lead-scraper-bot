@@ -111,7 +111,8 @@ def handle_candidate(domain):
     # independent sources before anything reaches Telegram.
     info = md.quick_store_check(domain)
     old, why = md.is_provably_old(session, domain, max_age,
-                                  info.get("custom_domain", ""))
+                                  info.get("custom_domain", ""),
+                                  info.get("copyright_year"))
     if old:
         print(f"     (vetoed — provably old: {why})")
         return
