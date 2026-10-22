@@ -37,6 +37,51 @@ module.exports = async (req, res) => {
     '5': { label: 'Fashion/clothing niche',             query: 'page.domain:myshopify.com AND page.title:(fashion OR clothing OR apparel)' },
   }
 
+  // ── /scout month picker — limits the search to one calendar month using
+  //  urlscan's own date filter, so picking "October 2026" really means it.
+  const MONTH_NAMES = ['January','February','March','April','May','June','July',
+                       'August','September','October','November','December']
+  function ymLabel(month) {
+    if (month === 'last7')  return 'the last 7 days'
+    if (month === 'last30') return 'the last 30 days'
+    if (!month || month === 'any') return 'any time'
+    const [y, m] = month.split('-')
+    return `${MONTH_NAMES[parseInt(m, 10) - 1]} ${y}`
+  }
+  function monthPickerKeyboard() {
+    const rows = []
+    const now = new Date()
+    rows.push([{ text: '🕐 Last 7 days',  callback_data: 'scoutmonth:last7'  },
+               { text: '🕐 Last 30 days', callback_data: 'scoutmonth:last30' }])
+    for (let i = 0; i < 12; i++) {
+      const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1))
+      const ym = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
+      rows.push([{ text: `📅 ${MONTH_NAMES[d.getUTCMonth()]} ${d.getUTCFullYear()}`,
+                   callback_data: `scoutmonth:${ym}` }])
+    }
+    rows.push([{ text: '🌐 Any time (newest first)', callback_data: 'scoutmonth:any' }])
+    return rows
+  }
+  // urlscan date syntax: date:>[YYYY-MM-DD] is EXCLUSIVE, date:<[...] likewise —
+  // so [first of month, first of next month) cleanly captures the whole month.
+  function applyMonthFilter(query, month) {
+    if (!month || month === 'any') return query
+    const isoDay = (d) => d.toISOString().slice(0, 10)
+    let from, to
+    if (month === 'last7') {
+      from = isoDay(new Date(Date.now() - 7 * 86400000))
+      to   = isoDay(new Date(Date.now() + 86400000))
+    } else if (month === 'last30') {
+      from = isoDay(new Date(Date.now() - 30 * 86400000))
+      to   = isoDay(new Date(Date.now() + 86400000))
+    } else {
+      const [y, m] = month.split('-').map(Number)
+      from = isoDay(new Date(Date.UTC(y, m - 1, 1)))
+      to   = isoDay(new Date(Date.UTC(y, m, 1)))
+    }
+    return `${query} AND date:>[${from}] AND date:<[${to}]`
+  }
+
   const LEAD_STATUSES = ['new', 'contacted', 'replied', 'interested', 'not_interested', 'do_not_contact', 'client']
 
   let body = req.body
@@ -1199,7 +1244,8 @@ module.exports = async (req, res) => {
     } catch (e) { return null }
   }
 
-  async function scrapeUntilUnseen(query, wantCount, maxPages = 4) {
+  async function scrapeUntilUnseen(query, wantCount, maxPages = 4, month = null) {
+    const effectiveQuery = applyMonthFilter(query, month)
     const unseenUrls = []
     const filteredOut = []
     const scanTimes = {}
@@ -1208,7 +1254,7 @@ module.exports = async (req, res) => {
     const extraBlacklistSet = await getExtraBlacklistSet()
 
     for (let page = 0; page < maxPages && unseenUrls.length < wantCount; page++) {
-      const data = await fetchUrlscanPage(query, searchAfter)
+      const data = await fetchUrlscanPage(effectiveQuery, searchAfter)
       if (!data) break
       if (total === null && typeof data.total === 'number') total = data.total
       if (!data.results || !data.results.length) { exhausted = true; break }
@@ -1249,13 +1295,14 @@ module.exports = async (req, res) => {
     return { urls: unseenUrls.slice(0, wantCount), filteredOut, scanTimes, total, newestScanTime, pagesUsed, gotEnough: unseenUrls.length >= wantCount, exhaustedSource: exhausted }
   }
 
-  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked) {
-    await send(chatId, `🔍 Searching for ${wantCount} fresh leads — "${label}"...\n\n` +
+  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked, month = null) {
+    const scope = ymLabel(month)
+    await send(chatId, `🔍 Searching for ${wantCount} fresh leads — "${label}" (${scope})...\n\n` +
       `⏱️ This takes a few minutes: every store is checked live, right now — fetched, opened, scanned for ` +
       `emails/socials/page speed, and cross-checked against everything you've already seen so what's ` +
       `returned is genuinely new. Nothing comes from a cached list.`)
     const { urls: cleaned, filteredOut, scanTimes, total, newestScanTime, pagesUsed, gotEnough, exhaustedSource } =
-      await scrapeUntilUnseen(query, wantCount, 4)
+      await scrapeUntilUnseen(query, wantCount, 4, month)
 
     if (total !== null) {
       await send(chatId,
@@ -2230,7 +2277,7 @@ module.exports = async (req, res) => {
           const scoutTier = await tierOf(cbUserId)
           if (!(await spendFreeCredit(cbChatId, scoutTier, cbUserId))) return res.status(200).send('OK')
         }
-        return await startScoutJob(cbChatId, cbUserId, search.query, search.label, search.wantCount, includeLocked)
+        return await startScoutJob(cbChatId, cbUserId, search.query, search.label, search.wantCount, includeLocked, search.month)
       }
 
       if (data === 'scout_custom') {
@@ -2247,9 +2294,25 @@ module.exports = async (req, res) => {
         if (!search) return res.status(200).send('OK')
         const q = await getUserQueue(cbUserId)
         q.pendingSearch = { query: search.query, label: search.label }
+        q.awaitingScoutMonth = true
+        await saveUserQueue(cbUserId, q)
+        await sendKeyboard(cbChatId, `"${search.label}" — which month and year should I pull from?\n\nPick a month and you'll only get stores first scanned in that window.`, monthPickerKeyboard())
+        return res.status(200).send('OK')
+      }
+
+      if (data.startsWith('scoutmonth:')) {
+        const month = data.slice('scoutmonth:'.length)
+        const q = await getUserQueue(cbUserId)
+        if (!q.pendingSearch || q.pendingSearch.isDirectList) {
+          await send(cbChatId, 'That search expired — send /scout to start again.')
+          return res.status(200).send('OK')
+        }
+        q.pendingSearch.month = month
+        q.awaitingScoutMonth = false
         q.awaitingLeadCount = true
         await saveUserQueue(cbUserId, q)
-        await send(cbChatId, `How many NEW leads? Reply with a number (max 300).`)
+        const scope = ymLabel(month)
+        await send(cbChatId, `✅ ${scope.charAt(0).toUpperCase() + scope.slice(1)} it is.\n\nHow many NEW leads? Reply with a number (max 300).`)
         return res.status(200).send('OK')
       }
 
@@ -2289,6 +2352,7 @@ module.exports = async (req, res) => {
     midFlowQueue.awaitingCompanyList || midFlowQueue.awaitingReviewCap ||
     midFlowQueue.awaitingMessages || midFlowQueue.awaitingCustomQuery ||
     midFlowQueue.awaitingLeadCount || midFlowQueue.awaitingLockedFilter ||
+    midFlowQueue.awaitingScoutMonth ||
     midFlowQueue.wizard || midFlowQueue.answeringGift
   ))
   if (!isOwner && !isAccessCmd && !isGiftCmd && !midFlow && !doc) {
@@ -2641,7 +2705,7 @@ module.exports = async (req, res) => {
   if (/^\/cancel(@\w+)?$/.test(text)) {
     const q = await getUserQueue(userId)
     q.awaitingMessages = false; q.awaitingReviewCap = false; q.awaitingCompanyList = false
-    q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false
+    q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false; q.awaitingScoutMonth = false
     q.awaitingPayContact = false; q.awaitingPayPrice = false; q.awaitingTrialSize = false
     q.answeringGift = null; q.giftDraft = null; q.awaitingStartText = false; q.awaitingBroadcast = false
     q.pendingFindJob = null; q.pending = []; q.results = []; q.messages = []
@@ -3123,9 +3187,9 @@ module.exports = async (req, res) => {
     if (userQueue.awaitingCustomQuery) {
       userQueue.awaitingCustomQuery = false
       userQueue.pendingSearch = { query: text, label: 'Custom search' }
-      userQueue.awaitingLeadCount = true
+      userQueue.awaitingScoutMonth = true
       await saveUserQueue(userId, userQueue)
-      await send(chatId, `How many NEW leads? Reply with a number (max 300).`)
+      await sendKeyboard(chatId, `Custom search: "${text.slice(0, 80)}" — which month and year should I pull from?`, monthPickerKeyboard())
       return res.status(200).send('OK')
     }
 
@@ -3242,7 +3306,7 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
 
-    await send(chatId, 'Send a .txt file, use /scout for URLScan leads, /find for Google Maps, or /fresh to monitor new Shopify stores.')
+    await send(chatId, 'Send a .txt file of links, use /scout to search stores, /find for local businesses, or /fresh to watch for brand-new stores.')
     return res.status(200).send('OK')
   } finally {
     await releaseLock(userId)
