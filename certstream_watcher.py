@@ -106,11 +106,20 @@ def handle_candidate(domain):
         print(f"     (real store, but {age_days}d old — renewal, not new — skipping)")
         return
 
+    # Prove-it's-not-old veto: an old store with a fresh renewal cert slips
+    # past the age check when crt.sh's history has gaps — cross-check
+    # independent sources before anything reaches Telegram.
+    info = md.quick_store_check(domain)
+    old, why = md.is_provably_old(session, domain, max_age,
+                                  info.get("custom_domain", ""))
+    if old:
+        print(f"     (vetoed — provably old: {why})")
+        return
+
     chat_id = str(cfg.get("chat_id", ""))
     if not chat_id:
         return
 
-    info = md.quick_store_check(domain)
     icon = {"live": "🟢", "locked": "🔒", "dead": "💀"}.get(info.get("status"), "❔")
     lines = [
         "⚡ LIVE — new Shopify store, cert just issued",

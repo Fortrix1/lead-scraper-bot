@@ -1293,9 +1293,11 @@ def process_job(data):
 #             supports — the full '%.myshopify.com' sweep — and cache
 #             every candidate domain it finds in Redis. Skipped on ticks
 #             that ran too recently, since it's a heavy request.
-#    Phase 2: age-check up to 75 pooled candidates (true birthday =
-#             earliest cert EVER for that exact domain — this part uses
-#             small exact-domain queries, which crt.sh handles fine)
+#    Phase 2: keep checking until `want` CONFIRMED-fresh stores are found
+#             (time budget or pool may cut it short — leftovers stay in the
+#             pool for the next tick). "Confirmed" = cert age within window
+#             AND no independent source (Wayback / products.json / urlscan /
+#             CertSpotter / custom-domain RDAP) proves it's actually old.
 #    Phase 3: report fresh finds to Telegram
 #  Cron fires every 10 min; a lock limits ticks to one per 25 min.
 # ══════════════════════════════════════════════════════════════
@@ -1353,14 +1355,138 @@ def parse_ts(s):
         return None
 
 def store_first_cert(session, domain):
-    """Earliest cert EVER for this exact domain (expired included) = true birthday."""
-    data = crtsh_json(session, {"q": domain}, timeout=45, tries=2)
+    """Earliest cert EVER for this exact domain = true birthday. Cross-checked:
+    the MINIMUM of crt.sh and CertSpotter, so a gap in crt.sh's history gets
+    caught by an independent index instead of making an old store look young."""
     earliest = None
+    data = crtsh_json(session, {"q": domain}, timeout=45, tries=2)
     for row in (data or []):
         t = parse_ts(row.get("not_before", ""))
         if t and (earliest is None or t < earliest):
             earliest = t
+    cs = certspotter_first_cert(session, domain)
+    if cs and (earliest is None or cs < earliest):
+        earliest = cs
     return earliest
+
+# ── "Prove it's not old" vetoes ─────────────────────────────────────
+# crt.sh alone lies about birthdays: its cert history has gaps, so an old
+# store's renewal cert can compute as a few days old. Before ANY store is
+# reported as new, cross-check independent free sources. One solid "old"
+# signal is decisive; no signal simply means "not proven old" and falls
+# through to the next check.
+
+def wayback_first_snapshot(session, host):
+    """Earliest Wayback Machine capture of host, or None if unknown/unreachable."""
+    try:
+        r = session.get(
+            "https://web.archive.org/cdx/search/cdx",
+            params={"url": host, "output": "json", "fl": "timestamp",
+                    "filter": "statuscode:200", "limit": 1},
+            timeout=15)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, list) or len(data) < 2:
+            return None
+        dt = datetime.strptime(str(data[1][0])[:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def shopify_oldest_product(session, domain):
+    """Oldest created_at among the store's own products. Stores running for
+    years almost always have products created years ago; a genuinely new
+    store's oldest product is weeks old. Returns None when unreachable."""
+    try:
+        r = session.get(f"https://{domain}/products.json?limit=250", timeout=12)
+        if r.status_code != 200 or "json" not in r.headers.get("content-type", ""):
+            return None
+        earliest = None
+        for p in r.json().get("products") or []:
+            t = parse_ts(p.get("created_at", ""))
+            if t and (earliest is None or t < earliest):
+                earliest = t
+        return earliest
+    except Exception:
+        return None
+
+
+def urlscan_first_seen(domain):
+    """First time urlscan.io ever saw this domain (their own database — solid).
+    None = never seen there, or lookup failed (no proof either way)."""
+    try:
+        r = requests.get(
+            f"https://urlscan.io/api/v1/search/?q=domain:{domain}&size=1&sort=_time:asc",
+            headers={"User-Agent": "lead-scraper-bot (shopify fresh-store watcher)"},
+            timeout=15)
+        if r.status_code != 200:
+            return None
+        results = r.json().get("results") or []
+        if not results:
+            return None
+        return parse_ts(results[0].get("task", {}).get("time", ""))
+    except Exception:
+        return None
+
+
+def certspotter_first_cert(session, domain):
+    """Cross-check CertSpotter for certs crt.sh missed (independent CT index)."""
+    try:
+        r = session.get(
+            "https://api.certspotter.com/v1/issuances",
+            params={"domain": domain, "include_subdomains": "false"},
+            timeout=15)
+        if r.status_code != 200:
+            return None
+        earliest = None
+        for row in r.json() or []:
+            t = parse_ts(row.get("not_before", ""))
+            if t and (earliest is None or t < earliest):
+                earliest = t
+        return earliest
+    except Exception:
+        return None
+
+
+def rdap_creation_date(session, domain):
+    """When the custom domain was registered — nobody runs a myshopify store
+    for years before registering their own domain."""
+    try:
+        r = session.get(f"https://rdap.org/domain/{domain.lower()}", timeout=12)
+        if r.status_code != 200:
+            return None
+        for ev in r.json().get("events", []):
+            if ev.get("eventAction") == "registration":
+                return parse_ts(ev.get("eventDate", ""))
+    except Exception:
+        pass
+    return None
+
+
+def is_provably_old(session, domain, max_age_days, custom_domain=""):
+    """(True, reason) if ANY independent source proves the store is older than
+    the window — in which case it must NOT be reported as new."""
+    now = datetime.now(timezone.utc)
+    for h in [h for h in {domain, (custom_domain or "").lower()} if h]:
+        t = wayback_first_snapshot(session, h)
+        if t and (now - t).days > max_age_days:
+            return True, f"wayback snapshot since {t:%Y-%m-%d}"
+    t = shopify_oldest_product(session, domain)
+    if t and (now - t).days > max_age_days:
+        return True, f"products on sale since {t:%Y-%m-%d}"
+    t = urlscan_first_seen(domain)
+    if t and (now - t).days > max_age_days:
+        return True, f"first seen on urlscan {t:%Y-%m-%d}"
+    t = certspotter_first_cert(session, domain)
+    if t and (now - t).days > max_age_days:
+        return True, f"old certificate indexed by CertSpotter ({t:%Y-%m-%d})"
+    if custom_domain:
+        t = rdap_creation_date(session, custom_domain)
+        if t and (now - t).days > max_age_days:
+            return True, f"custom domain registered {t:%Y-%m-%d}"
+    return False, ""
 
 def quick_store_check(domain):
     """Live store / locked 'coming soon' / dead? Also catches the custom
@@ -1518,12 +1644,16 @@ def run_fresh_tick(cfg):
         cooldown = "10 min" if pool_before == 0 else "20h"
         print(f"  full sweep skipped — within the {cooldown} cooldown, using existing candidate pool ({pool_before} left)")
 
-    # ── Phase 2: age-check up to 75 candidates, report fresh ones ──
+    # ── Phase 2: keep checking until we have `want` CONFIRMED-fresh stores ──
+    # (or the time budget / pool runs out). "Confirmed" = passed the cert-age
+    # check AND the prove-it's-not-old vetoes — a renewal cert from a
+    # years-old store can no longer sneak through as "new".
     fresh = []
     checked = 0
+    vetoed = 0
     already_processed = 0
     popped_empty = False
-    while checked < 75 and time_left() > 180:
+    while len(fresh) < want and time_left() > 120:
         d = redis("SPOP", "fresh:candidates")
         if not d:
             popped_empty = True
@@ -1543,8 +1673,14 @@ def run_fresh_tick(cfg):
                 info = quick_store_check(d)
                 info.update({"domain": d, "age_days": age_days,
                              "first_cert": first.strftime("%Y-%m-%d")})
-                fresh.append(info)
-                print(f"  🌱 {d} — {age_days}d old — {info['status']}")
+                old, why = is_provably_old(session, d, max_age,
+                                         info.get("custom_domain", ""))
+                if old:
+                    vetoed += 1
+                    print(f"  🚫 {d} — vetoes as old: {why}")
+                else:
+                    fresh.append(info)
+                    print(f"  🌱 {d} — {age_days}d old — {info['status']}")
         else:
             # lookup failed — park it with a fail counter, drop after 3 tries
             fails = int(redis("HINCRBY", "fresh:failcnt", d, "1") or 0)
@@ -1553,13 +1689,17 @@ def run_fresh_tick(cfg):
         time.sleep(4)
     if already_processed:
         print(f"  skipped {already_processed} already-processed domain(s) pulled from the pool")
+    if vetoed:
+        print(f"  🚫 {vetoed} store(s) vetoed as provably old (fake-fresh filtered out)")
     if popped_empty:
         print("  pool ran dry mid-tick")
+
     pool = redis("SCARD", "fresh:candidates") or 0
     sweep_note = "full sweep ran" if swept_this_run else f"using existing pool (was {pool_before} before this tick)"
-    summary = (f"🌱 tick done — {sweep_note}, "
-               f"{checked} stores age-checked, {len(fresh)} fresh, "
-               f"{pool} candidates waiting in pool.")
+    short_note = "full sweep ran" if swept_this_run else "from existing pool"
+    summary = (f"🌱 tick done — {short_note}, {checked} checked, "
+               f"{vetoed} old-store fakes filtered, {len(fresh)} confirmed new, "
+               f"{pool} still waiting in pool.")
     if fresh:
         lines = [summary, ""]
         for i, s in enumerate(fresh[:want], 1):

@@ -933,21 +933,70 @@ module.exports = async (req, res) => {
     } catch (e) { return null }
   }
 
-  // A store's real age = its EARLIEST certificate ever (including expired
-  // ones) — not the "Not Before" of whichever cert crt.sh shows first, which
-  // is just the latest ~90-day renewal. Only myshopify.com hosts qualify,
-  // and since a store's birthday never changes we cache it in Redis forever.
-  // Failures are cached for 6h (-1) so a flaky crt.sh doesn't stall every
-  // future batch on the same domain. Uses CRTSH_RELAY_URL when set.
+  // A store's real age = its EARLIEST birthday signal across INDEPENDENT
+  // sources. crt.sh alone lies: its history has gaps, so an old store's
+  // renewal cert can compute as "12 days old". So we ask several free
+  // sources and take the OLDEST answer — proof of old always wins:
+  //   1. crt.sh + CertSpotter (two independent certificate indexes, so a
+  //      gap in one is caught by the other)
+  //   2. Wayback Machine first snapshot
+  //   3. urlscan.io first sighting
+  // Only myshopify.com hosts qualify; birthdays never change, so the final
+  // answer is cached in Redis forever under a NEW key (age2:) — any wrong
+  // "young" ages cached by the old buggy version are simply ignored.
+  // "No source answered" is cached for 6h (-1) so a flaky day doesn't
+  // stall every future batch. Uses CRTSH_RELAY_URL for the crt.sh leg.
+  async function waybackFirstSeenMs(host) {
+    try {
+      const r = await fetch(
+        `https://web.archive.org/cdx/search/cdx?url=${host}&output=json&fl=timestamp&filter=statuscode:200&limit=1`,
+        { signal: AbortSignal.timeout(6000) })
+      if (!r.ok) return null
+      const data = await r.json()
+      if (!Array.isArray(data) || data.length < 2) return null
+      const m = String(data[1][0] || '').match(/^(\d{4})(\d{2})(\d{2})/)
+      return m ? Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`) : null
+    } catch { return null }
+  }
+
+  async function urlscanFirstSeenMs(host) {
+    try {
+      const r = await fetch(
+        `https://urlscan.io/api/v1/search/?q=domain:${encodeURIComponent(host)}&size=1&sort=_time:asc`,
+        { signal: AbortSignal.timeout(6000), headers: { 'User-Agent': 'lead-scraper-bot (shopify fresh-store watcher)' } })
+      if (!r.ok) return null
+      const t = (await r.json())?.results?.[0]?.task?.time
+      return t ? Date.parse(t) : null
+    } catch { return null }
+  }
+
+  async function certspotterFirstSeenMs(host) {
+    try {
+      const r = await fetch(
+        `https://api.certspotter.com/v1/issuances?domain=${encodeURIComponent(host)}&include_subdomains=false`,
+        { signal: AbortSignal.timeout(6000) })
+      if (!r.ok) return null
+      const rows = await r.json()
+      let earliest = null
+      for (const row of rows || []) {
+        const nb = row.not_before ? Date.parse(row.not_before) : NaN
+        if (!isNaN(nb) && (earliest === null || nb < earliest)) earliest = nb
+      }
+      return earliest
+    } catch { return null }
+  }
+
   async function getStoreAgeDays(url) {
     const host = url.replace(/^https?:\/\//, '').split('/')[0].toLowerCase()
     if (!host.endsWith('.myshopify.com')) return null
-    const cacheKey = `age:${host}`
+    const cacheKey = `age2:${host}`
     const { result: cached } = await redis('GET', cacheKey)
     if (cached !== null && cached !== undefined) {
       const v = JSON.parse(cached)
       return v === -1 ? null : v
     }
+    const signals = []
+    // 1. crt.sh (via relay when configured)
     try {
       const controller = new AbortController()
       const t = setTimeout(() => controller.abort(), 6000)
@@ -955,18 +1004,26 @@ module.exports = async (req, res) => {
         signal: controller.signal, headers: { 'User-Agent': 'Mozilla/5.0' }
       })
       clearTimeout(t)
-      if (!r.ok) { await redis('SET', cacheKey, '-1', 'EX', 21600); return null }
-      const rows = await r.json()
-      let earliest = null
-      for (const row of rows || []) {
-        const nb = row.not_before ? Date.parse(row.not_before) : NaN
-        if (!isNaN(nb) && (earliest === null || nb < earliest)) earliest = nb
+      if (r.ok) {
+        const rows = await r.json()
+        for (const row of rows || []) {
+          const nb = row.not_before ? Date.parse(row.not_before) : NaN
+          if (!isNaN(nb)) signals.push(nb)
+        }
       }
-      if (earliest === null) { await redis('SET', cacheKey, '-1', 'EX', 21600); return null }
-      const age = Math.floor((Date.now() - earliest) / 86400000)
-      await redis('SET', cacheKey, JSON.stringify(age))
-      return age
-    } catch { return null }
+    } catch {}
+    // 2–4. independent sources (each silently returns null on failure)
+    const cs = await certspotterFirstSeenMs(host)
+    if (cs) signals.push(cs)
+    const wb = await waybackFirstSeenMs(host)
+    if (wb) signals.push(wb)
+    const us = await urlscanFirstSeenMs(host)
+    if (us) signals.push(us)
+    if (!signals.length) { await redis('SET', cacheKey, '-1', 'EX', 21600); return null }
+    const earliest = Math.min(...signals)   // oldest answer = the truth
+    const age = Math.floor((Date.now() - earliest) / 86400000)
+    await redis('SET', cacheKey, JSON.stringify(age))
+    return age
   }
 
   function scoreLead(r) {
