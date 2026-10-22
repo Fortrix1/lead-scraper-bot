@@ -42,44 +42,50 @@ module.exports = async (req, res) => {
   const MONTH_NAMES = ['January','February','March','April','May','June','July',
                        'August','September','October','November','December']
   function ymLabel(month) {
-    if (month === 'last7')  return 'the last 7 days'
-    if (month === 'last30') return 'the last 30 days'
+    if (month === 'last7')       return 'the last 7 days'
+    if (month === 'last14')      return 'the last 14 days'
+    if (month === 'last30')      return 'the last 30 days'
+    if (month === 'thismonth') {
+      const d = new Date()
+      return `${MONTH_NAMES[d.getUTCMonth()]} ${d.getUTCFullYear()} (so far)`
+    }
     if (!month || month === 'any') return 'any time'
     const [y, m] = month.split('-')
     return `${MONTH_NAMES[parseInt(m, 10) - 1]} ${y}`
   }
   function monthPickerKeyboard() {
+    // urlscan's public search index only covers the last 30 days
+    // (search_date_limit_days: 30) — offering older months would just
+    // produce empty results, so the picker stays inside that window.
     const rows = []
     const now = new Date()
-    rows.push([{ text: '🕐 Last 7 days',  callback_data: 'scoutmonth:last7'  },
-               { text: '🕐 Last 30 days', callback_data: 'scoutmonth:last30' }])
-    for (let i = 0; i < 12; i++) {
-      const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1))
-      const ym = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
-      rows.push([{ text: `📅 ${MONTH_NAMES[d.getUTCMonth()]} ${d.getUTCFullYear()}`,
-                   callback_data: `scoutmonth:${ym}` }])
-    }
+    const ym = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`
+    rows.push([{ text: '🕐 Last 7 days',   callback_data: 'scoutmonth:last7'  },
+               { text: '🕐 Last 14 days',  callback_data: 'scoutmonth:last14' }])
+    rows.push([{ text: '🕐 Last 30 days',  callback_data: 'scoutmonth:last30' },
+               { text: `📅 This month (${MONTH_NAMES[now.getUTCMonth()]})`, callback_data: 'scoutmonth:thismonth' }])
     rows.push([{ text: '🌐 Any time (newest first)', callback_data: 'scoutmonth:any' }])
     return rows
   }
-  // urlscan date syntax: date:>[YYYY-MM-DD] is EXCLUSIVE, date:<[...] likewise —
-  // so [first of month, first of next month) cleanly captures the whole month.
+  // WORKING urlscan date syntax (verified live): an INCLUSIVE range —
+  // date:[YYYY-MM-DD TO YYYY-MM-DD]. The date:>[...] AND date:<[...] form is
+  // rejected by the API and silently returned zero results before.
   function applyMonthFilter(query, month) {
     if (!month || month === 'any') return query
     const isoDay = (d) => d.toISOString().slice(0, 10)
-    let from, to
-    if (month === 'last7') {
-      from = isoDay(new Date(Date.now() - 7 * 86400000))
-      to   = isoDay(new Date(Date.now() + 86400000))
-    } else if (month === 'last30') {
-      from = isoDay(new Date(Date.now() - 30 * 86400000))
-      to   = isoDay(new Date(Date.now() + 86400000))
+    const today = isoDay(new Date())
+    let from
+    if (month === 'last7')       from = isoDay(new Date(Date.now() - 7 * 86400000))
+    else if (month === 'last14') from = isoDay(new Date(Date.now() - 14 * 86400000))
+    else if (month === 'last30') from = isoDay(new Date(Date.now() - 30 * 86400000))
+    else if (month === 'thismonth') {
+      const d = new Date()
+      from = isoDay(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)))
     } else {
       const [y, m] = month.split('-').map(Number)
       from = isoDay(new Date(Date.UTC(y, m - 1, 1)))
-      to   = isoDay(new Date(Date.UTC(y, m, 1)))
     }
-    return `${query} AND date:>[${from}] AND date:<[${to}]`
+    return `${query} AND date:[${from} TO ${today}]`
   }
 
   const LEAD_STATUSES = ['new', 'contacted', 'replied', 'interested', 'not_interested', 'do_not_contact', 'client']
@@ -1055,32 +1061,33 @@ module.exports = async (req, res) => {
       const v = JSON.parse(cached)
       return v === -1 ? null : v
     }
-    const signals = []
-    // 1. crt.sh (via relay when configured)
-    try {
-      const controller = new AbortController()
-      const t = setTimeout(() => controller.abort(), 6000)
-      const r = await fetch(`${CRTSH_BASE}?q=${encodeURIComponent(host)}`, {
-        signal: controller.signal, headers: { 'User-Agent': 'Mozilla/5.0' }
-      })
-      clearTimeout(t)
-      if (r.ok) {
-        const rows = await r.json()
-        for (const row of rows || []) {
+    // All 5 sources in PARALLEL — sequentially this took up to ~30s per store
+    // and made "hunt until N" impossible inside one run.
+    async function crtshFirstSeenMs(host) {
+      try {
+        const controller = new AbortController()
+        const t = setTimeout(() => controller.abort(), 6000)
+        const r = await fetch(`${CRTSH_BASE}?q=${encodeURIComponent(host)}`, {
+          signal: controller.signal, headers: { 'User-Agent': 'Mozilla/5.0' }
+        })
+        clearTimeout(t)
+        if (!r.ok) return null
+        let earliest = null
+        for (const row of await r.json() || []) {
           const nb = row.not_before ? Date.parse(row.not_before) : NaN
-          if (!isNaN(nb)) signals.push(nb)
+          if (!isNaN(nb) && (earliest === null || nb < earliest)) earliest = nb
         }
-      }
-    } catch {}
-    // 2–4. independent sources (each silently returns null on failure)
-    const cs = await certspotterFirstSeenMs(host)
-    if (cs) signals.push(cs)
-    const wb = await waybackFirstSeenMs(host)
-    if (wb) signals.push(wb)
-    const us = await urlscanFirstSeenMs(host)
-    if (us) signals.push(us)
-    const pj = await productsJsonFirstSeenMs(host)
-    if (pj) signals.push(pj)
+        return earliest
+      } catch { return null }
+    }
+    const [crt, cs, wb, us, pj] = await Promise.all([
+      crtshFirstSeenMs(host),
+      certspotterFirstSeenMs(host),
+      waybackFirstSeenMs(host),
+      urlscanFirstSeenMs(host),
+      productsJsonFirstSeenMs(host),
+    ])
+    const signals = [crt, cs, wb, us, pj].filter(t => t)
     if (!signals.length) { await redis('SET', cacheKey, '-1', 'EX', 21600); return null }
     const earliest = Math.min(...signals)   // oldest answer = the truth
     const age = Math.floor((Date.now() - earliest) / 86400000)
@@ -1235,137 +1242,153 @@ module.exports = async (req, res) => {
   async function fetchUrlscanPage(query, searchAfter) {
     let apiUrl = `https://urlscan.io/api/v1/search/?q=${encodeURIComponent(query)}&size=100`
     if (searchAfter) apiUrl += `&search_after=${searchAfter}`
-    try {
-      const controller = new AbortController()
-      const t = setTimeout(() => controller.abort(), 5000)
-      const r = await fetch(apiUrl, { signal: controller.signal })
-      clearTimeout(t)
-      return await r.json()
-    } catch (e) { return null }
+    // Date-filtered queries run slower on urlscan's side — 12s cap + one
+    // retry. The old 5s cap silently killed every month-filtered search.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const controller = new AbortController()
+        const t = setTimeout(() => controller.abort(), 12000)
+        const r = await fetch(apiUrl, { signal: controller.signal })
+        clearTimeout(t)
+        if (!r.ok) return null
+        return await r.json()
+      } catch (e) { /* retry once, then give up */ }
+    }
+    return null
   }
 
-  async function scrapeUntilUnseen(query, wantCount, maxPages = 4, month = null) {
-    const effectiveQuery = applyMonthFilter(query, month)
-    const unseenUrls = []
-    const filteredOut = []
-    const scanTimes = {}
-    const seenThisRun = new Set()
-    let searchAfter = null, total = null, newestScanTime = null, pagesUsed = 0, exhausted = false
+  // Does a checked store pass the user's reachability + freshness filters?
+  function isUsableLead(r, includeLocked, freshDays) {
+    if (r.status !== 'OK') return false
+    if (r.isPasswordProtected && !includeLocked) return false
+    if (!(r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length)) return false
+    // Freshness: provably-over-the-limit is dropped; an unknown age can't be
+    // proven old, so it stays (it just won't carry a 🎂 tag).
+    if (freshDays && typeof r.ageDays === 'number' && r.ageDays > freshDays) return false
+    return true
+  }
+
+  // Pull the next page of urlscan candidates into userQueue.pending.
+  // Returns true when more candidates were queued; false when the source is
+  // exhausted OR the page fetch failed (the cursor is kept, so the next call
+  // retries the same page instead of skipping it).
+  async function pullNextCandidates(userQueue) {
+    const ctx = userQueue.searchCtx
+    if (!ctx || ctx.exhausted) return false
+    const data = await fetchUrlscanPage(ctx.query, ctx.searchAfter)
+    if (!data) return false
+    if (ctx.total == null && typeof data.total === 'number') ctx.total = data.total
+    const items = data.results || []
+    if (!items.length) { ctx.exhausted = true; return false }
+    const pageUrls = []
+    for (const item of items) {
+      const domain = item.page?.domain
+      const url = domain ? `https://${domain}` : (item.page?.url || item.task?.url)
+      if (url) pageUrls.push(url)
+    }
     const extraBlacklistSet = await getExtraBlacklistSet()
-
-    for (let page = 0; page < maxPages && unseenUrls.length < wantCount; page++) {
-      const data = await fetchUrlscanPage(effectiveQuery, searchAfter)
-      if (!data) break
-      if (total === null && typeof data.total === 'number') total = data.total
-      if (!data.results || !data.results.length) { exhausted = true; break }
-      pagesUsed++
-
-      const pageUrls = []
-      for (const item of data.results) {
-        const domain = item.page?.domain
-        const url = domain ? `https://${domain}` : (item.page?.url || item.task?.url)
-        const scanTime = item.task?.time || item.page?.time
-        if (url) {
-          pageUrls.push(url)
-          if (scanTime) scanTimes[url] = scanTime
-          if (scanTime && (!newestScanTime || scanTime > newestScanTime)) newestScanTime = scanTime
-        }
+    const { cleaned } = partitionLeads(pageUrls, extraBlacklistSet)
+    const seenMap = await getSeenBatch(cleaned.map(normalizeForDedupe))
+    const alreadyQueued = new Set(userQueue.pending)
+    for (const u of cleaned) {
+      if (!seenMap[normalizeForDedupe(u)] && !alreadyQueued.has(u)) {
+        userQueue.pending.push(u)
+        alreadyQueued.add(u)
       }
-
-      const { cleaned, filteredOut: pageFiltered } = partitionLeads(pageUrls, extraBlacklistSet)
-      filteredOut.push(...pageFiltered)
-
-      const dedupeKeys = cleaned.map(normalizeForDedupe)
-      const seenMap = await getSeenBatch(dedupeKeys)
-      for (let i = 0; i < cleaned.length; i++) {
-        const key = dedupeKeys[i]
-        if (!seenMap[key] && !seenThisRun.has(key)) {
-          seenThisRun.add(key)
-          unseenUrls.push(cleaned[i])
-          if (unseenUrls.length >= wantCount) break
-        }
-      }
-
-      const last = data.results[data.results.length - 1]
-      if (last?.sort) searchAfter = last.sort.join(',')
-      else { exhausted = true; break }
-      if (data.results.length < 100) { exhausted = true; break }
     }
-
-    return { urls: unseenUrls.slice(0, wantCount), filteredOut, scanTimes, total, newestScanTime, pagesUsed, gotEnough: unseenUrls.length >= wantCount, exhaustedSource: exhausted }
+    const last = items[items.length - 1]
+    if (last?.sort) ctx.searchAfter = last.sort.join(',')
+    else ctx.exhausted = true
+    if (items.length < 100) ctx.exhausted = true
+    return true
   }
 
-  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked, month = null) {
+  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked, month = null, freshDays = null) {
     const scope = ymLabel(month)
-    await send(chatId, `🔍 Searching for ${wantCount} fresh leads — "${label}" (${scope})...\n\n` +
-      `⏱️ This takes a few minutes: every store is checked live, right now — fetched, opened, scanned for ` +
-      `emails/socials/page speed, and cross-checked against everything you've already seen so what's ` +
-      `returned is genuinely new. Nothing comes from a cached list.`)
-    const { urls: cleaned, filteredOut, scanTimes, total, newestScanTime, pagesUsed, gotEnough, exhaustedSource } =
-      await scrapeUntilUnseen(query, wantCount, 4, month)
-
-    if (total !== null) {
-      await send(chatId,
-        `📊 Found ${cleaned.length} new of ${wantCount} requested (searched ${pagesUsed} page(s), ${total} total matches).` +
-        (!gotEnough && exhaustedSource ? ` That's everything currently unseen.` : '') +
-        (!gotEnough && !exhaustedSource ? ` Stopped early to stay within limits.` : '') +
-        (newestScanTime ? `\nMost recent scan: ${timeAgo(newestScanTime)}.` : '')
-      )
+    await send(chatId, `🔍 Hunting for ${wantCount} leads — "${label}" (${scope}${freshDays ? `, ≤${freshDays}d old` : ''})...\n\n` +
+      `⏱️ This can take several minutes: I keep pulling stores and checking each one live — age, email, socials, page speed — ` +
+      `until I have ${wantCount} that pass your filters. If a run's time budget cuts me short, send anything and I'll pick up exactly where I stopped.`)
+    const userQueue = {
+      pending: [], results: [], delivered: 0, done: false,
+      awaitingMessages: false, messages: [], awaitingCustomQuery: false,
+      label: label || '', includeLocked: !!includeLocked,
+      wantCount, freshDays,
+      searchCtx: { query: applyMonthFilter(query, month), searchAfter: null, exhausted: false, total: null }
     }
-
-    if (filteredOut.length) {
-      await saveFilteredOut(userId, filteredOut)
-      const shown = filteredOut.slice(0, 20)
-      const more = filteredOut.length > shown.length ? `\n…and ${filteredOut.length - shown.length} more` : ''
-      await send(chatId, `🚫 Filtered out — ${filteredOut.length} link(s):\n\n` + shown.join('\n') + more + `\n\nSaved — retrieve with /others.`)
-    }
-
-    return await startBatchJob(chatId, userId, cleaned, label, null, scanTimes, includeLocked)
+    await saveUserQueue(userId, userQueue)
+    return await runBatch(chatId, userId, userQueue)
   }
 
-  async function startBatchJob(chatId, userId, rawLinks, sourceLabel, poolSet, scanTimes, includeLocked) {
+  async function startBatchJob(chatId, userId, rawLinks, sourceLabel, poolSet, scanTimes, includeLocked, wantCount = 0, freshDays = null) {
     if (!rawLinks.length) {
       await send(chatId, `No links found from ${sourceLabel}.`)
       return res.status(200).send('OK')
     }
-
     const dedupeKeys = rawLinks.map(normalizeForDedupe)
     const seenMap = await getSeenBatch(dedupeKeys)
     const newLinks = rawLinks.filter((u, i) => !seenMap[dedupeKeys[i]])
     const alreadySeen = rawLinks.length - newLinks.length
-
     if (!newLinks.length) {
       await send(chatId, `✓ ${rawLinks.length} from ${sourceLabel} — all already checked. Nothing new.`)
       return res.status(200).send('OK')
     }
-
-    const userQueue = { pending: newLinks, results: [], awaitingMessages: false, messages: [], awaitingCustomQuery: false, label: sourceLabel || '', includeLocked: !!includeLocked }
+    const userQueue = {
+      pending: newLinks, results: [], delivered: 0, done: false,
+      awaitingMessages: false, messages: [], awaitingCustomQuery: false,
+      label: sourceLabel || '', includeLocked: !!includeLocked,
+      wantCount, freshDays,
+      searchCtx: null        // fixed list — nothing more to pull
+    }
     await saveUserQueue(userId, userQueue)
-
-    await send(chatId, `✓ ${sourceLabel}: found ${rawLinks.length} links (${alreadySeen} already seen, skipped).\n${newLinks.length} new to process.\n\nProcessing first batch of ${BATCH_SIZE}...`)
+    await send(chatId, `✓ ${sourceLabel}: found ${rawLinks.length} links (${alreadySeen} already seen, skipped).\n${newLinks.length} new to process.\n\n⏱️ Checking them now — results land as they pass your filters.`)
     return await runBatch(chatId, userId, userQueue)
   }
 
+  // PERSISTENT HUNTER: keeps checking batches until `wantCount` leads PASS the
+  // filters, the source is exhausted, or the run's time budget (~40s, one Vercel
+  // invocation) runs out. On timeout it saves state and asks for one ping to
+  // continue — and each store's age lookups now run in parallel, so one
+  // invocation covers ~2 batches instead of dying mid-first-batch.
   async function runBatch(chatId, userId, userQueue) {
-    const batch = userQueue.pending.slice(0, BATCH_SIZE)
-    userQueue.pending = userQueue.pending.slice(BATCH_SIZE)
-
-    const results = await processBatch(batch)
-    userQueue.results.push(...results)
-
-    const seenEntries = results.map(r => [normalizeForDedupe(r.url), { status: r.status, email: r.email, checkedAt: new Date().toISOString() }])
-    await markSeenBatch(seenEntries)
-    await saveUserQueue(userId, userQueue)
-
+    const deadline = Date.now() + 40000
+    const want = userQueue.wantCount || 0
+    const freshDays = userQueue.freshDays || null
     const includeLocked = !!userQueue.includeLocked
-    const usable = results.filter(r => r.status === 'OK' && (r.isPasswordProtected ? includeLocked : (r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length))).sort((a, b) => (b.score || 0) - (a.score || 0))
-    const remaining = userQueue.pending.length
 
-    const lockedCount = usable.filter(r => r.isPasswordProtected).length
-    const hotCount = usable.filter(r => r.score >= 70).length
-    let reply = `✓ Batch done: ${results.length} checked, ${usable.length} reachable, ${hotCount} 🔥 hot` + (lockedCount ? `, ${lockedCount} 🔐 locked` : '') + `.`
-    let leadNum = 0
-    usable.forEach(r => {
+    while (Date.now() < deadline) {
+      const usable = userQueue.results.filter(r => isUsableLead(r, includeLocked, freshDays))
+      if (want && usable.length >= want) break
+      if (!userQueue.pending.length) {
+        if (!(await pullNextCandidates(userQueue))) break
+        await saveUserQueue(userId, userQueue)
+        continue
+      }
+      const batch = userQueue.pending.slice(0, BATCH_SIZE)
+      userQueue.pending = userQueue.pending.slice(BATCH_SIZE)
+      const results = await processBatch(batch)
+      userQueue.results.push(...results)
+      await markSeenBatch(results.map(r => [normalizeForDedupe(r.url), { status: r.status, email: r.email, checkedAt: new Date().toISOString() }]))
+      await saveUserQueue(userId, userQueue)
+    }
+
+    const usableAll = userQueue.results.filter(r => isUsableLead(r, includeLocked, freshDays))
+    const fresh = usableAll.slice(userQueue.delivered || 0).sort((a, b) => (b.score || 0) - (a.score || 0))
+    const prevDelivered = (userQueue.delivered || 0)
+    userQueue.delivered = usableAll.length
+
+    const sourceExhausted = !userQueue.pending.length && (!userQueue.searchCtx || userQueue.searchCtx.exhausted)
+    const reached = !!(want && usableAll.length >= want)
+    userQueue.done = !!(reached || sourceExhausted)
+
+    let header
+    if (reached) header = `✅ ALL DONE — ${usableAll.length} leads as requested${freshDays ? ` (≤${freshDays}d old)` : ''}, checked ${userQueue.results.length} stores to find them.`
+    else if (sourceExhausted) header = `✓ Source finished — ${usableAll.length} usable of ${userQueue.results.length} checked.`
+    else header = `⏳ ${usableAll.length} of ${want} so far (checked ${userQueue.results.length}) — send anything and I'll keep hunting automatically.`
+    if (userQueue.searchCtx && userQueue.searchCtx.total != null && !sourceExhausted) header += `\n📊 ${userQueue.searchCtx.total} total matches in this window.`
+
+    let reply = header
+    let leadNum = prevDelivered
+    for (const r of fresh) {
       leadNum++
       const nameLine = r.store_name ? `${r.store_name}\n    🔗 ${r.url}` : `🔗 ${r.url}`
       const socialsList = Object.entries(r.socials || {}).map(([k, v]) => `${k}: ${v}`).join('\n              ')
@@ -1379,15 +1402,10 @@ module.exports = async (req, res) => {
       const hook = auditHookLine(r)
       const hookNote = hook ? `\n    💡 ${hook}` : ''
       reply += `\n\n${leadNum}. ${nameLine}${scoreNote}${ageNote}${hookNote}${socialsNote}${contactNote}${emailNote}`
-    })
-
-    if (remaining > 0) {
-      reply += `\n\n────────\n${remaining} links remaining. Send anything to continue.`
-    } else {
-      const totalUsable = userQueue.results.filter(r => r.status === 'OK' && (r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length)).length
-      reply += `\n\n────────\n✓ ALL DONE! ${userQueue.results.length} total, ${totalUsable} reachable.\nSend anything to move to the message-writing step.`
     }
-
+    if (!fresh.length && !userQueue.done) reply += `\n\n(The last batch didn't add any leads that pass your filters — still hunting.)`
+    if (userQueue.done) reply += `\n\n────────\nSend anything to move to the message-writing step.`
+    await saveUserQueue(userId, userQueue)
     await send(chatId, reply)
     return res.status(200).send('OK')
   }
@@ -2268,7 +2286,7 @@ module.exports = async (req, res) => {
         const includeLocked = data === 'lockedyes'
         if (search.isDirectList) {
           const batchLinks = search.rawLinks.slice(0, search.wantCount)
-          return await startBatchJob(cbChatId, cbUserId, batchLinks, search.label, null, null, includeLocked)
+          return await startBatchJob(cbChatId, cbUserId, batchLinks, search.label, null, null, includeLocked, search.wantCount, search.freshDays || null)
         }
         // /scout doesn't go through the shared job queue (it runs right here, hitting
         // URLScan.io directly) — so this is the actual "the search is happening now"
@@ -2277,7 +2295,7 @@ module.exports = async (req, res) => {
           const scoutTier = await tierOf(cbUserId)
           if (!(await spendFreeCredit(cbChatId, scoutTier, cbUserId))) return res.status(200).send('OK')
         }
-        return await startScoutJob(cbChatId, cbUserId, search.query, search.label, search.wantCount, includeLocked, search.month)
+        return await startScoutJob(cbChatId, cbUserId, search.query, search.label, search.wantCount, includeLocked, search.month, search.freshDays || null)
       }
 
       if (data === 'scout_custom') {
@@ -2296,7 +2314,7 @@ module.exports = async (req, res) => {
         q.pendingSearch = { query: search.query, label: search.label }
         q.awaitingScoutMonth = true
         await saveUserQueue(cbUserId, q)
-        await sendKeyboard(cbChatId, `"${search.label}" — which month and year should I pull from?\n\nPick a month and you'll only get stores first scanned in that window.`, monthPickerKeyboard())
+        await sendKeyboard(cbChatId, `"${search.label}" — which month and year should I pull from?\n\nPick a window — the search index only reaches back 30 days, so older months aren't searchable.`, monthPickerKeyboard())
         return res.status(200).send('OK')
       }
 
@@ -2313,6 +2331,24 @@ module.exports = async (req, res) => {
         await saveUserQueue(cbUserId, q)
         const scope = ymLabel(month)
         await send(cbChatId, `✅ ${scope.charAt(0).toUpperCase() + scope.slice(1)} it is.\n\nHow many NEW leads? Reply with a number (max 300).`)
+        return res.status(200).send('OK')
+      }
+
+      if (data.startsWith('scoutfresh:')) {
+        const days = data.slice('scoutfresh:'.length)
+        const q = await getUserQueue(cbUserId)
+        if (!q.pendingSearch) {
+          await send(cbChatId, 'That search expired — send /scout to start again.')
+          return res.status(200).send('OK')
+        }
+        q.pendingSearch.freshDays = days === 'any' ? null : parseInt(days)
+        q.awaitingFreshFilter = false
+        q.awaitingLockedFilter = true
+        await saveUserQueue(cbUserId, q)
+        await sendKeyboard(cbChatId, `🔐 Include password-protected / "coming soon" stores?`, [
+          [{ text: '✅ Yes, show them', callback_data: 'lockedyes' }],
+          [{ text: '🚫 No, skip them', callback_data: 'lockedno' }]
+        ])
         return res.status(200).send('OK')
       }
 
@@ -2352,7 +2388,7 @@ module.exports = async (req, res) => {
     midFlowQueue.awaitingCompanyList || midFlowQueue.awaitingReviewCap ||
     midFlowQueue.awaitingMessages || midFlowQueue.awaitingCustomQuery ||
     midFlowQueue.awaitingLeadCount || midFlowQueue.awaitingLockedFilter ||
-    midFlowQueue.awaitingScoutMonth ||
+    midFlowQueue.awaitingScoutMonth || midFlowQueue.awaitingFreshFilter ||
     midFlowQueue.wizard || midFlowQueue.answeringGift
   ))
   if (!isOwner && !isAccessCmd && !isGiftCmd && !midFlow && !doc) {
@@ -2705,7 +2741,7 @@ module.exports = async (req, res) => {
   if (/^\/cancel(@\w+)?$/.test(text)) {
     const q = await getUserQueue(userId)
     q.awaitingMessages = false; q.awaitingReviewCap = false; q.awaitingCompanyList = false
-    q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false; q.awaitingScoutMonth = false
+    q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false; q.awaitingScoutMonth = false; q.awaitingFreshFilter = false
     q.awaitingPayContact = false; q.awaitingPayPrice = false; q.awaitingTrialSize = false
     q.answeringGift = null; q.giftDraft = null; q.awaitingStartText = false; q.awaitingBroadcast = false
     q.pendingFindJob = null; q.pending = []; q.results = []; q.messages = []
@@ -3207,11 +3243,13 @@ module.exports = async (req, res) => {
       }
       userQueue.awaitingLeadCount = false
       userQueue.pendingSearch.wantCount = wantCount
-      userQueue.awaitingLockedFilter = true
+      userQueue.awaitingFreshFilter = true
       await saveUserQueue(userId, userQueue)
-      await sendKeyboard(chatId, `🔐 Include password-protected / "coming soon" stores?`, [
-        [{ text: '✅ Yes, show them', callback_data: 'lockedyes' }],
-        [{ text: '🚫 No, skip them', callback_data: 'lockedno' }]
+      await sendKeyboard(chatId, `🌱 How fresh should the stores be?\n\nI keep checking until I have ${wantCount} that pass this — old stores get skipped, not counted.`, [
+        [{ text: '🌱 Brand new (≤30 days)', callback_data: 'scoutfresh:30' },
+         { text: '🌱 Under 3 months (≤90 days)', callback_data: 'scoutfresh:90' }],
+        [{ text: '🌱 Under a year (≤365 days)', callback_data: 'scoutfresh:365' },
+         { text: '🌍 Any age', callback_data: 'scoutfresh:any' }]
       ])
       return res.status(200).send('OK')
     }
@@ -3293,12 +3331,12 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
 
-    // ── Continue next batch ──
-    if (userQueue.pending.length > 0) {
+    // ── Continue hunting: user pinged while a scout is still short of its target ──
+    if (!userQueue.done && (userQueue.pending.length > 0 || (userQueue.searchCtx && !userQueue.searchCtx.exhausted))) {
       return await runBatch(chatId, userId, userQueue)
     }
 
-    if (userQueue.results.length > 0 && !userQueue.awaitingMessages) {
+    if (userQueue.results.length > 0 && !userQueue.awaitingMessages && userQueue.done) {
       const withEmail = userQueue.results.filter(r => r.email !== 'no email')
       userQueue.awaitingMessages = true
       await saveUserQueue(userId, userQueue)
