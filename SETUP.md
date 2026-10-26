@@ -409,9 +409,17 @@ daemon run in `daemon.yml`:
 
 ### URLScan Scraping
 
-Send `/scout` in Telegram → pick a search → reply with how many leads → choose whether to include locked stores.
+Send `/scout` in Telegram → pick a search → choose a date window → reply with how many leads → choose freshness and whether to include locked stores → type `all` or one required social platform (`linkedin`, `facebook`, `instagram`, or `x`).
 
-Results come back in batches. Send any message to continue to the next batch.
+Under **Custom date or backward range**, choose one exact day or a backward range, then type the year, month, and day. A range asks for its total number of days and counts backward while including the selected end date. URLScan's public index only reaches back about 30 days, so older custom dates are rejected rather than returning an unexplained empty search.
+
+A required social platform is mandatory: stores without it are skipped and do not count toward the requested lead total. Social extraction rejects Shopify/default placeholder handles, non-profile links, dead profiles, and redirects away from the social platform. If a social network blocks automated profile checks, a structurally valid link is kept unless there is positive evidence that it is invalid.
+
+Results come back in batches. Send any message to continue searching until the requested number of qualifying leads is found or URLScan is exhausted.
+
+### Gifts
+
+The owner creates gifts from **Admin → Gifts**. Publishing sends a direct Telegram notification to every known user. Quiz gifts show **Answer / Decline**; other gifts show **Claim / Decline**. Decline hides that gift only for the user who tapped it. Claims and quiz answers are locked per gift so simultaneous responses cannot overwrite the winner. Wrong quiz answers leave the gift open.
 
 ### File Upload
 

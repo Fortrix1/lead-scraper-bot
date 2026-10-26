@@ -65,6 +65,7 @@ module.exports = async (req, res) => {
     rows.push([{ text: '🕐 Last 30 days',  callback_data: 'scoutmonth:last30' },
                { text: `📅 This month (${MONTH_NAMES[now.getUTCMonth()]})`, callback_data: 'scoutmonth:thismonth' }])
     rows.push([{ text: '🌐 Any time (newest first)', callback_data: 'scoutmonth:any' }])
+    rows.push([{ text: '✏️ Custom date or backward range', callback_data: 'scoutdatecustom' }])
     return rows
   }
   // WORKING urlscan date syntax (verified live): an INCLUSIVE range —
@@ -86,6 +87,28 @@ module.exports = async (req, res) => {
       from = isoDay(new Date(Date.UTC(y, m - 1, 1)))
     }
     return `${query} AND date:[${from} TO ${today}]`
+  }
+  function applyScoutDateFilter(query, month, dateRange) {
+    if (dateRange && dateRange.from && dateRange.to) {
+      return `${query} AND date:[${dateRange.from} TO ${dateRange.to}]`
+    }
+    return applyMonthFilter(query, month)
+  }
+  function dateRangeLabel(range) {
+    if (!range) return ''
+    return range.from === range.to ? range.from : `${range.from} to ${range.to}`
+  }
+  function validIsoDay(year, month, day) {
+    const d = new Date(Date.UTC(year, month - 1, day))
+    if (d.getUTCFullYear() !== year || d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) return null
+    return d.toISOString().slice(0, 10)
+  }
+  function customDateWindowError(from, to) {
+    const today = new Date().toISOString().slice(0, 10)
+    const oldest = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)
+    if (to > today) return 'That date is in the future. Choose today or an earlier day.'
+    if (from < oldest) return `urlscan\'s public search only reaches back about 30 days (${oldest} onward here). Choose a more recent date or shorten the range.`
+    return ''
   }
 
   const LEAD_STATUSES = ['new', 'contacted', 'replied', 'interested', 'not_interested', 'do_not_contact', 'client']
@@ -206,7 +229,7 @@ module.exports = async (req, res) => {
   function activeFlowFlags(q) {
     return !!(q && (q.awaitingReviewCap || q.awaitingCompanyList || q.awaitingMessages ||
       q.awaitingCustomQuery || q.awaitingLeadCount || q.awaitingLockedFilter ||
-      q.wizard || q.answeringGift))
+      q.awaitingCustomDate || q.awaitingSocialFilter || q.wizard || q.answeringGift))
   }
 
   async function saveFilteredOut(userId, list) {
@@ -417,6 +440,22 @@ module.exports = async (req, res) => {
     await redis('SET', `gift:${g.id}`, JSON.stringify(g))
     await redis('ZADD', 'gifts:index', String(g.created || Date.now()), g.id)
   }
+  // Claims and quiz answers for the same gift must be serialized across Vercel
+  // invocations; otherwise two simultaneous reads can overwrite the winner.
+  async function withGiftLock(giftId, fn) {
+    const key = `lock:gift:${giftId}`
+    let acquired = false
+    for (let i = 0; i < 8; i++) {
+      const { ok, result } = await redis('SET', key, '1', 'NX', 'EX', '20')
+      if (ok && result === 'OK') { acquired = true; break }
+      await new Promise(r => setTimeout(r, 120))
+    }
+    if (!acquired) return false
+    try { await fn(); return true } finally { await redis('DEL', key) }
+  }
+  function giftDismissed(g, uid) {
+    return (g.dismissed || []).includes(String(uid))
+  }
   function normAnswer(s) {
     return String(s || '').toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim()
   }
@@ -459,39 +498,85 @@ module.exports = async (req, res) => {
     }
     return out.reverse()
   }
-  async function claimGift(chatId, uid, giftId) {
-    const g = await getGift(giftId)
-    if (!g || g.status !== 'open') { await send(chatId, `That gift is no longer available.`); return }
-    if (g.mode === 'quiz') { await send(chatId, `That one needs you to answer its question first — tap it in 🎁 Gifts and send your answer.`); return }
-    if ((g.winners || []).some(w => w.uid === uid)) { await send(chatId, `You already claimed this one 🎁`); return }
-    if (g.mode === 'first' && (g.winners || []).length >= 1) { await send(chatId, `Someone already grabbed this one — check the other open gifts!`); return }
-    if (g.mode === 'everyone' && g.maxClaims > 0 && (g.winners || []).length >= g.maxClaims) { await send(chatId, `This gift is all claimed out — check back for the next one!`); return }
-    g.winners = g.winners || []
-    g.winners.push({ uid, ts: Date.now() })
-    if (g.mode === 'first') g.status = 'closed'
-    await saveGift(g)
-    await awardGiftTo(g, uid)
-    await deliverGift(uid, g)
-    await notifyOwnerGiftLine(g, uid, 'claimed')
-    await send(chatId, `🎁 Gift claimed — check your DMs from the bot!`)
+  function giftInviteText(g) {
+    return `🎁 New gift for you!\n\n🎟️ ${giftPrizeText(g)}` +
+      (g.message ? `\n\n💌 ${g.message}` : '') +
+      (g.mode === 'quiz' ? `\n\n❓ ${g.question}\n\nTap Answer, then send your answer as a normal message.` :
+        g.mode === 'first' ? `\n\n⚡ First person to claim wins.` : `\n\nTap Claim to receive yours.`)
   }
-  async function answerGift(chatId, uid, giftId, text) {
-    const g = await getGift(giftId)
-    if (!g || g.status !== 'open') { await send(chatId, `That gift is no longer available.`); return }
-    if ((g.winners || []).length >= 1) { await send(chatId, `Someone already won this one!`); return }
-    g.attempts = g.attempts || {}
-    g.attempts[String(uid)] = text.slice(0, 200)
-    await saveGift(g)
-    if (normAnswer(text) === normAnswer(g.answer)) {
-      g.winners = [{ uid, ts: Date.now() }]
-      g.status = 'closed'
+  function giftInviteKeyboard(g) {
+    return [[
+      B(g.mode === 'quiz' ? '✏️ Answer' : '🎁 Claim', g.mode === 'quiz' ? `giftans:${g.id}` : `giftclaim:${g.id}`),
+      B('🚫 Decline', `giftdecline:${g.id}`)
+    ]]
+  }
+  async function publishGiftToAll(g) {
+    const { result: ids } = await redis('SMEMBERS', 'bot:users')
+    let delivered = 0, failed = 0
+    const recipients = ids || []
+    // Small parallel batches stay below Telegram's broadcast rate while avoiding
+    // one long serial request chain inside a single Vercel invocation.
+    for (let i = 0; i < recipients.length; i += 20) {
+      const responses = await Promise.all(recipients.slice(i, i + 20).map(uid => tgCall('sendMessage', {
+        chat_id: uid, text: giftInviteText(g),
+        reply_markup: { inline_keyboard: giftInviteKeyboard(g) }
+      })))
+      for (const r of responses) { if (r?.ok) delivered++; else failed++ }
+      if (i + 20 < recipients.length) await new Promise(resolve => setTimeout(resolve, 800))
+    }
+    return { delivered, failed }
+  }
+  function giftUnavailableText(g) {
+    if (!g) return 'That gift could not be found. Open /gift to see the current gifts.'
+    if ((g.winners || []).length) return 'This gift already has a winner.'
+    return 'This gift was closed by the owner. No winner was recorded.'
+  }
+  async function claimGift(chatId, uid, giftId) {
+    const ran = await withGiftLock(giftId, async () => {
+      const g = await getGift(giftId)
+      if (!g || g.status !== 'open') { await send(chatId, giftUnavailableText(g)); return }
+      if (g.mode === 'quiz') { await send(chatId, `This is a quiz gift — tap Answer and send your answer.`); return }
+      if ((g.winners || []).some(w => String(w.uid) === String(uid))) { await send(chatId, `You already claimed this one 🎁`); return }
+      if (g.mode === 'first' && (g.winners || []).length >= 1) { await send(chatId, `Someone already grabbed this one — check the other open gifts!`); return }
+      if (g.mode === 'everyone' && g.maxClaims > 0 && (g.winners || []).length >= g.maxClaims) { await send(chatId, `This gift is all claimed out — check back for the next one!`); return }
+      g.winners = g.winners || []
+      g.winners.push({ uid, ts: Date.now() })
+      if (g.mode === 'first') g.status = 'closed'
       await saveGift(g)
       await awardGiftTo(g, uid)
       await deliverGift(uid, g)
-      await notifyOwnerGiftLine(g, uid, 'WON (correct answer)')
-      await send(chatId, `🎉 Correct! You won — the gift is in your DMs.`)
-    } else {
-      await send(chatId, `❌ Not quite — think it over and send another answer. (Wrong answers land on the owner's screen, who can also award the gift by hand.)`)
+      await notifyOwnerGiftLine(g, uid, 'claimed')
+      await send(chatId, `🎁 Gift claimed — your prize has been added to your account.`)
+    })
+    if (!ran) await send(chatId, 'That gift is busy with another response. Please tap the button again in a moment.')
+  }
+  async function answerGift(chatId, uid, giftId, text) {
+    const ran = await withGiftLock(giftId, async () => {
+      const g = await getGift(giftId)
+      if (!g || g.status !== 'open') { await send(chatId, giftUnavailableText(g)); return }
+      if (g.mode !== 'quiz') { await send(chatId, 'This gift needs Claim rather than an answer.'); return }
+      if ((g.winners || []).length >= 1) { await send(chatId, `Someone already won this one!`); return }
+      g.attempts = g.attempts || {}
+      g.attempts[String(uid)] = text.slice(0, 200)
+      if (normAnswer(text) === normAnswer(g.answer)) {
+        g.winners = [{ uid, ts: Date.now() }]
+        g.status = 'closed'
+        await saveGift(g)
+        await awardGiftTo(g, uid)
+        await deliverGift(uid, g)
+        await notifyOwnerGiftLine(g, uid, 'WON (correct answer)')
+        await send(chatId, `🎉 Correct! You won — your prize has been added to your account.`)
+      } else {
+        // Wrong attempts never close the gift or create a winner.
+        await saveGift(g)
+        await send(chatId, `❌ Not quite — tap Answer on the gift and try again. The gift is still open.`)
+      }
+    })
+    if (!ran) {
+      const q = await getUserQueue(uid)
+      q.answeringGift = giftId
+      await saveUserQueue(uid, q)
+      await send(chatId, 'Another answer is being checked. Please send yours again in a moment.')
     }
   }
 
@@ -803,19 +888,73 @@ module.exports = async (req, res) => {
     return generic.some(p => email.startsWith(p))
   }
 
+  const SOCIAL_HOSTS = {
+    facebook: ['facebook.com'], instagram: ['instagram.com'],
+    x: ['x.com', 'twitter.com'], linkedin: ['linkedin.com']
+  }
+  const SOCIAL_PLACEHOLDERS = new Set([
+    'shopify', 'shopifyplus', 'shopifydevelopers', 'yourstore', 'yourbrand',
+    'username', 'yourusername', 'example', 'examples', 'test', 'testing',
+    'facebook', 'instagram', 'twitter', 'x', 'linkedin', 'home', 'login'
+  ])
+  function normalizeSocialUrl(platform, raw) {
+    try {
+      const u = new URL(raw.replace(/[\\"'<>]+$/g, ''))
+      const host = u.hostname.toLowerCase().replace(/^(www|m|mobile)\./, '')
+      if (!SOCIAL_HOSTS[platform].includes(host)) return null
+      const parts = u.pathname.split('/').filter(Boolean)
+      if (platform === 'linkedin') {
+        if (!['company', 'in'].includes((parts[0] || '').toLowerCase()) || !parts[1]) return null
+        if (SOCIAL_PLACEHOLDERS.has(parts[1].toLowerCase())) return null
+      } else {
+        if (parts.length !== 1 || !/^[a-zA-Z0-9_.-]+$/.test(parts[0])) return null
+        if (SOCIAL_PLACEHOLDERS.has(parts[0].toLowerCase())) return null
+        if (['sharer', 'share', 'intent', 'hashtag', 'explore', 'p', 'reel', 'stories'].includes(parts[0].toLowerCase())) return null
+      }
+      return `https://${host}/${parts.join('/')}`
+    } catch { return null }
+  }
   function extractSocials(text) {
     const socials = {}
     const patterns = {
-      facebook:  /https?:\/\/(?:www\.)?facebook\.com\/[a-zA-Z0-9_.\-]+/,
-      instagram: /https?:\/\/(?:www\.)?instagram\.com\/[a-zA-Z0-9_.\-]+/,
-      twitter:   /https?:\/\/(?:www\.)?(?:twitter|x)\.com\/[a-zA-Z0-9_.\-]+/,
-      linkedin:  /https?:\/\/(?:www\.)?linkedin\.com\/(?:company|in)\/[a-zA-Z0-9_.\-]+/,
+      facebook:  /https?:\/\/(?:www\.|m\.)?facebook\.com\/[a-zA-Z0-9_.\-]+/gi,
+      instagram: /https?:\/\/(?:www\.)?instagram\.com\/[a-zA-Z0-9_.\-]+/gi,
+      x:         /https?:\/\/(?:www\.|mobile\.)?(?:twitter|x)\.com\/[a-zA-Z0-9_.\-]+/gi,
+      linkedin:  /https?:\/\/(?:www\.)?linkedin\.com\/(?:company|in)\/[a-zA-Z0-9_.\-]+/gi,
     }
     for (const [key, pat] of Object.entries(patterns)) {
-      const m = text.match(pat)
-      if (m) socials[key] = m[0]
+      for (const m of text.match(pat) || []) {
+        const clean = normalizeSocialUrl(key, m)
+        if (clean) { socials[key] = clean; break }
+      }
     }
     return socials
+  }
+  // A live 404, a platform "not found" page, or a redirect back to Shopify is
+  // definite proof of a bad link. Network blocks (403/429/timeouts) are not
+  // treated as proof that a real account is fake; the cleaned link is kept.
+  async function validateSocialUrl(platform, url) {
+    try {
+      const r = await fetch(url, {
+        redirect: 'follow', signal: AbortSignal.timeout(4500),
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36' }
+      })
+      const finalHost = new URL(r.url || url).hostname.toLowerCase().replace(/^(www|m|mobile)\./, '')
+      if (!SOCIAL_HOSTS[platform].includes(finalHost)) return false
+      if ([404, 410].includes(r.status)) return false
+      if ([401, 403, 429, 999].includes(r.status)) return true
+      if (!r.ok) return false
+      const body = (await r.text()).slice(0, 250000).toLowerCase()
+      if (/page (?:isn't|is not) available|this account doesn.?t exist|this page (?:could not|couldn't) be found|profile (?:does not|doesn't) exist/.test(body)) return false
+      return true
+    } catch { return true }
+  }
+  async function validateSocials(socials) {
+    const entries = Object.entries(socials || {})
+    const checked = await Promise.all(entries.map(async ([platform, url]) =>
+      [platform, url, await validateSocialUrl(platform, url)]))
+    return checked.filter(([, , valid]) => valid)
+      .reduce((out, [platform, url]) => { out[platform] = url; return out }, {})
   }
 
   // Official, free Companies House "advanced search" — the one API endpoint
@@ -1179,7 +1318,7 @@ module.exports = async (req, res) => {
         /enter (using )?password/i.test(html) || /opening soon/i.test(html)
       )
 
-      result.socials = extractSocials(html)
+      result.socials = await validateSocials(extractSocials(html))
       const homeEmails = cleanEmails(html)
 
       if (homeEmails.length) {
@@ -1195,9 +1334,13 @@ module.exports = async (req, res) => {
             const r = await fetch(pageUrl, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(3500) })
             if (!r.ok) return { pageUrl, emails: [], exists: false }
             const pageHtml = await r.text()
-            return { pageUrl, emails: cleanEmails(pageHtml), exists: true }
-          } catch { return { pageUrl, emails: [], exists: false } }
+            return { pageUrl, emails: cleanEmails(pageHtml), exists: true, socials: extractSocials(pageHtml) }
+          } catch { return { pageUrl, emails: [], exists: false, socials: {} } }
         }))
+        for (const fallback of fallbackResults) {
+          if (!fallback.socials) continue
+          result.socials = { ...result.socials, ...await validateSocials(fallback.socials) }
+        }
         const withEmail = fallbackResults.find(r => r.emails.length > 0)
         if (withEmail) {
           result.email = bestEmail(withEmail.emails)
@@ -1258,10 +1401,11 @@ module.exports = async (req, res) => {
   }
 
   // Does a checked store pass the user's reachability + freshness filters?
-  function isUsableLead(r, includeLocked, freshDays) {
+  function isUsableLead(r, includeLocked, freshDays, requiredSocial = null) {
     if (r.status !== 'OK') return false
     if (r.isPasswordProtected && !includeLocked) return false
     if (!(r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length)) return false
+    if (requiredSocial && !r.socials?.[requiredSocial]) return false
     // Freshness: provably-over-the-limit is dropped; an unknown age can't be
     // proven old, so it stays (it just won't carry a 🎂 tag).
     if (freshDays && typeof r.ageDays === 'number' && r.ageDays > freshDays) return false
@@ -1303,17 +1447,17 @@ module.exports = async (req, res) => {
     return true
   }
 
-  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked, month = null, freshDays = null) {
-    const scope = ymLabel(month)
-    await send(chatId, `🔍 Hunting for ${wantCount} leads — "${label}" (${scope}${freshDays ? `, ≤${freshDays}d old` : ''})...\n\n` +
+  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked, month = null, freshDays = null, dateRange = null, requiredSocial = null) {
+    const scope = dateRange ? dateRangeLabel(dateRange) : ymLabel(month)
+    await send(chatId, `🔍 Hunting for ${wantCount} leads — "${label}" (${scope}${freshDays ? `, ≤${freshDays}d old` : ''}${requiredSocial ? `, must have ${requiredSocial === 'x' ? 'X' : requiredSocial[0].toUpperCase() + requiredSocial.slice(1)}` : ''})...\n\n` +
       `⏱️ This can take several minutes: I keep pulling stores and checking each one live — age, email, socials, page speed — ` +
       `until I have ${wantCount} that pass your filters. If a run's time budget cuts me short, send anything and I'll pick up exactly where I stopped.`)
     const userQueue = {
       pending: [], results: [], delivered: 0, done: false,
       awaitingMessages: false, messages: [], awaitingCustomQuery: false,
       label: label || '', includeLocked: !!includeLocked,
-      wantCount, freshDays,
-      searchCtx: { query: applyMonthFilter(query, month), searchAfter: null, exhausted: false, total: null }
+      wantCount, freshDays, requiredSocial,
+      searchCtx: { query: applyScoutDateFilter(query, month, dateRange), searchAfter: null, exhausted: false, total: null }
     }
     await saveUserQueue(userId, userQueue)
     return await runBatch(chatId, userId, userQueue)
@@ -1354,9 +1498,10 @@ module.exports = async (req, res) => {
     const want = userQueue.wantCount || 0
     const freshDays = userQueue.freshDays || null
     const includeLocked = !!userQueue.includeLocked
+    const requiredSocial = userQueue.requiredSocial || null
 
     while (Date.now() < deadline) {
-      const usable = userQueue.results.filter(r => isUsableLead(r, includeLocked, freshDays))
+      const usable = userQueue.results.filter(r => isUsableLead(r, includeLocked, freshDays, requiredSocial))
       if (want && usable.length >= want) break
       if (!userQueue.pending.length) {
         if (!(await pullNextCandidates(userQueue))) break
@@ -1371,7 +1516,7 @@ module.exports = async (req, res) => {
       await saveUserQueue(userId, userQueue)
     }
 
-    const usableAll = userQueue.results.filter(r => isUsableLead(r, includeLocked, freshDays))
+    const usableAll = userQueue.results.filter(r => isUsableLead(r, includeLocked, freshDays, requiredSocial))
     const fresh = usableAll.slice(userQueue.delivered || 0).sort((a, b) => (b.score || 0) - (a.score || 0))
     const prevDelivered = (userQueue.delivered || 0)
     userQueue.delivered = usableAll.length
@@ -1774,7 +1919,7 @@ module.exports = async (req, res) => {
   }
 
   async function buildGiftsScreen(userId) {
-    const open = await openGiftList()
+    const open = (await openGiftList()).filter(g => !giftDismissed(g, userId))
     if (!open.length) {
       return { text: `<b>🎁 Gifts</b>\n\nNo open gifts right now — check back soon!`, kb: [[B('🏠 Main menu', 'menu:main')]] }
     }
@@ -1807,7 +1952,7 @@ module.exports = async (req, res) => {
         `<b>/grant1 &lt;user id&gt; [count]</b> — give one-time search credits\n` +
         `<b>/revoke &lt;user id&gt;</b> — strip pass + credits and block their free trial\n\n` +
         `<b>🎁 Gifts</b> (also: /gift → 🎁 Gifts)\n` +
-        `Create a gift in 4 taps: prize (searches with a result cap, or a days-pass) → who gets it (everyone / first claim / quiz question) → optional personal message. Winners get it by DM; you get a DM on every claim. For quiz gifts, open 📝 Attempts to read answers and 🏆 mark a winner by hand.\n\n` +
+        `Create a gift: prize (searches with a result cap, or a days-pass) → who gets it (everyone / first claim / quiz question) → optional personal message. Publishing DMs every known user with Answer/Claim and Decline buttons. Decline hides the gift only for that user. Winners get their prize by DM; you get a DM on every claim. For quiz gifts, open 📝 Attempts to read answers and 🏆 mark a winner by hand.\n\n` +
         `<b>✏️ Text editing</b>\n` +
         `✏️ Edit /start message — replace the welcome text shown on /start for everyone ("clear" resets it)\n\n` +
         `<b>Other owner tools</b>\n` +
@@ -2123,15 +2268,34 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
 
+    if (d.startsWith('giftdecline:')) {
+      const gid = d.slice('giftdecline:'.length)
+      const ran = await withGiftLock(gid, async () => {
+        const g = await getGift(gid)
+        if (g && !giftDismissed(g, actorId)) {
+          g.dismissed = g.dismissed || []
+          g.dismissed.push(String(actorId))
+          await saveGift(g)
+        }
+      })
+      await tgCall('editMessageText', {
+        chat_id: cbChat, message_id: cbMsg,
+        text: ran ? '🎁 Gift declined. It is hidden only for you; nobody else is affected.' : 'Please tap Decline again in a moment.',
+        reply_markup: { inline_keyboard: [[B('🎁 Other gifts', 'menu:gifts'), B('🏠 Main menu', 'menu:main')]] }
+      })
+      await answerCb(cq.id, ran ? 'Gift dismissed for you.' : 'Try again in a moment.')
+      return res.status(200).send('OK')
+    }
+
     if (d.startsWith('giftclaim:')) {
       await answerCb(cq.id)
-      await claimGift(cbChat, actorId, d.slice(12))
+      await claimGift(cbChat, actorId, d.slice('giftclaim:'.length))
       return res.status(200).send('OK')
     }
 
     if (d.startsWith('giftans:')) {
       await answerCb(cq.id)
-      const gid = d.slice(9)
+      const gid = d.slice('giftans:'.length)
       const g0 = await getGift(gid)
       if (!g0 || g0.status !== 'open') { await send(cbChat, 'That gift is no longer available.'); return res.status(200).send('OK') }
       const gq2 = await getUserQueue(actorId)
@@ -2193,24 +2357,28 @@ module.exports = async (req, res) => {
       const parts = d.split(':')
       const gid = parts[1]
       if (parts[0] === 'giftclose') {
-        const g = await getGift(gid)
-        if (g) { g.status = 'closed'; await saveGift(g) }
+        await withGiftLock(gid, async () => {
+          const g = await getGift(gid)
+          if (g) { g.status = 'closed'; await saveGift(g) }
+        })
         await pushScreen(cbChat, cbMsg, await buildGiftAdminScreen())
       } else if (parts[0] === 'giftatt') {
         const s = await buildGiftAttemptsScreen(gid)
         if (s) await pushScreen(cbChat, cbMsg, s)
       } else {
         const uid2 = parts.slice(2).join(':')
-        const g = await getGift(gid)
-        if (g && g.status === 'open' && !(g.winners || []).some(w => w.uid === uid2)) {
-          g.winners = g.winners || []
-          g.winners.push({ uid: uid2, ts: Date.now() })
-          g.status = 'closed'
-          await saveGift(g)
-          await awardGiftTo(g, uid2)
-          await deliverGift(uid2, g, '🏆 Awarded by the owner.')
-          await notifyOwnerGiftLine(g, uid2, 'awarded manually')
-        }
+        await withGiftLock(gid, async () => {
+          const g = await getGift(gid)
+          if (g && g.status === 'open' && !(g.winners || []).some(w => String(w.uid) === String(uid2))) {
+            g.winners = g.winners || []
+            g.winners.push({ uid: uid2, ts: Date.now() })
+            g.status = 'closed'
+            await saveGift(g)
+            await awardGiftTo(g, uid2)
+            await deliverGift(uid2, g, '🏆 Awarded by the owner.')
+            await notifyOwnerGiftLine(g, uid2, 'awarded manually')
+          }
+        })
         await pushScreen(cbChat, cbMsg, await buildGiftAdminScreen())
       }
       return res.status(200).send('OK')
@@ -2280,22 +2448,20 @@ module.exports = async (req, res) => {
         const q = await getUserQueue(cbUserId)
         const search = q.pendingSearch
         q.awaitingLockedFilter = false
-        q.pendingSearch = null
-        await saveUserQueue(cbUserId, q)
-        if (!search) return res.status(200).send('OK')
-        const includeLocked = data === 'lockedyes'
+        if (!search) { await saveUserQueue(cbUserId, q); return res.status(200).send('OK') }
+        search.includeLocked = data === 'lockedyes'
         if (search.isDirectList) {
+          q.pendingSearch = null
+          await saveUserQueue(cbUserId, q)
           const batchLinks = search.rawLinks.slice(0, search.wantCount)
-          return await startBatchJob(cbChatId, cbUserId, batchLinks, search.label, null, null, includeLocked, search.wantCount, search.freshDays || null)
+          return await startBatchJob(cbChatId, cbUserId, batchLinks, search.label, null, null, search.includeLocked, search.wantCount, search.freshDays || null)
         }
-        // /scout doesn't go through the shared job queue (it runs right here, hitting
-        // URLScan.io directly) — so this is the actual "the search is happening now"
-        // moment, same role as queueJob plays for /find and /findco.
-        if (!isOwner) {
-          const scoutTier = await tierOf(cbUserId)
-          if (!(await spendFreeCredit(cbChatId, scoutTier, cbUserId))) return res.status(200).send('OK')
-        }
-        return await startScoutJob(cbChatId, cbUserId, search.query, search.label, search.wantCount, includeLocked, search.month, search.freshDays || null)
+        q.awaitingSocialFilter = true
+        await saveUserQueue(cbUserId, q)
+        await send(cbChatId,
+          `📱 Social-media filter\n\nType ALL to show every usable store, or type ONE platform that every result must have: LinkedIn, Facebook, Instagram, or X.\n\n` +
+          `If a store lacks a valid link for your chosen platform, it is skipped and does not count toward your requested total.`)
+        return res.status(200).send('OK')
       }
 
       if (data === 'scout_custom') {
@@ -2303,6 +2469,35 @@ module.exports = async (req, res) => {
         const q = await getUserQueue(cbUserId)
         q.awaitingCustomQuery = true
         await saveUserQueue(cbUserId, q)
+        return res.status(200).send('OK')
+      }
+
+      if (data === 'scoutdatecustom') {
+        const q = await getUserQueue(cbUserId)
+        if (!q.pendingSearch || q.pendingSearch.isDirectList) {
+          await send(cbChatId, 'That search expired — send /scout to start again.')
+          return res.status(200).send('OK')
+        }
+        q.awaitingCustomDate = true
+        q.customDate = { step: 'mode' }
+        await saveUserQueue(cbUserId, q)
+        await sendKeyboard(cbChatId, '📅 Custom date — choose a search type:', [
+          [{ text: '1️⃣ One exact day', callback_data: 'scoutdatemode:single' }],
+          [{ text: '↩️ Range counting backward', callback_data: 'scoutdatemode:range' }]
+        ])
+        return res.status(200).send('OK')
+      }
+
+      if (data.startsWith('scoutdatemode:')) {
+        const q = await getUserQueue(cbUserId)
+        if (!q.pendingSearch || !q.customDate) {
+          await send(cbChatId, 'That custom date flow expired — send /scout to start again.')
+          return res.status(200).send('OK')
+        }
+        q.customDate.mode = data.endsWith(':range') ? 'range' : 'single'
+        q.customDate.step = 'year'
+        await saveUserQueue(cbUserId, q)
+        await send(cbChatId, `📅 ${q.customDate.mode === 'range' ? 'Backward range' : 'Single day'} selected.\n\nStep 1: type the YEAR (for example, 2026).`)
         return res.status(200).send('OK')
       }
 
@@ -2326,6 +2521,9 @@ module.exports = async (req, res) => {
           return res.status(200).send('OK')
         }
         q.pendingSearch.month = month
+        q.pendingSearch.dateRange = null
+        q.customDate = null
+        q.awaitingCustomDate = false
         q.awaitingScoutMonth = false
         q.awaitingLeadCount = true
         await saveUserQueue(cbUserId, q)
@@ -2389,6 +2587,7 @@ module.exports = async (req, res) => {
     midFlowQueue.awaitingMessages || midFlowQueue.awaitingCustomQuery ||
     midFlowQueue.awaitingLeadCount || midFlowQueue.awaitingLockedFilter ||
     midFlowQueue.awaitingScoutMonth || midFlowQueue.awaitingFreshFilter ||
+    midFlowQueue.awaitingCustomDate || midFlowQueue.awaitingSocialFilter ||
     midFlowQueue.wizard || midFlowQueue.answeringGift
   ))
   if (!isOwner && !isAccessCmd && !isGiftCmd && !midFlow && !doc) {
@@ -2596,8 +2795,9 @@ module.exports = async (req, res) => {
         await saveGift(gift)
         gq.giftDraft = null
         await saveUserQueue(userId, gq)
+        const notice = await publishGiftToAll(gift)
         await tgCall('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
-          text: `✅ Gift <code>${gid}</code> is LIVE.\n\n🎁 ${giftPrizeText(gift)} · mode: ${gift.mode}${gift.message ? '\n💌 "' + gift.message.slice(0, 80) + '"' : ''}\n\nUsers see it under 🎁 Gifts on the main menu (or /gift). You get a DM every time someone claims or wins.`,
+          text: `✅ Gift <code>${gid}</code> is LIVE.\n\n🎁 ${giftPrizeText(gift)} · mode: ${gift.mode}${gift.message ? '\n💌 "' + gift.message.slice(0, 80) + '"' : ''}\n\n📨 Direct notification delivered to ${notice.delivered} user(s)${notice.failed ? `; ${notice.failed} failed (blocked bot or deleted chat)` : ''}. It also remains under 🎁 Gifts unless a user declines it.`,
           reply_markup: { inline_keyboard: [[B('🎁 Gift admin', 'menu:admingifts')]] } })
         return res.status(200).send('OK')
       }
@@ -2742,6 +2942,7 @@ module.exports = async (req, res) => {
     const q = await getUserQueue(userId)
     q.awaitingMessages = false; q.awaitingReviewCap = false; q.awaitingCompanyList = false
     q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false; q.awaitingScoutMonth = false; q.awaitingFreshFilter = false
+    q.awaitingCustomDate = false; q.awaitingSocialFilter = false; q.customDate = null; q.pendingSearch = null
     q.awaitingPayContact = false; q.awaitingPayPrice = false; q.awaitingTrialSize = false
     q.answeringGift = null; q.giftDraft = null; q.awaitingStartText = false; q.awaitingBroadcast = false
     q.pendingFindJob = null; q.pending = []; q.results = []; q.messages = []
@@ -3229,6 +3430,79 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
 
+    // ── Custom Scout date: year → month → day → optional backward range ──
+    if (userQueue.awaitingCustomDate && userQueue.customDate) {
+      const cd = userQueue.customDate
+      if (cd.step === 'mode') {
+        await send(chatId, 'Tap One exact day or Range counting backward on the date buttons above.')
+        return res.status(200).send('OK')
+      }
+      if (cd.step === 'year') {
+        const year = Number(text.trim())
+        if (!/^\d{4}$/.test(text.trim()) || year < 2000 || year > new Date().getUTCFullYear()) {
+          await send(chatId, `Type a valid four-digit year from 2000 to ${new Date().getUTCFullYear()}.`)
+          return res.status(200).send('OK')
+        }
+        cd.year = year; cd.step = 'month'
+        await saveUserQueue(userId, userQueue)
+        await send(chatId, 'Step 2: type the MONTH — a number 1–12 or a name such as October.')
+        return res.status(200).send('OK')
+      }
+      if (cd.step === 'month') {
+        const rawMonth = text.trim().toLowerCase()
+        const namedMonth = MONTH_NAMES.findIndex(name => name.toLowerCase() === rawMonth || name.slice(0, 3).toLowerCase() === rawMonth)
+        const month = namedMonth >= 0 ? namedMonth + 1 : Number(rawMonth)
+        if (!Number.isInteger(month) || month < 1 || month > 12) {
+          await send(chatId, 'Type a month from 1–12, or its name (for example, 10 or October).')
+          return res.status(200).send('OK')
+        }
+        cd.month = month; cd.step = 'day'
+        await saveUserQueue(userId, userQueue)
+        await send(chatId, `Step 3: type the DAY of ${MONTH_NAMES[month - 1]} ${cd.year}.`)
+        return res.status(200).send('OK')
+      }
+      if (cd.step === 'day') {
+        const day = Number(text.trim())
+        const iso = validIsoDay(cd.year, cd.month, day)
+        if (!iso) {
+          await send(chatId, `That is not a real day in ${MONTH_NAMES[cd.month - 1]} ${cd.year}. Type a valid day number.`)
+          return res.status(200).send('OK')
+        }
+        cd.to = iso
+        if (cd.mode === 'range') {
+          cd.step = 'rangeDays'
+          await saveUserQueue(userId, userQueue)
+          await send(chatId, `↩️ Range end: ${iso}.\n\nHow many days in total, counting backward and INCLUDING this end date? Type 2–30.\nExample: 5 days ending on the 10th = the 6th through the 10th.`)
+          return res.status(200).send('OK')
+        }
+        cd.from = iso
+      } else if (cd.step === 'rangeDays') {
+        const days = Number(text.trim())
+        if (!/^\d+$/.test(text.trim()) || days < 2 || days > 30) {
+          await send(chatId, 'Type a whole number from 2–30. The range includes the selected end date.')
+          return res.status(200).send('OK')
+        }
+        cd.from = new Date(Date.parse(cd.to + 'T00:00:00Z') - (days - 1) * 86400000).toISOString().slice(0, 10)
+      } else if (cd.step !== 'day') {
+        await send(chatId, 'That date step could not be read. Send /cancel, then start /scout again.')
+        return res.status(200).send('OK')
+      }
+      const windowError = customDateWindowError(cd.from, cd.to)
+      if (windowError) {
+        await send(chatId, windowError + (cd.mode === 'range' ? '\n\nType a shorter number of days, or /cancel to start over.' : '\n\nType a different day, or /cancel to start over.'))
+        return res.status(200).send('OK')
+      }
+      userQueue.pendingSearch.month = null
+      userQueue.pendingSearch.dateRange = { from: cd.from, to: cd.to }
+      userQueue.awaitingCustomDate = false
+      userQueue.customDate = null
+      userQueue.awaitingScoutMonth = false
+      userQueue.awaitingLeadCount = true
+      await saveUserQueue(userId, userQueue)
+      await send(chatId, `✅ Date set: ${dateRangeLabel(userQueue.pendingSearch.dateRange)}.\n\nHow many NEW leads? Reply with a number (max 300).`)
+      return res.status(200).send('OK')
+    }
+
     // ── Awaiting lead count ──
     if (userQueue.awaitingLeadCount) {
       const n = parseInt(text.replace(/[^0-9]/g, ''), 10)
@@ -3252,6 +3526,31 @@ module.exports = async (req, res) => {
          { text: '🌍 Any age', callback_data: 'scoutfresh:any' }]
       ])
       return res.status(200).send('OK')
+    }
+
+    // ── Final Scout filter: show all, or require one real social platform ──
+    if (userQueue.awaitingSocialFilter) {
+      const aliases = { linkedin: 'linkedin', facebook: 'facebook', instagram: 'instagram', ig: 'instagram', x: 'x', twitter: 'x' }
+      const choice = text.trim().toLowerCase()
+      const requiredSocial = aliases[choice] || null
+      if (choice !== 'all' && !requiredSocial) {
+        await send(chatId, 'Type ALL, LinkedIn, Facebook, Instagram, or X. A chosen platform is required on every returned store.')
+        return res.status(200).send('OK')
+      }
+      const search = userQueue.pendingSearch
+      userQueue.awaitingSocialFilter = false
+      userQueue.pendingSearch = null
+      await saveUserQueue(userId, userQueue)
+      if (!search) {
+        await send(chatId, 'That search expired — send /scout to start again.')
+        return res.status(200).send('OK')
+      }
+      if (!isOwner) {
+        const scoutTier = await tierOf(userId)
+        if (!(await spendFreeCredit(chatId, scoutTier, userId))) return res.status(200).send('OK')
+      }
+      return await startScoutJob(chatId, userId, search.query, search.label, search.wantCount,
+        !!search.includeLocked, search.month, search.freshDays || null, search.dateRange || null, requiredSocial)
     }
 
     // ── File upload: .txt of links, OR a cookie export (.json/.txt) ──
