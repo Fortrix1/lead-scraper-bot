@@ -1,6 +1,11 @@
 // api/scraper_bot.js
 // Personal Telegram lead-scraper bot — hosted on Vercel
 // v4: admin lock, audit log, /fresh as automatic tick switch, relay-aware age lookups
+// v5: scout date windows skip the redundant freshness question (the chosen
+//     window is enforced strictly, then it goes straight to the password
+//     question); new AI Site Hunter module (/hunt + /check + 🤖 buttons) that
+//     finds AI-builder sites (Lovable/Framer/v0/Bolt...) via crt.sh CT logs,
+//     fingerprints them, scores AI copy, and pulls owner contacts.
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*')
@@ -229,7 +234,7 @@ module.exports = async (req, res) => {
   function activeFlowFlags(q) {
     return !!(q && (q.awaitingReviewCap || q.awaitingCompanyList || q.awaitingMessages ||
       q.awaitingCustomQuery || q.awaitingLeadCount || q.awaitingLockedFilter ||
-      q.awaitingCustomDate || q.awaitingSocialFilter || q.wizard || q.answeringGift))
+      q.awaitingCustomDate || q.awaitingSocialFilter || q.awaitingHuntUrl || q.wizard || q.answeringGift))
   }
 
   async function saveFilteredOut(userId, list) {
@@ -1381,6 +1386,318 @@ module.exports = async (req, res) => {
     return `${Math.floor(hours / 24)}d ago`
   }
 
+  // ══════════════════════════════════════════════
+  //  AI SITE HUNTER — finds brand-new websites built by AI website builders
+  //  (Lovable, Framer, v0/Bolt, Durable, Hostinger AI, Wix AI...).
+  //  Source: crt.sh Certificate Transparency logs — every new subdomain cert
+  //  on a builder's free host is a fresh AI-built site. This module only
+  //  READS public pages and public APIs (no logins, no posting anywhere).
+  // ══════════════════════════════════════════════
+  const AI_HUNT_SOURCES = {
+    lovable: { label: 'Lovable',        suffixes: ['lovable.app'] },
+    framer:  { label: 'Framer',         suffixes: ['framer.app'] },
+    all:     { label: 'All AI builders', suffixes: ['lovable.app', 'framer.app', 'vercel.app', 'netlify.app', 'pages.dev'] }
+  }
+  // vercel.app / netlify.app / pages.dev cert logs are enormous — only keep
+  // subdomains that look like a real small business (keyword filter).
+  const AI_HUNT_BIG_HOSTS = ['vercel.app', 'netlify.app', 'pages.dev']
+  const AI_HUNT_KEYWORDS = ['roof','dental','law','plumb','agency','salon','clinic','landscap','clean','fitness','gym',
+    'restaurant','bakery','realty','estate','coach','consult','repair','detail','movers','moving','pest','hvac',
+    'electric','photo','wedding','tutor','account','insur','mortgage','chiro','therapy','spa','barber','auto',
+    'studio','shop','store','care','homes','build','design','market']
+
+  const AI_SUBDOMAIN_BUILDERS = { 'lovable.app': 'Lovable', 'framer.app': 'Framer' }
+  const AI_BUILDER_MARKERS = [
+    { builder: 'Lovable',      category: 'AI_BUILDER', conf: 0.9,  tests: [/lovable-uploads\//i, /lovable-logo-mono/i] },
+    { builder: 'Framer',       category: 'AI_BUILDER', conf: 0.9,  tests: [/framerusercontent\.com/i, /data-framer-/i] },
+    { builder: 'Durable',      category: 'AI_BUILDER', conf: 0.85, tests: [/cdn\.durable\.co/i, /<meta[^>]+generator[^>]+durable/i] },
+    { builder: 'Hostinger AI', category: 'AI_BUILDER', conf: 0.85, tests: [/<meta[^>]+name=["']generator["'][^>]*hostinger/i] },
+    { builder: 'Wix',          category: 'NO_CODE',    conf: 0.9,  tests: [/static\.wixstatic\.com/i] },
+    { builder: 'Webflow',      category: 'NO_CODE',    conf: 0.9,  tests: [/cdn\.prod\.website-files\.com/i, /data-wf-page/i] },
+    { builder: 'Squarespace',  category: 'NO_CODE',    conf: 0.9,  tests: [/static1\.squarespace\.com/i, /squarespace\.com\/assets/i] },
+  ]
+  // "AI wrote this" copy heuristics — each match counts once (spec §5.2).
+  const AI_COPY_PATTERNS = [
+    /in today's fast-paced/i, /we pride ourselves on/i, /our journey began/i,
+    /look no further/i, /elevate your/i, /seamless(?:ly)?/i, /game.?chang(?:er|ing)/i,
+    /your one-stop/i, /whether you're a/i, /cutting-edge (?:solutions|technology)/i,
+    /at .{2,30}, we believe/i, /unparalleled/i, /delve into/i,
+    /transform(?:ing)? the way you/i, /a game-changer/i, /changed my business/i
+  ]
+
+  function aiDomainAllowed(host) {
+    if (!/^[a-z0-9][a-z0-9.-]*$/.test(host) || host.includes('..')) return false
+    const big = AI_HUNT_BIG_HOSTS.find(s => host.endsWith('.' + s))
+    if (!big) return true   // lovable.app / framer.app: every subdomain is an AI-built site
+    const sub = host.slice(0, -(big.length + 1))
+    return !!sub && AI_HUNT_KEYWORDS.some(k => sub.includes(k))
+  }
+
+  function huntCountButtons(srcKey, tier) {
+    if (tier === 'daily')   return [[B(`🎁 Free hunt (${DAILY_RESULT_CAP})`, `huntgo:${srcKey}:${DAILY_RESULT_CAP}`)]]
+    if (tier === 'onetime') return [[B(`🎁 Free hunt (${FREE_RESULT_CAP})`, `huntgo:${srcKey}:${FREE_RESULT_CAP}`)]]
+    return [[B('10', `huntgo:${srcKey}:10`), B('20', `huntgo:${srcKey}:20`), B('50', `huntgo:${srcKey}:50`)]]
+  }
+
+  // Newest certs for one builder suffix. Returns null on failure (crt.sh is
+  // often overloaded — one retry with backoff), [] when genuinely empty.
+  // Uses the same CRTSH_RELAY_URL relay as the store-age lookups when set.
+  async function fetchCrtshNewestDomains(suffix, limit = 200) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await fetch(`${CRTSH_BASE}?q=${encodeURIComponent('%.' + suffix)}&output=json`,
+          { signal: AbortSignal.timeout(25000), headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AIHunter/1.0' } })
+        if (!r.ok) { if (!attempt) await new Promise(r2 => setTimeout(r2, 4000)); continue }
+        const rows = await r.json()
+        const newest = new Map()
+        for (const row of rows || []) {
+          const nb = Date.parse(row.not_before || '') || 0
+          for (let n of String(row.name_value || row.common_name || '').split('\n')) {
+            n = n.trim().toLowerCase().replace(/^\*\./, '').replace(/\.$/, '')
+            if (!n.endsWith('.' + suffix) || !aiDomainAllowed(n)) continue
+            if (nb >= (newest.get(n) || 0)) newest.set(n, nb)
+          }
+        }
+        return [...newest.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit)
+          .map(([domain, notBefore]) => ({ domain, notBefore }))
+      } catch (e) {
+        if (!attempt) await new Promise(r2 => setTimeout(r2, 4000))
+      }
+    }
+    return null
+  }
+
+  function htmlToVisibleText(html) {
+    return String(html || '')
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&[a-z#0-9]+;/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+
+  function aiCopyScore(text) {
+    const words = Math.max(1, text.split(' ').filter(Boolean).length)
+    let hits = 0
+    for (const p of AI_COPY_PATTERNS) if (p.test(text)) hits++
+    return Math.min(40, Math.round((hits / (words / 100)) * 25))
+  }
+
+  function detectAiBuilder(host, html) {
+    for (const [suffix, name] of Object.entries(AI_SUBDOMAIN_BUILDERS)) {
+      if (host === suffix || host.endsWith('.' + suffix)) return { builder: name, confidence: 0.99, category: 'AI_BUILDER' }
+    }
+    for (const m of AI_BUILDER_MARKERS) {
+      if (m.tests.some(t => t.test(html))) return { builder: m.builder, confidence: m.conf, category: m.category }
+    }
+    return null
+  }
+
+  function aiSiteWeaknesses(html) {
+    const w = []
+    if (/lovable-logo-mono/i.test(html)) w.push("default Lovable logo still in place")
+    if (!/<meta[^>]+name=["']description["']/i.test(html)) w.push('no meta description')
+    const tm = html.match(/<title[^>]*>([^<]*)<\/title>/i)
+    const title = tm ? tm[1].trim() : ''
+    if (!title || /^(home|index|welcome|untitled|new (site|website|project))$/i.test(title)) w.push(`generic title tag${title ? ` ('${title}')` : ''}`)
+    const internalLinks = new Set(html.match(/href=["']\/[a-z0-9][a-z0-9\-/]{0,40}["']/gi) || [])
+    if (internalLinks.size < 3) w.push('single-page site (no real pages/nav)')
+    if (/your[._-]?email@example\.com|lorem ipsum/i.test(html)) w.push('placeholder content left behind')
+    return w
+  }
+
+  // Free, key-less RDAP fallback for the domain owner's email (custom domains
+  // only — registrars often redact, so this is a fallback, never primary).
+  async function rdapEmail(domain) {
+    try {
+      const r = await fetch(`https://rdap.org/domain/${domain}`,
+        { signal: AbortSignal.timeout(6000), headers: { Accept: 'application/rdap+json' } })
+      if (!r.ok) return null
+      const data = await r.json()
+      for (const ent of data.entities || []) {
+        if (!(ent.roles || []).some(x => ['registrant', 'administrative', 'abuse', 'technical'].includes(x))) continue
+        for (const item of ent.vcardArray?.[1] || []) {
+          if (item[0] === 'email' && item[3]) return String(item[3])
+        }
+      }
+    } catch {}
+    return null
+  }
+
+  // Full single-site pass: fetch homepage raw HTML -> fingerprint the builder,
+  // score the copy for "AI wrote this", pull contacts (homepage -> contact
+  // pages -> socials -> RDAP), and list pitchable weaknesses.
+  async function analyzeAiSite(url) {
+    const host = url.replace(/^https?:\/\//, '').split('/')[0].toLowerCase()
+    const out = { url, host, status: 'dead', builder: null, confidence: 0, category: 'HUMAN',
+      ai_score: 0, emails: [], socials: {}, formUrl: '', weaknesses: [], title: '' }
+    let html = ''
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(8000), redirect: 'follow',
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36' } })
+      if (![200, 401, 403].includes(r.status)) return out
+      html = (await r.text()).slice(0, 500000)
+      out.status = 'OK'
+    } catch { return out }
+
+    const tm = html.match(/<title[^>]*>([^<]*)<\/title>/i)
+    out.title = tm ? tm[1].trim().slice(0, 60) : ''
+    const copyPts = aiCopyScore(htmlToVisibleText(html))
+    const det = detectAiBuilder(host, html)
+    if (det) {
+      out.builder = det.builder; out.confidence = det.conf; out.category = det.category
+      out.ai_score = Math.min(100, 60 + copyPts)
+    } else {
+      out.ai_score = copyPts
+      // No stable v0/Bolt marker — Next.js signals + high AI-copy = heuristic hit.
+      if ((html.includes('/_next/') || html.includes('__next')) && copyPts >= 40) {
+        out.builder = 'v0/Bolt?'; out.confidence = 0.5; out.category = 'LIKELY_AI'
+      }
+    }
+    out.weaknesses = aiSiteWeaknesses(html)
+
+    // Contacts, in priority order: inline emails -> contact pages -> socials -> RDAP.
+    out.emails = [...new Set(cleanEmails(html))].slice(0, 3)
+    out.socials = extractSocials(html)
+    if (!out.emails.length) {
+      const base = `https://${host}`
+      const pages = await Promise.all(['/contact', '/contact-us', '/about'].map(async p => {
+        try {
+          const r2 = await fetch(base + p, { signal: AbortSignal.timeout(5000), redirect: 'follow',
+            headers: { 'User-Agent': 'Mozilla/5.0' } })
+          if (!r2.ok) return null
+          const h2 = (await r2.text()).slice(0, 300000)
+          return { url: base + p, emails: cleanEmails(h2), socials: extractSocials(h2), hasForm: /<form[\s>]/i.test(h2) }
+        } catch { return null }
+      }))
+      for (const pg of pages.filter(Boolean)) {
+        if (pg.emails.length && !out.emails.length) out.emails = [...new Set(pg.emails)].slice(0, 3)
+        if (!out.formUrl && pg.hasForm) out.formUrl = pg.url
+        out.socials = { ...out.socials, ...pg.socials }
+      }
+      const isBuilderSub = Object.keys(AI_SUBDOMAIN_BUILDERS).some(s => host.endsWith('.' + s)) ||
+        AI_HUNT_BIG_HOSTS.some(s => host.endsWith('.' + s))
+      if (!out.emails.length && !isBuilderSub) {
+        const rdap = await rdapEmail(host)
+        if (rdap) out.emails = [rdap]
+      }
+    }
+    if (!out.formUrl && !out.emails.length && /<form[\s>]/i.test(html)) out.formUrl = url
+    out.socials = await validateSocials(out.socials)
+    return out
+  }
+
+  function aiLeadCard(lead, idx) {
+    const contactBits = []
+    if (lead.emails.length) contactBits.push(`📧 ${lead.emails.join(', ')}`)
+    const socialBits = Object.entries(lead.socials || {}).map(([k, v]) => `${k}: ${v}`)
+    if (socialBits.length) contactBits.push(`💬 ${socialBits.join(' · ')}`)
+    if (lead.formUrl) contactBits.push(`📝 form: ${lead.formUrl}`)
+    const conf = lead.confidence ? ` (conf ${lead.confidence.toFixed(2)})` : ''
+    return `${idx}. 🔗 ${lead.url}` +
+      (lead.title ? `\n    🏷️ ${lead.title}` : '') +
+      `\n    🛠 ${lead.builder || 'unknown'}${conf} · ai_score: ${lead.ai_score}` +
+      `\n    ${contactBits.length ? contactBits.join('\n    ') : '⚠️ no public contact found'}` +
+      (lead.weaknesses.length ? `\n    ⚠️ Weak: ${lead.weaknesses.join('; ')}` : '')
+  }
+
+  async function startAiHunt(chatId, userId, srcKey, want) {
+    const src = AI_HUNT_SOURCES[srcKey]
+    if (!src) { await send(chatId, 'Unknown builder — pick one from the 🤖 AI-Built Sites menu.'); return res.status(200).send('OK') }
+    await send(chatId,
+      `🤖 AI Site Hunter — ${src.label}\n\n` +
+      `Scanning certificate logs for the newest AI-built sites, then opening each one live: ` +
+      `builder check, AI-copy score, contacts, weaknesses. Hunting for ${want} lead${want === 1 ? '' : 's'}.\n\n` +
+      `⏱️ Give it a few minutes — if the time budget cuts me short, send anything and I'll keep hunting.`)
+    const pools = await Promise.all(src.suffixes.map(s => fetchCrtshNewestDomains(s, 200)))
+    if (pools.every(p => p === null)) {
+      await send(chatId, `crt.sh didn't answer — it's often overloaded (and your relay isn't set). Try again in a minute or two.`)
+      return res.status(200).send('OK')
+    }
+    const byDom = new Map()
+    for (const c of pools.filter(Boolean).flat()) {
+      const prev = byDom.get(c.domain)
+      if (!prev || c.notBefore > prev.notBefore) byDom.set(c.domain, c)
+    }
+    let candidates = [...byDom.values()].sort((a, b) => b.notBefore - a.notBefore)
+    const seenMap = await getSeenBatch(candidates.map(c => `ai:${c.domain}`))
+    candidates = candidates.filter(c => !seenMap[`ai:${c.domain}`]).slice(0, 300)
+    if (!candidates.length) {
+      await send(chatId, `✓ The newest certificates are all sites you've already received. Nothing new right now — try again later.`)
+      return res.status(200).send('OK')
+    }
+    const q = await getUserQueue(userId)
+    q.aiHunt = { srcKey, label: src.label, want, candidates, results: [], delivered: 0, done: false }
+    await saveUserQueue(userId, q)
+    return await runAiHuntBatch(chatId, userId, q)
+  }
+
+  // Same persistent-hunter pattern as /scout: check batches until `want` live
+  // leads are found, the candidate pool runs dry, or the ~40s invocation
+  // budget runs out (then one ping continues exactly where it stopped).
+  async function runAiHuntBatch(chatId, userId, userQueue) {
+    const h = userQueue.aiHunt
+    if (!h) return res.status(200).send('OK')
+    const deadline = Date.now() + 40000
+    const goodSoFar = () => h.results.filter(r => r.status === 'OK' && r.builder)
+    while (Date.now() < deadline && h.candidates.length && goodSoFar().length < h.want) {
+      const chunk = h.candidates.splice(0, CONCURRENCY)
+      const results = await Promise.all(chunk.map(c => analyzeAiSite(`https://${c.domain}`)))
+      h.results.push(...results)
+      await markSeenBatch(chunk.map((c, i) => [`ai:${c.domain}`, { status: results[i].status, builder: results[i].builder || '', checkedAt: new Date().toISOString() }]))
+      await saveUserQueue(userId, userQueue)
+    }
+    const live = goodSoFar()
+    const fresh = live.slice(h.delivered)
+    const prevDelivered = h.delivered
+    h.delivered = live.length
+    h.done = live.length >= h.want || !h.candidates.length
+
+    let header
+    if (live.length >= h.want) header = `✅ ALL DONE — ${live.length} AI-built sites as requested (${h.label}), checked ${h.results.length} new domains to find them.`
+    else if (!h.candidates.length) header = `✓ Pool finished — ${live.length} live AI-built sites of ${h.results.length} new domains checked (${h.label}).`
+    else header = `⏳ ${live.length} of ${h.want} so far (checked ${h.results.length}) — send anything and I'll keep hunting.`
+
+    let reply = header
+    let n = prevDelivered
+    for (const r of fresh) { n++; reply += `\n\n${aiLeadCard(r, n)}` }
+    if (h.done) reply += `\n\n────────\n🔬 Deep-check any single site with /check <url>`
+    await saveUserQueue(userId, userQueue)
+    await send(chatId, reply)
+    return res.status(200).send('OK')
+  }
+
+  // /check <url> — deep single-site report: builder, AI-copy score, contacts,
+  // weaknesses, a likely-prompt guess and a ready pitch hook.
+  async function sendAiSiteReport(chatId, rawUrl) {
+    let url = String(rawUrl || '').trim().split(/\s/)[0]
+    if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url
+    if (!/^https?:\/\/[a-z0-9.-]+\.[a-z]{2,}/i.test(url)) {
+      await send(chatId, `That doesn't look like a URL — send e.g. https://some-site.com`)
+      return
+    }
+    await send(chatId, `🔬 Deep-checking ${url} — fingerprint, AI-copy score, contacts...`)
+    const lead = await analyzeAiSite(url)
+    if (lead.status !== 'OK') { await send(chatId, `❌ Couldn't reach that site (down, blocking, or not a real site).`); return }
+    const verdict =
+      lead.category === 'AI_BUILDER' ? `✅ Built with ${lead.builder} (AI builder)` :
+      lead.category === 'NO_CODE'    ? `🧩 Built with ${lead.builder} (no-code — pitch a redesign, not "your site looks AI")` :
+      lead.category === 'LIKELY_AI'  ? `🤔 Likely AI-built (${lead.builder})` :
+                                       `👤 Looks hand-built (no AI-builder markers, low AI-copy score)`
+    const promptGuess = lead.title ? `"a website for ${lead.title.toLowerCase()}"` : '—'
+    const pitchHook = lead.weaknesses.length
+      ? `their site ${lead.weaknesses[0]}${lead.weaknesses[1] ? ' and ' + lead.weaknesses[1] : ''} — easy wins to offer.`
+      : 'no obvious placeholder weaknesses spotted — lead with speed/SEO instead.'
+    await send(chatId,
+      `🔬 Deep check — ${lead.host}\n\n` +
+      `${verdict}\n` +
+      `Confidence: ${lead.confidence ? lead.confidence.toFixed(2) : '—'} · AI-copy score: ${lead.ai_score}/100\n\n` +
+      `${aiLeadCard(lead, 1).replace(/^1\. /, '')}\n\n` +
+      `💬 Likely prompt: ${promptGuess}\n` +
+      `💡 Pitch hook: ${pitchHook}`)
+  }
+
   // ── URLSCAN.IO ──
   async function fetchUrlscanPage(query, searchAfter) {
     let apiUrl = `https://urlscan.io/api/v1/search/?q=${encodeURIComponent(query)}&size=100`
@@ -1665,6 +1982,24 @@ module.exports = async (req, res) => {
             nav()
           ]
         }
+      case 'aihunter':
+        return {
+          text:
+            `<b>🤖 AI Site Hunter</b>\n\n` +
+            `Finds brand-new websites built by AI builders (Lovable, Framer, v0/Bolt, Durable...) — ` +
+            `their owners usually need a proper redesign, and you can pitch exactly that.\n\n` +
+            `Each lead comes with: the builder it was made with, an AI-copy score, the owner's ` +
+            `contact channels (email / socials / contact form), and the site's weaknesses.\n\n` +
+            `⚡ <b>Hunt</b> — scan the newest certificate records for fresh AI-built sites\n` +
+            `🔬 <b>Check one site</b> — deep analysis of any URL: builder, confidence, contacts, weaknesses, likely prompt, pitch hook`,
+          kb: [
+            [go('⚡ Hunt Lovable sites', 'hunt:lovable')],
+            [go('🖼 Hunt Framer sites', 'hunt:framer')],
+            [go('🌐 Hunt ALL AI builders', 'hunt:all')],
+            [go('🔬 Check one site', 'huntcheck')],
+            nav()
+          ]
+        }
       case 'leads':
         return {
           text:
@@ -1726,6 +2061,8 @@ module.exports = async (req, res) => {
             `/find &lt;city&gt; &lt;niche&gt; [count] — local businesses\n` +
             `/scout — search Shopify stores\n` +
             `/fresh [age_days] [count] — watch for new Shopify stores\n` +
+            `/hunt &lt;lovable|framer|all&gt; [count] — find AI-built websites\n` +
+            `/check &lt;url&gt; — deep-check one site (builder, contacts, weaknesses)\n` +
             `/freshoff — stop watching\n` +
             `/campaigns — your campaigns\n` +
             `/leads &lt;status&gt; — leads by status\n` +
@@ -1756,8 +2093,9 @@ module.exports = async (req, res) => {
           kb: [
             [go('🗺️ Local Businesses', 'menu:local'), go('🕵️ Find Contacts', 'menu:findco')],
             [B('🇬🇧 New UK Companies', 'menu:uk'), go('🛍️ Shopify Stores', 'menu:shopify')],
-            [go('📂 My Leads', 'menu:leads'), B('🎁 Gifts', 'menu:gifts')],
-            [B('🧰 Tools', 'menu:tools'), B('❓ How it works', 'menu:help')],
+            [go('🤖 AI-Built Sites', 'menu:aihunter'), go('📂 My Leads', 'menu:leads')],
+            [B('🎁 Gifts', 'menu:gifts'), B('🧰 Tools', 'menu:tools')],
+            [B('❓ How it works', 'menu:help')],
             owner ? [B('🛠 Admin', 'menu:admin')] : [B('💳 Get Access', 'run:/access')]
           ]
         }
@@ -2019,6 +2357,7 @@ module.exports = async (req, res) => {
   async function registerCommands(ownerChatId) {
     const pub = [
       ['start', '🏠 Open the main menu'], ['menu', '🏠 Main menu'], ['newuk', '🇬🇧 New UK companies'],
+      ['hunt', '🤖 Hunt AI-built sites'], ['check', '🔬 Deep-check one site'],
       ['access', '💳 Get access / check status'], ['gift', '🎁 Open the gift box'],
       ['help', '❓ How this bot works'], ['cancel', '🧹 Stop what I\'m waiting for']
     ]
@@ -2026,6 +2365,7 @@ module.exports = async (req, res) => {
       ['start', '🏠 Open the main menu'], ['menu', '🏠 Main menu'], ['help', '❓ How this bot works'],
       ['newuk', '🇬🇧 New UK companies'], ['findco', '🕵️ Find contacts for companies'],
       ['find', '🗺️ Local businesses'], ['scout', '🛍️ Search Shopify stores'],
+      ['hunt', '🤖 Hunt AI-built sites'], ['check', '🔬 Deep-check one site'],
       ['fresh', '🌱 Watch for brand-new stores'], ['freshoff', '🛑 Stop watching new stores'],
       ['campaigns', '📋 Your campaigns'], ['leads', '📂 Leads by status'], ['mark', '✅ Update a lead\'s status'],
       ['others', '🚫 Blacklisted links'], ['black', '🔒 Add to blacklist'], ['scoutlist', '🕵️ Scan a domain list'],
@@ -2550,6 +2890,33 @@ module.exports = async (req, res) => {
         return res.status(200).send('OK')
       }
 
+      // ── 🤖 AI Site Hunter buttons ──
+      if (data === 'huntcheck') {
+        const q = await getUserQueue(cbUserId)
+        q.awaitingHuntUrl = true
+        await saveUserQueue(cbUserId, q)
+        await send(cbChatId,
+          `🔬 Send me the URL of the site you want deep-checked (e.g. https://some-site.com).\n\n` +
+          `I'll report the builder, confidence, AI-copy score, contact channels, weaknesses, a likely-prompt guess and a pitch hook.`)
+        return res.status(200).send('OK')
+      }
+
+      if (data.startsWith('huntgo:')) {
+        const [, srcKey, nStr] = data.split(':')
+        const want = Math.min(Math.max(parseInt(nStr) || 10, 1), 50)
+        return await startAiHunt(cbChatId, cbUserId, srcKey, want)
+      }
+
+      if (data.startsWith('hunt:')) {
+        const srcKey = data.slice('hunt:'.length)
+        if (!AI_HUNT_SOURCES[srcKey]) return res.status(200).send('OK')
+        const huntTier = isOwner ? 'owner' : await tierOf(cbUserId)
+        await sendKeyboard(cbChatId,
+          `🤖 ${AI_HUNT_SOURCES[srcKey].label} — how many fresh AI-built sites?`,
+          huntCountButtons(srcKey, huntTier))
+        return res.status(200).send('OK')
+      }
+
       return res.status(200).send('OK')
     } finally {
       await releaseLock(cbUserId)
@@ -2588,6 +2955,7 @@ module.exports = async (req, res) => {
     midFlowQueue.awaitingLeadCount || midFlowQueue.awaitingLockedFilter ||
     midFlowQueue.awaitingScoutMonth || midFlowQueue.awaitingFreshFilter ||
     midFlowQueue.awaitingCustomDate || midFlowQueue.awaitingSocialFilter ||
+    midFlowQueue.awaitingHuntUrl ||
     midFlowQueue.wizard || midFlowQueue.answeringGift
   ))
   if (!isOwner && !isAccessCmd && !isGiftCmd && !midFlow && !doc) {
@@ -2943,6 +3311,7 @@ module.exports = async (req, res) => {
     q.awaitingMessages = false; q.awaitingReviewCap = false; q.awaitingCompanyList = false
     q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false; q.awaitingScoutMonth = false; q.awaitingFreshFilter = false
     q.awaitingCustomDate = false; q.awaitingSocialFilter = false; q.customDate = null; q.pendingSearch = null
+    q.awaitingHuntUrl = false; q.aiHunt = null
     q.awaitingPayContact = false; q.awaitingPayPrice = false; q.awaitingTrialSize = false
     q.answeringGift = null; q.giftDraft = null; q.awaitingStartText = false; q.awaitingBroadcast = false
     q.pendingFindJob = null; q.pending = []; q.results = []; q.messages = []
@@ -3320,6 +3689,43 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK')
   }
 
+  // ── /hunt [lovable|framer|all] [count] — AI Site Hunter ──
+  // Free public reads (crt.sh + the sites themselves), like /newuk — no
+  // session, no credit spent; only the result COUNT follows the tier caps.
+  if (/^\/hunt(@\w+)?(\s|$)/.test(text)) {
+    const parts = text.split(/\s+/).slice(1)
+    const srcKey = (parts[0] || '').toLowerCase()
+    const n = Math.min(Math.max(parseInt(parts[1]) || 10, 1), 50)
+    if (AI_HUNT_SOURCES[srcKey]) {
+      const huntTier = isOwner ? 'owner' : await tierOf(userId)
+      const huntCap = huntTier === 'onetime' ? FREE_RESULT_CAP : huntTier === 'daily' ? DAILY_RESULT_CAP : null
+      const want = huntCap ? Math.min(n, huntCap) : n
+      if (huntCap && n > huntCap) {
+        await send(chatId, `🎟️ Free accounts see up to ${huntCap} leads per hunt — hunting ${want} instead of ${n}. Get a pass (/access) for up to 50.`)
+      }
+      return await startAiHunt(chatId, userId, srcKey, want)
+    }
+    // No/invalid builder -> open the same button screen as 🤖 AI-Built Sites
+    const s = screenFor('aihunter', isOwner, hasAccess)
+    await tgCall('sendMessage', { chat_id: chatId, text: s.text, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: s.kb }, disable_web_page_preview: true })
+    return res.status(200).send('OK')
+  }
+
+  // ── /check <url> — deep single-site AI analysis ──
+  if (/^\/check(@\w+)?(\s|$)/.test(text)) {
+    const url = text.replace(/^\/check(@\w+)?\s*/, '').trim()
+    if (url) {
+      await sendAiSiteReport(chatId, url)
+      return res.status(200).send('OK')
+    }
+    const q = await getUserQueue(userId)
+    q.awaitingHuntUrl = true
+    await saveUserQueue(userId, q)
+    await send(chatId, `🔬 Send me the URL of the site you want deep-checked (e.g. https://some-site.com).`)
+    return res.status(200).send('OK')
+  }
+
   // ══════════════════════════════════════════════
   //  MAIN MESSAGE FLOW (lock protected)
   // ══════════════════════════════════════════════
@@ -3517,6 +3923,28 @@ module.exports = async (req, res) => {
       }
       userQueue.awaitingLeadCount = false
       userQueue.pendingSearch.wantCount = wantCount
+      // If the user already pinned a date window (Last 7/14/30 days, This month,
+      // or a custom day/range), that window IS the freshness rule — the urlscan
+      // date:[from TO to] filter in the query enforces it strictly. Asking
+      // "how fresh should the stores be" again would be a redundant second
+      // question, so skip it and go straight to the password-store question.
+      // Only "Any time" searches (and direct link lists) still need an age filter.
+      const s0 = userQueue.pendingSearch
+      const windowChosen = !s0.isDirectList && !!(s0.dateRange || (s0.month && s0.month !== 'any'))
+      if (windowChosen) {
+        s0.freshDays = null
+        userQueue.awaitingFreshFilter = false
+        userQueue.awaitingLockedFilter = true
+        await saveUserQueue(userId, userQueue)
+        const chosenScope = s0.dateRange ? dateRangeLabel(s0.dateRange) : ymLabel(s0.month)
+        await sendKeyboard(chatId,
+          `✅ Got it — ${wantCount} leads, strictly from ${chosenScope}. No extra age filter on top of your chosen dates.\n\n` +
+          `🔐 Include password-protected / "coming soon" stores?`, [
+          [{ text: '✅ Yes, show them', callback_data: 'lockedyes' }],
+          [{ text: '🚫 No, skip them', callback_data: 'lockedno' }]
+        ])
+        return res.status(200).send('OK')
+      }
       userQueue.awaitingFreshFilter = true
       await saveUserQueue(userId, userQueue)
       await sendKeyboard(chatId, `🌱 How fresh should the stores be?\n\nI keep checking until I have ${wantCount} that pass this — old stores get skipped, not counted.`, [
@@ -3551,6 +3979,14 @@ module.exports = async (req, res) => {
       }
       return await startScoutJob(chatId, userId, search.query, search.label, search.wantCount,
         !!search.includeLocked, search.month, search.freshDays || null, search.dateRange || null, requiredSocial)
+    }
+
+    // ── Awaiting a URL for the AI Site Hunter deep check ──
+    if (userQueue.awaitingHuntUrl) {
+      userQueue.awaitingHuntUrl = false
+      await saveUserQueue(userId, userQueue)
+      await sendAiSiteReport(chatId, text)
+      return res.status(200).send('OK')
     }
 
     // ── File upload: .txt of links, OR a cookie export (.json/.txt) ──
@@ -3628,6 +4064,11 @@ module.exports = async (req, res) => {
       userQueue.messages = []
       await saveUserQueue(userId, userQueue)
       return res.status(200).send('OK')
+    }
+
+    // ── Continue an AI Site Hunter run cut short by the time budget ──
+    if (userQueue.aiHunt && !userQueue.aiHunt.done) {
+      return await runAiHuntBatch(chatId, userId, userQueue)
     }
 
     // ── Continue hunting: user pinged while a scout is still short of its target ──
