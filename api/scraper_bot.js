@@ -2027,11 +2027,17 @@ module.exports = async (req, res) => {
     // pings meant for this hunt. A deep search the user explicitly started
     // pauses and stays resumable from its button.
     const preQ = await getUserQueue(userId)
+    let preDirty = false
     if (preQ.deepQ) {
       if (preQ.deepQ.started) preQ.deepQ.started = false
       else { preQ.deepQ = null; preQ.deepIdx = 0 }
-      await saveUserQueue(userId, preQ)
+      preDirty = true
     }
+    // A stale "send outreach messages" collector from an old finished batch
+    // must never eat the pings this hunt is about to promise ("send anything
+    // and I'll keep hunting"). Disarm it the moment a hunt starts.
+    if (preQ.awaitingMessages) { preQ.awaitingMessages = false; preQ.messages = []; preDirty = true }
+    if (preDirty) await saveUserQueue(userId, preQ)
     const mode = await getHuntMode(userId)
     const country = await getHuntCountry(userId)
     const age = await getHuntAge(userId)
@@ -2092,6 +2098,10 @@ module.exports = async (req, res) => {
   async function runAiHuntBatch(chatId, userId, userQueue) {
     const h = userQueue.aiHunt
     if (!h) return res.status(200).send('OK')
+    // A ping that continues this hunt proves the user isn't mid-outreach —
+    // kill any stale collector from an old finished batch so it can't eat
+    // the NEXT ping once this run ends.
+    if (userQueue.awaitingMessages) { userQueue.awaitingMessages = false; userQueue.messages = [] }
     const deadline = Date.now() + 40000
     // Business mode: developer/portfolio leads don't count toward `want` and
     // are never delivered — but they're still checked, counted and skipped
@@ -2685,6 +2695,9 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     // Tapping the button (or resuming) flips the queue from OFFER to RUN —
     // from here on, pings belong to the deep search until it drains.
     if (!dq.started) { dq.started = true; await saveUserQueue(userId, userQueue) }
+    // Same stale-collector kill as the hunt: deep-search pings are never
+    // outreach drafts for a batch that already finished.
+    if (userQueue.awaitingMessages) { userQueue.awaitingMessages = false; userQueue.messages = [] }
     const total = dq.urls.length
     const deadline = Date.now() + 40000
     while (userQueue.deepIdx < total && Date.now() < deadline) {
@@ -5256,7 +5269,14 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     }
 
     // ── Awaiting outreach messages ──
-    if (userQueue.awaitingMessages) {
+    // A live run outranks this collector: an AI hunt still digging (or a deep
+    // search the user explicitly started) has the bot's promise "send anything
+    // and I'll keep going" — that ping must never be eaten as an outreach
+    // message for a stale, already-finished batch (the "Got 4 message(s).
+    // Need 46 more" hijack).
+    const huntAlive = !!(userQueue.aiHunt && !userQueue.aiHunt.done)
+    const deepAlive = !!(userQueue.deepQ && userQueue.deepQ.started && userQueue.deepIdx < userQueue.deepQ.urls.length)
+    if (userQueue.awaitingMessages && !huntAlive && !deepAlive) {
       const withEmail = userQueue.results.filter(r => r.email !== 'no email')
       const parts = text.split('/').map(s => s.trim()).filter(Boolean)
       userQueue.messages.push(...parts)
@@ -5293,7 +5313,10 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       return await runBatch(chatId, userId, userQueue)
     }
 
-    if (userQueue.results.length > 0 && !userQueue.awaitingMessages && userQueue.done) {
+    // Re-offer outreach collection only for users who never moved on to AI
+    // hunts — once a hunt session exists, an idle ping must land on the menu,
+    // never resurrect this collector (it ate hunt pings as outreach drafts).
+    if (userQueue.results.length > 0 && !userQueue.awaitingMessages && userQueue.done && !userQueue.aiHunt) {
       const withEmail = userQueue.results.filter(r => r.email !== 'no email')
       userQueue.awaitingMessages = true
       await saveUserQueue(userId, userQueue)
