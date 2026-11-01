@@ -1462,6 +1462,63 @@ module.exports = async (req, res) => {
     /transform(?:ing)? the way you/i, /a game-changer/i, /changed my business/i
   ]
 
+  // ── Country identification (multi-signal, reliability order):
+  //   1. ccTLD — .ng / .co.uk / .ca … (only meaningful on custom domains)
+  //   2. printed phone prefixes — +234, +44, +91 … read from the page text
+  //   3. LLM content guess (addresses, city names, currency, language) in the
+  //      deep report
+  // Server geo (urlscan page.country) is deliberately NOT used — free-builder
+  // sites are served from the builder's CDN, which would label every
+  // framer.website "US" no matter where the business actually is.
+  const COUNTRY_LABELS = {
+    NG: '🇳🇬 Nigeria', GH: '🇬🇭 Ghana', KE: '🇰🇪 Kenya', ZA: '🇿🇦 South Africa', EG: '🇪🇬 Egypt',
+    US: '🇺🇸 United States', UK: '🇬🇧 United Kingdom', CA: '🇨🇦 Canada', AU: '🇦🇺 Australia',
+    IN: '🇮🇳 India', PK: '🇵🇰 Pakistan', PH: '🇵🇭 Philippines', ID: '🇮🇩 Indonesia', MY: '🇲🇾 Malaysia', SG: '🇸🇬 Singapore',
+    DE: '🇩🇪 Germany', FR: '🇫🇷 France', IT: '🇮🇹 Italy', ES: '🇪🇸 Spain', NL: '🇳🇱 Netherlands',
+    IE: '🇮🇪 Ireland', PT: '🇵🇹 Portugal', BR: '🇧🇷 Brazil', MX: '🇲🇽 Mexico', AR: '🇦🇷 Argentina',
+    JP: '🇯🇵 Japan', AE: '🇦🇪 UAE', SA: '🇸🇦 Saudi Arabia', TR: '🇹🇷 Turkey', VN: '🇻🇳 Vietnam'
+  }
+  const COUNTRY_CCTLDS = {
+    ng: 'NG', gh: 'GH', ke: 'KE', za: 'ZA', eg: 'EG', tz: 'KE', ug: 'KE', ma: 'EG', et: 'KE',
+    uk: 'UK', us: 'US', ca: 'CA', au: 'AU', nz: 'AU', ie: 'IE',
+    in: 'IN', pk: 'PK', bd: 'IN', ph: 'PH', id: 'ID', my: 'MY', sg: 'SG',
+    de: 'DE', fr: 'FR', it: 'IT', es: 'ES', pt: 'PT', nl: 'NL', be: 'NL', ch: 'DE', at: 'DE',
+    se: 'DE', no: 'DE', dk: 'DE', fi: 'SE', pl: 'DE', cz: 'DE', ro: 'DE', gr: 'DE', tr: 'TR',
+    br: 'BR', mx: 'MX', ar: 'AR', cl: 'AR', co: 'MX',
+    jp: 'JP', kr: 'JP', cn: 'JP', hk: 'JP', tw: 'JP', vn: 'VN', th: 'VN',
+    il: 'TR', ae: 'AE', sa: 'AE'
+  }
+  const COUNTRY_PHONE = [
+    ['+880', 'IN'], ['+852', 'JP'], ['+886', 'JP'], ['+234', 'NG'], ['+254', 'KE'],
+    ['+233', 'GH'], ['+255', 'KE'], ['+256', 'KE'], ['+212', 'EG'], ['+351', 'PT'],
+    ['+358', 'DE'], ['+353', 'IE'], ['+972', 'TR'], ['+971', 'AE'], ['+966', 'AE'],
+    ['+27', 'ZA'], ['+20', 'EG'], ['+44', 'UK'], ['+91', 'IN'], ['+92', 'PK'],
+    ['+63', 'PH'], ['+62', 'ID'], ['+60', 'MY'], ['+65', 'SG'], ['+49', 'DE'],
+    ['+33', 'FR'], ['+39', 'IT'], ['+34', 'ES'], ['+31', 'NL'], ['+32', 'NL'],
+    ['+41', 'DE'], ['+43', 'DE'], ['+46', 'DE'], ['+47', 'DE'], ['+45', 'DE'],
+    ['+48', 'DE'], ['+40', 'DE'], ['+30', 'DE'], ['+90', 'TR'], ['+55', 'BR'],
+    ['+52', 'MX'], ['+54', 'AR'], ['+56', 'AR'], ['+57', 'MX'], ['+81', 'JP'],
+    ['+82', 'JP'], ['+86', 'JP'], ['+84', 'VN'], ['+66', 'VN'], ['+61', 'AU'],
+    ['+64', 'AU'], ['+1', 'US']
+  ]
+  function detectCountry(host, text) {
+    const h = String(host || '').toLowerCase()
+    const t = String(text || '')
+    for (const [cc, code] of Object.entries(COUNTRY_CCTLDS)) {
+      if (h.endsWith('.' + cc)) return { code, label: COUNTRY_LABELS[code], why: [`.${cc} domain`] }
+    }
+    const counts = new Map()
+    for (const [prefix, code] of COUNTRY_PHONE) {
+      const rx = code === 'US' ? /\+1[\s(.-]{0,2}\d/g : new RegExp('\\' + prefix + '[\\s(.-]{0,2}\\d', 'g')
+      const n = (t.match(rx) || []).length
+      if (n) counts.set(code, (counts.get(code) || 0) + n)
+    }
+    let best = null
+    for (const [code, n] of counts) if (!best || n > best.n) best = { code, n }
+    if (best) return { code: best.code, label: COUNTRY_LABELS[best.code], why: [`${best.code} phone numbers ×${best.n}`] }
+    return null
+  }
+
   function aiDomainAllowed(host) {
     if (!/^[a-z0-9][a-z0-9.-]*$/.test(host) || host.includes('..')) return false
     const big = AI_HUNT_BIG_HOSTS.find(s => host === s || host.endsWith('.' + s))
@@ -1470,13 +1527,21 @@ module.exports = async (req, res) => {
     return !!sub && AI_HUNT_KEYWORDS.some(k => sub.includes(k))
   }
 
-  function huntCountButtons(srcKey, tier, mode = 'business') {
+  function huntCountButtons(srcKey, tier, mode = 'business', country = 'any') {
     const countRow = tier === 'daily'   ? [[B(`🎁 Free hunt (${DAILY_RESULT_CAP})`, `huntgo:${srcKey}:${DAILY_RESULT_CAP}`)]]
                    : tier === 'onetime' ? [[B(`🎁 Free hunt (${FREE_RESULT_CAP})`, `huntgo:${srcKey}:${FREE_RESULT_CAP}`)]]
                    : [[B('10', `huntgo:${srcKey}:10`), B('20', `huntgo:${srcKey}:20`), B('50', `huntgo:${srcKey}:50`)]]
+    const cbtn = (code, name) => B(country === code ? `${name} ✅` : name, `huntcountry:${code}`)
     return [...countRow, [
       B(mode === 'business' ? '🏢 Business sites only ✅' : '🏢 Business sites only', 'huntmode:business'),
       B(mode === 'all' ? '🌐 Show everything ✅' : '🌐 Show everything', 'huntmode:all')
+    ], [
+      B(country === 'any' ? '🌍 Any country ✅' : '🌍 Any country', 'huntcountry:any'),
+      B('✍️ Other country', 'countryhint')
+    ], [
+      cbtn('ng', '🇳🇬 NG'), cbtn('us', '🇺🇸 US'), cbtn('uk', '🇬🇧 UK'), cbtn('in', '🇮🇳 IN'), cbtn('ca', '🇨🇦 CA')
+    ], [
+      cbtn('gh', '🇬🇭 GH'), cbtn('ke', '🇰🇪 KE'), cbtn('za', '🇿🇦 ZA'), cbtn('ph', '🇵🇭 PH'), cbtn('de', '🇩🇪 DE')
     ]]
   }
 
@@ -1487,6 +1552,14 @@ module.exports = async (req, res) => {
       const { result } = await redis('GET', `hunt:mode:${userId}`)
       return result === 'all' ? 'all' : 'business'
     } catch { return 'business' }
+  }
+
+  // Per-user AI Hunter country filter — 'any' (default) or a 2-letter code.
+  async function getHuntCountry(userId) {
+    try {
+      const { result } = await redis('GET', `hunt:country:${userId}`)
+      return (result && COUNTRY_LABELS[result.toUpperCase()]) ? result.toLowerCase() : 'any'
+    } catch { return 'any' }
   }
 
   // Newest certs for one builder suffix (TIER A only). Returns null on
@@ -1671,7 +1744,7 @@ module.exports = async (req, res) => {
   async function analyzeAiSite(url, certMs = 0) {
     const host = url.replace(/^https?:\/\//, '').split('/')[0].toLowerCase()
     const out = { url, host, status: 'dead', builder: null, confidence: 0, category: 'HUMAN',
-      ai_score: 0, emails: [], socials: {}, formUrl: '', weaknesses: [], title: '',
+      ai_score: 0, emails: [], socials: {}, formUrl: '', weaknesses: [], title: '', country: null,
       kind: 'UNCERTAIN', kindWhy: null, certDate: certMs ? new Date(certMs).toISOString().slice(0, 10) : '' }
     let html = ''
     try {
@@ -1701,6 +1774,7 @@ module.exports = async (req, res) => {
       }
     }
     out.weaknesses = aiSiteWeaknesses(html)
+    out.country = detectCountry(host, htmlToVisibleText(html).slice(0, 12000))
     const kind = classifySiteKind(host, html)
     out.kind = kind.kind
     out.kindWhy = { dev: kind.dev, biz: kind.biz }
@@ -1758,6 +1832,7 @@ module.exports = async (req, res) => {
       `\n    🛠 ${lead.builder || 'unknown'}${conf} · ai_score: ${lead.ai_score}` +
       (kindTag ? ` · ${kindTag}` : '') +
       (lead.certDate ? `\n    🆕 spotted: ${lead.certDate}` : '') +
+      (lead.country && lead.country.code ? `\n    🌍 ${lead.country.label}${lead.country.why && lead.country.why.length ? ` (${lead.country.why[0]})` : ''}` : '') +
       `\n    ${contactBits.length ? contactBits.join('\n    ') : '⚠️ no public contact found'}` +
       (lead.weaknesses.length ? `\n    ⚠️ Weak: ${lead.weaknesses.join('; ')}` : '') +
       whyLines.map(w => `\n    ℹ️ ${w}`).join('')
@@ -1767,11 +1842,13 @@ module.exports = async (req, res) => {
     const src = AI_HUNT_SOURCES[srcKey]
     if (!src) { await send(chatId, 'Unknown builder — pick one from the 🤖 AI-Built Sites menu.'); return res.status(200).send('OK') }
     const mode = await getHuntMode(userId)
+    const country = await getHuntCountry(userId)
     await send(chatId,
       `🤖 AI Site Hunter — ${src.label}\n\n` +
       `Scanning the newest ${src.tier === 'A' ? 'certificate records' : 'public scans'} for fresh ${src.label} sites, then opening each one live: ` +
       `builder check, AI-copy score, contacts, weaknesses. Hunting for ${want} lead${want === 1 ? '' : 's'}\n` +
-      `Filter: ${mode === 'business' ? '🏢 business sites only (tap 🌐 in the hunt menu to include developers)' : '🌐 everything, developer sites tagged'}.\n\n` +
+      `Filter: ${mode === 'business' ? '🏢 business sites only (tap 🌐 in the hunt menu to include developers)' : '🌐 everything, developer sites tagged'}.\n` +
+      `Country: ${country === 'any' ? '🌍 any country' : COUNTRY_LABELS[country.toUpperCase()] + ' — non-matching sites skipped'}.\n\n` +
       `⏱️ Give it a few minutes — if the time budget cuts me short, send anything and I'll keep hunting.`)
     // Per-zone fetch with cross-fallback: crt.sh zones fall back to urlscan
     // when crt.sh 502s (it does that a lot), and urlscan zones fall back to
@@ -1809,7 +1886,7 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
     const q = await getUserQueue(userId)
-    q.aiHunt = { srcKey, label: src.label, want, mode, candidates, results: [], delivered: 0, done: false }
+    q.aiHunt = { srcKey, label: src.label, want, mode, country, candidates, results: [], delivered: 0, done: false }
     await saveUserQueue(userId, q)
     return await runAiHuntBatch(chatId, userId, q)
   }
@@ -1825,7 +1902,14 @@ module.exports = async (req, res) => {
     // are never delivered — but they're still checked, counted and skipped
     // loudly so you know the filter is alive.
     const isSkippedDev = r => h.mode === 'business' && r.kind === 'DEVELOPER'
-    const goodSoFar = () => h.results.filter(r => r.status === 'OK' && r.builder && !isSkippedDev(r))
+    // Country filter: only sites whose detected country matches are counted as
+    // leads. A site whose country can't be proven also misses (you asked for a
+    // country, not a maybe) — the skip counter in the header keeps it honest.
+    const isCountryMiss = r => h.country && h.country !== 'any' &&
+      (!r.country || (h.country.toUpperCase() === 'US'
+        ? (r.country.code !== 'US' && r.country.code !== 'CA')
+        : r.country.code !== h.country.toUpperCase()))
+    const goodSoFar = () => h.results.filter(r => r.status === 'OK' && r.builder && !isSkippedDev(r) && !isCountryMiss(r))
     while (Date.now() < deadline && h.candidates.length && goodSoFar().length < h.want) {
       const chunk = h.candidates.splice(0, CONCURRENCY)
       const results = await Promise.all(chunk.map(c => analyzeAiSite(c.url || `https://${c.domain}`, c.notBefore || 0)))
@@ -1839,6 +1923,7 @@ module.exports = async (req, res) => {
     h.delivered = live.length
     h.done = live.length >= h.want || !h.candidates.length
     const skippedDev = h.results.filter(r => r.status === 'OK' && r.builder && isSkippedDev(r)).length
+    const skippedCountry = (h.country && h.country !== 'any') ? h.results.filter(r => r.status === 'OK' && r.builder && isCountryMiss(r)).length : 0
 
     let header
     if (live.length >= h.want) header = `✅ ALL DONE — ${live.length} AI-built sites as requested (${h.label}), checked ${h.results.length} new domains to find them.`
@@ -1847,18 +1932,242 @@ module.exports = async (req, res) => {
     if (h.mode === 'business' && skippedDev > 0) {
       header += `\n🏢 Skipped ${skippedDev} developer/portfolio site${skippedDev === 1 ? '' : 's'} — tap 🌐 Show everything in the hunt menu to include them.`
     }
+    if (skippedCountry > 0) {
+      header += `\n🌍 Country filter ${COUNTRY_LABELS[h.country.toUpperCase()] || h.country.toUpperCase()} — skipped ${skippedCountry} site${skippedCountry === 1 ? '' : 's'} that didn't match.`
+    }
 
     let reply = header
     let n = prevDelivered
     for (const r of fresh) { n++; reply += `\n\n${aiLeadCard(r, n)}` }
-    if (h.done) reply += `\n\n────────\n🔬 Deep-check any single site with /check <url>`
     await saveUserQueue(userId, userQueue)
+    if (h.done) {
+      const deepUrls = [...new Set(h.results
+        .filter(r => r.status === 'OK' && r.builder && !isSkippedDev(r) && !isCountryMiss(r))
+        .map(r => r.url))]
+      reply += `\n\n────────\n🔬 Deep-check one site: /check <url>`
+      await send(chatId, reply)
+      if (deepUrls.length) {
+        userQueue.deepQ = { urls: deepUrls, label: h.label }
+        userQueue.deepIdx = 0
+        await saveUserQueue(userId, userQueue)
+        await sendKeyboard(chatId,
+          `🧠 Want the FULL intel on all ${deepUrls.length} lead${deepUrls.length === 1 ? '' : 's'}?\n\n` +
+          `DEEP SEARCH crawls every page of each site top-to-bottom, then the AI writes the complete dossier: what the business really is, how the site is built, every weakness found, the likely prompt they typed, your rebuild plan and a ready-to-send pitch DM.\n\n` +
+          `⏱️ ~1 site/min, runs in the background — send anything to keep it going.`,
+          [[B(`🔬 DEEP SEARCH ALL ${deepUrls.length}`, 'deepsearch:go'), B('✋ Skip', 'deepsearch:skip')]])
+      }
+      return res.status(200).send('OK')
+    }
     await send(chatId, reply)
     return res.status(200).send('OK')
   }
 
-  // /check <url> — deep single-site report: builder, AI-copy score, contacts,
-  // weaknesses, a likely-prompt guess and a ready pitch hook.
+  // ══════════════════════════════════════════════
+  //  DEEP SEARCH — full-crawl AI intelligence
+  // ══════════════════════════════════════════════
+  // Replaces the old 5-line /check card. Crawl the homepage + up to 7 inner
+  // pages, extract everything visible, then (if an LLM key is configured)
+  // the AI writes the complete dossier: business description, page-by-page
+  // notes, every weakness, the likely prompt, a rebuild plan and a ready-
+  // to-send pitch DM. No key → the same crawl comes back structured, just
+  // without the AI prose.
+
+  const DEEP_FETCH_UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36' }
+  const DEEP_PATH_HINTS = /(about|contact|services?|pricing|prices?|shop|store|products?|book|menu|gallery|portfolio|team|faq|blog|offers?|packages?|quote|appointment)/i
+
+  function clip(text, max) {
+    const s = String(text || '').trim()
+    return s.length <= max ? s : s.slice(0, max - 1) + '…'
+  }
+
+  async function deepFetch(url) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(7000), redirect: 'follow', headers: DEEP_FETCH_UA })
+      if (![200, 401, 403].includes(r.status)) return null
+      return (await r.text()).slice(0, 400000)
+    } catch { return null }
+  }
+
+  function deepPageSummary(html) {
+    const title = (String(html).match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1] || ''
+    const meta = (String(html).match(/<meta[^>]+name=["']description["'][^>]*content=["']([^"']{0,200})["']/i) || [])[1] || ''
+    const headings = [...String(html).matchAll(/<h[12][^>]*>([\s\S]{0,120}?)<\/h[12]>/gi)]
+      .map(m => htmlToVisibleText(m[1]).trim()).filter(Boolean).slice(0, 5)
+    const text = htmlToVisibleText(html)
+    const phones = [...new Set((text.match(/\+\d{1,3}[\d\s().-]{7,14}\d/g) || []).slice(0, 4))]
+    return {
+      title: title.trim().slice(0, 80), meta: meta.trim(), headings,
+      text: text.slice(0, 700), textAll: text, phones,
+      emails: [...new Set(cleanEmails(html))].slice(0, 3),
+      socials: extractSocials(html),
+      forms: /<form[\s>]/i.test(html)
+    }
+  }
+
+  // Crawl homepage + up to 7 inner pages (business-looking paths first).
+  // Returns [{ path, html }] or null when the site is unreachable.
+  async function deepCrawlSite(url) {
+    const base = url.replace(/\/+$/, '')
+    const homeHtml = await deepFetch(base)
+    if (!homeHtml) return null
+    const seen = new Set([''])
+    const links = []
+    const re = /href=["'](\/[a-z0-9][a-z0-9\-\/.]{0,60})["']/gi
+    let m
+    while ((m = re.exec(homeHtml)) && links.length < 40) {
+      const p = m[1].split('#')[0].replace(/\/+$/, '')
+      if (!p || p.length < 2 || seen.has(p)) continue
+      if (/\.(png|jpe?g|gif|css|js|svg|ico|webp|pdf|xml|txt)$/i.test(p)) continue
+      seen.add(p)
+      links.push(p)
+    }
+    links.sort((a, b) => (DEEP_PATH_HINTS.test(b) ? 1 : 0) - (DEEP_PATH_HINTS.test(a) ? 1 : 0))
+    const picked = links.slice(0, 7)
+    const inners = await Promise.all(picked.map(async p => {
+      const html = await deepFetch(base + p)
+      return html ? { path: p, html } : null
+    }))
+    return [{ path: '/ (home)', html: homeHtml }, ...inners.filter(Boolean)]
+  }
+
+  // LLM chain — Groq → Gemini → OpenRouter, all free tiers, all optional.
+  // No key configured → returns null and the deep report degrades to the
+  // structured crawl (still detailed, just no AI prose).
+  async function llmJson(systemPrompt, userContent) {
+    const attempts = []
+    if (process.env.GROQ_API_KEY) attempts.push({
+      url: 'https://api.groq.com/openai/v1/chat/completions',
+      model: 'llama-3.3-70b-versatile',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` }
+    })
+    if (process.env.OPENROUTER_API_KEY) attempts.push({
+      url: 'https://openrouter.ai/api/v1/chat/completions',
+      model: 'meta-llama/llama-3.3-70b-instruct:free',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`, 'X-Title': 'lead-scraper-bot' }
+    })
+    for (const a of attempts) {
+      try {
+        const r = await fetch(a.url, {
+          method: 'POST', signal: AbortSignal.timeout(30000), headers: a.headers,
+          body: JSON.stringify({ model: a.model, temperature: 0.3, max_tokens: 2000,
+            response_format: { type: 'json_object' },
+            messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }] }) })
+        if (!r.ok) continue
+        const txt = (await r.json()).choices?.[0]?.message?.content || ''
+        const j = txt.match(/\{[\s\S]*\}/)
+        if (j) return JSON.parse(j[0])
+      } catch {}
+    }
+    if (process.env.GEMINI_API_KEY) {
+      try {
+        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+          method: 'POST', signal: AbortSignal.timeout(30000), headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: systemPrompt + '\n\n' + userContent }] }],
+            generationConfig: { temperature: 0.3, maxOutputTokens: 2000, responseMimeType: 'application/json' } }) })
+        if (r.ok) {
+          const txt = (await r.json()).candidates?.[0]?.content?.parts?.[0]?.text || ''
+          const j = txt.match(/\{[\s\S]*\}/)
+          if (j) return JSON.parse(j[0])
+        }
+      } catch {}
+    }
+    return null
+  }
+
+  const DEEP_SYSTEM_PROMPT = `You are a meticulous website analyst working for a freelance web designer who pitches paid redesigns to small businesses. You receive the raw crawl of a website (every page, top to bottom). Reply with ONLY a JSON object, no markdown:
+{"business":"3-5 sentence description of what this business is, what it sells/does, who it serves and how it presents itself","structure":"one short sentence per crawled page saying what is on it","build":"how the site is built and feels: builder tool, design quality, mobile/completeness","weaknesses":["up to 6 SPECIFIC problems visible in the content or markup"],"prompt":"the likely prompt the owner typed into an AI site builder to generate this site, written as one quoted paragraph","rebuild":["up to 5 concrete improvements to offer"],"pitch":"a ready-to-send outreach DM of 60-110 words: friendly, mentions 2-3 specific weaknesses seen on THIS site, offers a paid redesign, ends with a light question","country":"best-guess country of the business from addresses, city names, phone codes, currency and language, or 'unknown'","country_why":"short reason for the country guess","quality":0}
+quality is an integer 0-100 overall site quality. Be specific and concrete everywhere. Never invent facts you cannot see in the crawl.`
+
+  // Full pipeline for one URL: crawl → heuristics → (LLM) → formatted report.
+  async function deepAnalyzeUrl(url) {
+    const host = url.replace(/^https?:\/\//i, '').split('/')[0].toLowerCase()
+    const pages = await deepCrawlSite(url)
+    if (!pages) return `❌ Couldn't reach ${host} (down, blocking, or not a real site).`
+    const pageData = pages.map(p => ({ path: p.path, sum: deepPageSummary(p.html), html: p.html }))
+    const home = pageData[0]
+    const det = detectAiBuilder(host, home.html)
+    const copy = aiCopyScore(home.sum.textAll.slice(0, 8000))
+    const kind = classifySiteKind(host, home.html)
+    const weaknesses = [...new Set(pageData.flatMap(p => aiSiteWeaknesses(p.html)))]
+    const emails = [...new Set(pageData.flatMap(p => p.sum.emails))].slice(0, 4)
+    const phones = [...new Set(pageData.flatMap(p => p.sum.phones))].slice(0, 5)
+    const socials = Object.assign({}, ...pageData.map(p => p.sum.socials))
+    const allText = pageData.map(p => p.sum.textAll).join(' ')
+    const country = detectCountry(host, allText)
+
+    let dossier = `SITE: ${url}\nBUILDER: ${det ? det.builder + ' (' + det.category + ', confidence ' + det.conf + ')' : 'no stable builder marker'}\n`
+    for (const p of pageData) {
+      dossier += `\n=== PAGE ${p.path} ===\nTITLE: ${p.sum.title}\nMETA: ${p.sum.meta}\nHEADINGS: ${p.sum.headings.join(' | ')}\nTEXT: ${p.sum.text}\n`
+      if (p.sum.emails.length) dossier += `EMAILS: ${p.sum.emails.join(', ')}\n`
+      if (p.sum.phones.length) dossier += `PHONES: ${p.sum.phones.join(', ')}\n`
+      if (p.sum.forms) dossier += `HAS CONTACT FORM\n`
+    }
+    dossier += `\nHEURISTIC FINDINGS: ${weaknesses.join('; ') || 'none'}\n`
+    if (country) dossier += `COUNTRY SIGNALS: ${country.label} (${country.why.join(', ')})\n`
+
+    const ai = await llmJson(DEEP_SYSTEM_PROMPT, dossier.slice(0, 14000))
+    const quality = ai && Number.isFinite(+ai.quality) ? Math.max(0, Math.min(100, Math.round(+ai.quality))) : null
+    const cLabel = (ai && ai.country && ai.country !== 'unknown') ? String(ai.country) : (country ? country.label : 'unknown')
+    const cWhy = country ? country.why.join(', ') : ((ai && ai.country_why) || '')
+    const kindTag = kind.kind === 'REAL_BUSINESS' ? '🏢 real business' : kind.kind === 'DEVELOPER' ? '👨‍💻 developer/portfolio' : '❔ unclear'
+    const contactLine = [
+      emails.length ? `📧 ${emails.join(', ')}` : '',
+      phones.length ? `📞 ${phones.join(', ')}` : '',
+      Object.keys(socials).length ? `💬 ${Object.entries(socials).map(([k, v]) => `${k}: ${v}`).join(' · ')}` : ''
+    ].filter(Boolean).join('\n') || '⚠️ no public contact found'
+
+    if (!ai) {
+      return clip(
+        `🔬🔬 DEEP CRAWL — ${url}\n` +
+        `🌍 Country: ${cLabel}${cWhy ? ` — ${cWhy}` : ''}\n` +
+        `🛠 ${det ? det.builder : 'unknown builder'} · AI-copy ${copy}/100 · ${kindTag}\n` +
+        `📄 Pages crawled: ${pageData.map(p => p.path).join(' · ')}\n\n` +
+        `📝 What's on the site:\n${pageData.map(p => `  • ${p.path} — ${p.sum.title || '(no title)'}: ${clip(p.sum.text, 150)}`).join('\n')}\n\n` +
+        `⚠️ Issues found: ${weaknesses.length ? weaknesses.join('; ') : 'none obvious'}\n\n` +
+        `💬 Likely prompt guess: ${home.sum.title ? `"a website for ${home.sum.title.toLowerCase()}"` : '—'}\n\n` +
+        `${contactLine}\n\n` +
+        `🧠 AI brain not connected — add GROQ_API_KEY (free at console.groq.com) to your Vercel env and redeploy to unlock the full dossier: business breakdown, the real likely prompt, rebuild plan and a ready-to-send pitch DM.`, 3900)
+    }
+    return clip(
+      `🔬🔬 DEEP INTEL — ${url}\n` +
+      `🌍 Country: ${cLabel}${cWhy ? ` — ${cWhy}` : ''}${quality !== null ? `  ·  💯 site quality: ${quality}/100` : ''}\n` +
+      `🛠 ${det ? det.builder : 'unknown builder'} · AI-copy ${copy}/100 · ${kindTag}\n` +
+      `${contactLine}\n\n` +
+      `🏢 WHAT THIS BUSINESS IS:\n${clip(ai.business, 700)}\n\n` +
+      `📄 THE SITE, PAGE BY PAGE:\n${clip(ai.structure, 700)}\n\n` +
+      `🧱 HOW IT'S BUILT:\n${clip(ai.build, 350)}\n\n` +
+      `⚠️ WHAT'S WRONG:${weaknesses.length ? ` (${weaknesses.length} issues flagged)` : ''}\n${(Array.isArray(ai.weaknesses) ? ai.weaknesses : []).slice(0, 6).map((w, i) => `  ${i + 1}. ${clip(w, 160)}`).join('\n')}\n\n` +
+      `💬 LIKELY PROMPT THEY USED:\n"${clip(ai.prompt, 600)}"\n\n` +
+      `🔨 YOUR REBUILD PLAN:\n${(Array.isArray(ai.rebuild) ? ai.rebuild : []).slice(0, 5).map((r2, i) => `  ${i + 1}. ${clip(r2, 150)}`).join('\n')}\n\n` +
+      `📨 READY-TO-SEND PITCH:\n"${clip(ai.pitch, 800)}"`, 3900)
+  }
+
+  // Deep-search continuation loop: one site per round, persistent queue in
+  // Redis, same "send anything to continue" pattern as the hunts.
+  async function runDeepSearchBatch(chatId, userId, userQueue) {
+    const dq = userQueue.deepQ
+    if (!dq || !Array.isArray(dq.urls)) return res.status(200).send('OK')
+    const total = dq.urls.length
+    const deadline = Date.now() + 40000
+    while (userQueue.deepIdx < total && Date.now() < deadline) {
+      const url = dq.urls[userQueue.deepIdx]
+      const report = await deepAnalyzeUrl(url)
+      userQueue.deepIdx++
+      await saveUserQueue(userId, userQueue)
+      await send(chatId, `📡 Deep intel ${userQueue.deepIdx}/${total}${dq.label ? ` — ${dq.label}` : ''}\n\n${report}`)
+    }
+    if (userQueue.deepIdx >= total) {
+      userQueue.deepQ = null
+      userQueue.deepIdx = 0
+      await saveUserQueue(userId, userQueue)
+      await send(chatId, `✅ Deep search complete — ${total} full dossier${total === 1 ? '' : 's'} delivered. Every one has the likely prompt + a ready-to-send pitch.`)
+    } else {
+      await send(chatId, `⏳ Deep intel ${userQueue.deepIdx}/${total} delivered — time budget hit. Send anything to continue where it stopped.`)
+    }
+    return res.status(200).send('OK')
+  }
+
+  // /check <url> — now runs the FULL deep pipeline (crawl + AI dossier).
   async function sendAiSiteReport(chatId, rawUrl) {
     let url = String(rawUrl || '').trim().split(/\s/)[0]
     if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url
@@ -1866,30 +2175,8 @@ module.exports = async (req, res) => {
       await send(chatId, `That doesn't look like a URL — send e.g. https://some-site.com`)
       return
     }
-    await send(chatId, `🔬 Deep-checking ${url} — fingerprint, AI-copy score, contacts...`)
-    const lead = await analyzeAiSite(url)
-    if (lead.status !== 'OK') { await send(chatId, `❌ Couldn't reach that site (down, blocking, or not a real site).`); return }
-    const verdict =
-      lead.category === 'AI_BUILDER' ? `✅ Built with ${lead.builder} (AI builder)` :
-      lead.category === 'NO_CODE'    ? `🧩 Built with ${lead.builder} (no-code — pitch a redesign, not "your site looks AI")` :
-      lead.category === 'LIKELY_AI'  ? `🤔 Likely AI-built (${lead.builder})` :
-                                       `👤 Looks hand-built (no AI-builder markers, low AI-copy score)`
-    const kindLine =
-      lead.kind === 'REAL_BUSINESS' ? `🏢 Classified: real business site` :
-      lead.kind === 'DEVELOPER'     ? `👨‍💻 Classified: developer/portfolio site` :
-                                      `❔ Classified: unclear (not enough signals either way)`
-    const promptGuess = lead.title ? `"a website for ${lead.title.toLowerCase()}"` : '—'
-    const pitchHook = lead.weaknesses.length
-      ? `their site ${lead.weaknesses[0]}${lead.weaknesses[1] ? ' and ' + lead.weaknesses[1] : ''} — easy wins to offer.`
-      : 'no obvious placeholder weaknesses spotted — lead with speed/SEO instead.'
-    await send(chatId,
-      `🔬 Deep check — ${lead.host}\n\n` +
-      `${verdict}\n` +
-      `${kindLine}\n` +
-      `Confidence: ${lead.confidence ? lead.confidence.toFixed(2) : '—'} · AI-copy score: ${lead.ai_score}/100\n\n` +
-      `${aiLeadCard(lead, 1, true).replace(/^1\. /, '')}\n\n` +
-      `💬 Likely prompt: ${promptGuess}\n` +
-      `💡 Pitch hook: ${pitchHook}`)
+    await send(chatId, `🔬 Deep-crawling ${url.replace(/^https?:\/\//, '')} — every page top to bottom, then the AI dossier. ~30–60s…`)
+    await send(chatId, await deepAnalyzeUrl(url))
   }
 
   // ── URLSCAN.IO ──
@@ -2209,7 +2496,7 @@ module.exports = async (req, res) => {
             `🏢 <b>Business filter</b> — every hunt keyboard has a 🏢/🌐 row: business-only mode silently skips ` +
             `developer portfolios, demos and side projects and tells you how many it skipped.\n\n` +
             `⚡ <b>Hunt</b> — scan the newest sources for fresh AI-built sites\n` +
-            `🔬 <b>Check one site</b> — deep analysis of any URL: builder, confidence, contacts, weaknesses, likely prompt, pitch hook`,
+            `🔬 <b>Check one site</b> — full AI dossier of any URL: crawled page by page — business breakdown, weaknesses, the likely prompt, rebuild plan and a ready-to-send pitch DM`,
           kb: [
             [go('⚡ Hunt Lovable sites', 'hunt:lovable')],
             [go('🖼 Hunt Framer sites', 'hunt:framer')],
@@ -3139,7 +3426,7 @@ module.exports = async (req, res) => {
         await saveUserQueue(cbUserId, q)
         await send(cbChatId,
           `🔬 Send me the URL of the site you want deep-checked (e.g. https://some-site.com).\n\n` +
-          `I'll report the builder, confidence, AI-copy score, contact channels, weaknesses, a likely-prompt guess and a pitch hook.`)
+          `I'll crawl every page top-to-bottom and write the full AI dossier: business breakdown, weaknesses, the likely prompt they used, a rebuild plan and a ready-to-send pitch DM.`)
         return res.status(200).send('OK')
       }
 
@@ -3152,10 +3439,44 @@ module.exports = async (req, res) => {
         return res.status(200).send('OK')
       }
 
+      if (data.startsWith('huntcountry:')) {
+        const code = data.slice('huntcountry:'.length).toLowerCase()
+        if (code === 'any') await redis('SET', `hunt:country:${cbUserId}`, 'any')
+        else if (COUNTRY_LABELS[code.toUpperCase()]) await redis('SET', `hunt:country:${cbUserId}`, code.toLowerCase())
+        const saved = await getHuntCountry(cbUserId)
+        await send(cbChatId, saved === 'any'
+          ? `🌍 Any country — hunts scan every country again.`
+          : `🌍 Country filter set: ${COUNTRY_LABELS[saved.toUpperCase()]} — future hunts only deliver sites that look ${COUNTRY_LABELS[saved.toUpperCase()].replace(/^\S+\s/, '')} (matched by domain ending, phone numbers and page content).`)
+        return res.status(200).send('OK')
+      }
+
+      if (data === 'countryhint') {
+        await send(cbChatId, `✍️ To target another country, just send:\n/country NG — or US, UK, IN, GH, KE, ZA, PH, DE, BR, CA, AU…\n\n/country any removes the filter.`)
+        return res.status(200).send('OK')
+      }
+
       if (data.startsWith('huntgo:')) {
         const [, srcKey, nStr] = data.split(':')
         const want = Math.min(Math.max(parseInt(nStr) || 10, 1), 50)
         return await startAiHunt(cbChatId, cbUserId, srcKey, want)
+      }
+
+      if (data === 'deepsearch:go') {
+        const dq = await getUserQueue(cbUserId)
+        if (!dq.deepQ || !Array.isArray(dq.deepQ.urls) || dq.deepIdx >= dq.deepQ.urls.length) {
+          await send(cbChatId, `Nothing queued — run a hunt first, then tap the deep search button under the results.`)
+          return res.status(200).send('OK')
+        }
+        return await runDeepSearchBatch(cbChatId, cbUserId, dq)
+      }
+
+      if (data === 'deepsearch:skip') {
+        const dq = await getUserQueue(cbUserId)
+        dq.deepQ = null
+        dq.deepIdx = 0
+        await saveUserQueue(cbUserId, dq)
+        await send(cbChatId, `Skipped. Deep-check any single site anytime with /check <url>.`)
+        return res.status(200).send('OK')
       }
 
       if (data.startsWith('hunt:')) {
@@ -3163,9 +3484,10 @@ module.exports = async (req, res) => {
         if (!AI_HUNT_SOURCES[srcKey]) return res.status(200).send('OK')
         const huntTier = isOwner ? 'owner' : await tierOf(cbUserId)
         const huntMode = await getHuntMode(cbUserId)
+        const huntCountry = await getHuntCountry(cbUserId)
         await sendKeyboard(cbChatId,
           `🤖 ${AI_HUNT_SOURCES[srcKey].label} — how many fresh AI-built sites?`,
-          huntCountButtons(srcKey, huntTier, huntMode))
+          huntCountButtons(srcKey, huntTier, huntMode, huntCountry))
         return res.status(200).send('OK')
       }
 
@@ -3207,7 +3529,7 @@ module.exports = async (req, res) => {
     midFlowQueue.awaitingLeadCount || midFlowQueue.awaitingLockedFilter ||
     midFlowQueue.awaitingScoutMonth || midFlowQueue.awaitingFreshFilter || midFlowQueue.awaitingScoutAgeGate ||
     midFlowQueue.awaitingCustomDate || midFlowQueue.awaitingSocialFilter ||
-    midFlowQueue.awaitingHuntUrl ||
+    midFlowQueue.awaitingHuntUrl || midFlowQueue.deepQ ||
     midFlowQueue.wizard || midFlowQueue.answeringGift
   ))
   if (!isOwner && !isAccessCmd && !isGiftCmd && !midFlow && !doc) {
@@ -3974,7 +4296,35 @@ module.exports = async (req, res) => {
     const q = await getUserQueue(userId)
     q.awaitingHuntUrl = true
     await saveUserQueue(userId, q)
-    await send(chatId, `🔬 Send me the URL of the site you want deep-checked (e.g. https://some-site.com).`)
+    await send(chatId, `🔬 Send me the URL of the site you want deep-checked (e.g. https://some-site.com).\n\nI'll crawl every page top-to-bottom and write the full AI dossier: business breakdown, weaknesses, the likely prompt, rebuild plan and a ready-to-send pitch DM.`)
+    return res.status(200).send('OK')
+  }
+
+  // ── /country XX — set the AI-hunter country filter ──
+  if (/^\/country(@\w+)?(\s|$)/.test(text)) {
+    const arg = text.replace(/^\/country(@\w+)?\s*/, '').trim().toLowerCase()
+    const current = await getHuntCountry(userId)
+    if (!arg) {
+      const popular = 'NG 🇳🇬 · US 🇺🇸 · UK 🇬🇧 · IN 🇮🇳 · GH 🇬🇭 · KE 🇰🇪 · ZA 🇿🇦 · PH 🇵🇭 · DE 🇩🇪 · BR 🇧🇷 · CA 🇨🇦 · AU 🇦🇺'
+      await send(chatId,
+        `🌍 Country filter right now: ${current === 'any' ? 'Any country' : COUNTRY_LABELS[current.toUpperCase()]}\n\n` +
+        `Set one with:\n/country NG   /country US   /country UK   /country GH …\n\n` +
+        `Popular: ${popular}\n\n` +
+        `Detection uses the site's domain ending (.ng, .co.uk…), the phone numbers it prints (+234, +44…) and its page content (addresses, cities, currency).\n` +
+        `/country any removes the filter. You can also tap the country buttons in any hunt menu.`)
+      return res.status(200).send('OK')
+    }
+    if (arg === 'any') {
+      await redis('SET', `hunt:country:${userId}`, 'any')
+      await send(chatId, `🌍 Country filter removed — hunts scan every country again.`)
+      return res.status(200).send('OK')
+    }
+    if (!COUNTRY_LABELS[arg.toUpperCase()]) {
+      await send(chatId, `❓ Unknown country code "${arg.toUpperCase()}". Use a 2-letter code like /country NG, /country US, /country UK — or /country any to remove the filter.`)
+      return res.status(200).send('OK')
+    }
+    await redis('SET', `hunt:country:${userId}`, arg.toLowerCase())
+    await send(chatId, `🌍 Country filter set: ${COUNTRY_LABELS[arg.toUpperCase()]}.\nFrom now on AI hunts only deliver sites that look ${COUNTRY_LABELS[arg.toUpperCase()].replace(/^\S+\s/, '')} — matched by domain ending, phone numbers and page content.`)
     return res.status(200).send('OK')
   }
 
@@ -4327,6 +4677,11 @@ module.exports = async (req, res) => {
       userQueue.messages = []
       await saveUserQueue(userId, userQueue)
       return res.status(200).send('OK')
+    }
+
+    // ── Continue a deep search run cut short by the time budget ──
+    if (userQueue.deepQ && userQueue.deepIdx < userQueue.deepQ.urls.length) {
+      return await runDeepSearchBatch(chatId, userId, userQueue)
     }
 
     // ── Continue an AI Site Hunter run cut short by the time budget ──
