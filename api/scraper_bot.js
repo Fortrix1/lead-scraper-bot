@@ -1536,7 +1536,7 @@ module.exports = async (req, res) => {
     return !!sub && AI_HUNT_KEYWORDS.some(k => sub.includes(k))
   }
 
-  function huntCountButtons(srcKey, tier, mode = 'business', country = 'any') {
+  function huntCountButtons(srcKey, tier, mode = 'business', country = 'any', age = 'newest') {
     const countRow = tier === 'daily'   ? [[B(`🎁 Free hunt (${DAILY_RESULT_CAP})`, `huntgo:${srcKey}:${DAILY_RESULT_CAP}`)]]
                    : tier === 'onetime' ? [[B(`🎁 Free hunt (${FREE_RESULT_CAP})`, `huntgo:${srcKey}:${FREE_RESULT_CAP}`)]]
                    : [[B('10', `huntgo:${srcKey}:10`), B('20', `huntgo:${srcKey}:20`), B('50', `huntgo:${srcKey}:50`)]]
@@ -1551,6 +1551,8 @@ module.exports = async (req, res) => {
       cbtn('ng', '🇳🇬 NG'), cbtn('us', '🇺🇸 US'), cbtn('uk', '🇬🇧 UK'), cbtn('in', '🇮🇳 IN'), cbtn('ca', '🇨🇦 CA')
     ], [
       cbtn('gh', '🇬🇭 GH'), cbtn('ke', '🇰🇪 KE'), cbtn('za', '🇿🇦 ZA'), cbtn('ph', '🇵🇭 PH'), cbtn('de', '🇩🇪 DE')
+    ], [
+      B(`🗓 Sites from: ${ageLabel(age)} ▸`, `huntage:${srcKey}`)
     ]]
   }
 
@@ -1571,11 +1573,88 @@ module.exports = async (req, res) => {
     } catch { return 'any' }
   }
 
+  // Per-user hunt freshness window — the /hunt twin of /scout's date picker.
+  // 'newest' (default) prefers the freshest certs but WIDENS automatically
+  // when a dig rounds past them, because an unseen 3-week-old site you never
+  // received still beats an empty chat. Explicit picks stay strict.
+  const HUNT_AGES = ['newest', 'last7', 'last30', 'thismonth', 'any']
+  async function getHuntAge(userId) {
+    try {
+      const { result } = await redis('GET', `hunt:age:${userId}`)
+      return HUNT_AGES.includes(result) ? result : 'newest'
+    } catch { return 'newest' }
+  }
+
+  function ageLabel(age) {
+    if (age === 'last7') return 'Last 7 days'
+    if (age === 'last30') return 'Last 30 days'
+    if (age === 'thismonth') return 'This month'
+    if (age === 'any') return 'Any age'
+    return 'Newest first (≤14 days)'
+  }
+
+  // Freshness cut for one pool candidate. `dig` = which archive round this
+  // candidate came from; the default 'newest' window widens 14d → 30d → 90d
+  // → any as the dig goes deeper. Candidates without a birth timestamp pass
+  // (let the live checks decide).
+  function huntAgeOk(c, age, dig = 0) {
+    if (!c || !c.notBefore) return true
+    if (age === 'any') return true
+    if (age === 'last7') return Date.now() - c.notBefore <= 7 * 86400000
+    if (age === 'last30') return Date.now() - c.notBefore <= 30 * 86400000
+    if (age === 'thismonth') {
+      const d = new Date()
+      return c.notBefore >= Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)
+    }
+    const days = dig <= 0 ? (parseInt(process.env.HUNT_MAX_CERT_AGE_DAYS) || 14)
+               : dig === 1 ? 30
+               : dig === 2 ? 90
+               : 36500
+    return Date.now() - c.notBefore <= days * 86400000
+  }
+
+  function huntAgeKeyboard(srcKey, age) {
+    const row = (val, label) => [[{ text: age === val ? `${label} ✅` : label, callback_data: `hageset:${srcKey}:${val}` }]]
+    return [
+      ...row('newest', '🆕 Newest first (≤14 days)'),
+      ...row('last7', '🕐 Last 7 days'),
+      ...row('last30', '🕐 Last 30 days'),
+      ...row('thismonth', '📅 This month'),
+      ...row('any', '♾ Any age — digs the whole archive'),
+      [{ text: '« Back', callback_data: `hunt:${srcKey}` }]
+    ]
+  }
+
+  // One round of pool building for a hunt. dig=0 fetches the newest slice;
+  // each further round digs deeper: crt.sh steps 200 certs further back in
+  // time, urlscan widens its scan window (public index holds ~30 days).
+  // Cross-fallback: crt.sh zones fall back to urlscan when crt.sh 502s (it
+  // does that a lot) and vice versa — a dead source never kills the run.
+  async function buildHuntPool(src, dig = 0) {
+    const pools = await Promise.all(src.suffixes.map(async s => {
+      if (src.tier === 'A') {
+        const crt = await fetchCrtshNewestDomains(s, 200, dig * 200)
+        if (crt) return crt
+        return await fetchUrlscanBuilderDomains(s, 200, 4 + dig * 10)
+      }
+      const us = await fetchUrlscanBuilderDomains(s, 200, 4 + dig * 10)
+      if (us && us.length) return us
+      return await fetchCrtshNewestDomains(s, 200, dig * 200) || []
+    }))
+    if (pools.every(p => p === null || (Array.isArray(p) && !p.length))) return []
+    const byDom = new Map()
+    for (const c of pools.filter(Boolean).flat()) {
+      const prev = byDom.get(c.domain)
+      if (!prev || c.notBefore > prev.notBefore) byDom.set(c.domain, c)
+    }
+    return [...byDom.values()].sort((a, b) => b.notBefore - a.notBefore)
+  }
+
   // Newest certs for one builder suffix (TIER A only). Returns null on
   // failure (crt.sh 502s are normal under load — 3 attempts, growing
   // backoff), [] when genuinely empty. Uses the same CRTSH_RELAY_URL relay
   // as the store-age lookups when set.
-  async function fetchCrtshNewestDomains(suffix, limit = 200) {
+  async function fetchCrtshNewestDomains(suffix, limit = 200, offset = 0) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const r = await fetch(`${CRTSH_BASE}?q=${encodeURIComponent('%.' + suffix)}&output=json`,
@@ -1591,7 +1670,7 @@ module.exports = async (req, res) => {
             if (nb >= (newest.get(n) || 0)) newest.set(n, nb)
           }
         }
-        return [...newest.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit)
+        return [...newest.entries()].sort((a, b) => b[1] - a[1]).slice(offset, offset + limit)
           .map(([domain, notBefore]) => ({ domain, notBefore }))
       } catch (e) {
         if (attempt < 2) await new Promise(r2 => setTimeout(r2, attempt ? 10000 : 4000))
@@ -1609,9 +1688,12 @@ module.exports = async (req, res) => {
   //   2. the FULL page.url, not just the domain — Wix free sites live at a
   //      PATH (sub.wixsite.com/mysite); the bare subdomain root 404s.
   // Same shape as the crt.sh pool: { domain, notBefore } plus url.
-  async function fetchUrlscanBuilderDomains(suffix, limit = 200) {
+  async function fetchUrlscanBuilderDomains(suffix, limit = 200, daysBack = 4) {
+    // urlscan's public search index only keeps ~30 days — clamp so deeper
+    // digs stay inside what the API can actually answer.
+    const span = Math.min(Math.max(daysBack, 1), 30)
     const to = new Date().toISOString().slice(0, 10)
-    const from = new Date(Date.now() - 4 * 86400000).toISOString().slice(0, 10)
+    const from = new Date(Date.now() - span * 86400000).toISOString().slice(0, 10)
     const query = `page.domain:${suffix} AND page.status:200 AND date:[${from} TO ${to}]`
     const found = new Map()   // domain -> { domain, url, notBefore }
     let searchAfter = null
@@ -1852,50 +1934,45 @@ module.exports = async (req, res) => {
     if (!src) { await send(chatId, 'Unknown builder — pick one from the 🤖 AI-Built Sites menu.'); return res.status(200).send('OK') }
     const mode = await getHuntMode(userId)
     const country = await getHuntCountry(userId)
+    const age = await getHuntAge(userId)
     await send(chatId,
       `🤖 AI Site Hunter — ${src.label}\n\n` +
-      `Scanning the newest ${src.tier === 'A' ? 'certificate records' : 'public scans'} for fresh ${src.label} sites, then opening each one live: ` +
+      `Scanning ${src.tier === 'A' ? 'certificate records' : 'public scans'} for ${src.label} sites, then opening each one live: ` +
       `builder check, AI-copy score, contacts, weaknesses. Hunting for ${want} lead${want === 1 ? '' : 's'}\n` +
       `Filter: ${mode === 'business' ? '🏢 business sites only (tap 🌐 in the hunt menu to include developers)' : '🌐 everything, developer sites tagged'}.\n` +
-      `Country: ${country === 'any' ? '🌍 any country' : COUNTRY_LABELS[country.toUpperCase()] + ' — non-matching sites skipped'}.\n\n` +
+      `Country: ${country === 'any' ? '🌍 any country' : COUNTRY_LABELS[country.toUpperCase()] + ' — non-matching sites skipped'}.\n` +
+      `🗓 Freshness: ${ageLabel(age)}${age === 'newest' ? ' — if you already got the newest, I dig deeper automatically' : ''}.\n\n` +
       `⏱️ Give it a few minutes — if the time budget cuts me short, send anything and I'll keep hunting.`)
-    // Per-zone fetch with cross-fallback: crt.sh zones fall back to urlscan
-    // when crt.sh 502s (it does that a lot), and urlscan zones fall back to
-    // crt.sh when the recent-scan window is dry. A dead source never kills the run.
-    const pools = await Promise.all(src.suffixes.map(async s => {
-      if (src.tier === 'A') {
-        const crt = await fetchCrtshNewestDomains(s, 200)
-        if (crt) return crt
-        return await fetchUrlscanBuilderDomains(s, 200)
+    // Dig loop: round 0 = the newest slice of the zone. If every one of
+    // those is already on your received list, round 1 digs 200 certs
+    // deeper / widens urlscan's window instead of dying with "nothing new".
+    let candidates = []
+    let rawTotal = 0
+    let dig = 0
+    for (dig = 0; dig <= 1 && !candidates.length; dig++) {
+      const pool = await buildHuntPool(src, dig)
+      rawTotal += pool.length
+      if (!pool.length) continue
+      const seenMap = await getSeenBatch(pool.map(c => `ai:${c.domain}`))
+      const unseen = pool.filter(c => !seenMap[`ai:${c.domain}`])
+      const aged = unseen.filter(c => huntAgeOk(c, age, dig))
+      if (aged.length) candidates = aged.slice(0, 300)
+      else if (dig === 0 && age === 'newest' && unseen.length) {
+        // old lenient fallback: a quiet week shouldn't zero the default run
+        candidates = unseen.slice(0, 300)
       }
-      const us = await fetchUrlscanBuilderDomains(s, 200)
-      if (us && us.length) return us
-      return await fetchCrtshNewestDomains(s, 200) || []
-    }))
-    if (pools.every(p => p === null || (Array.isArray(p) && !p.length))) {
-      await send(chatId, `Nothing found right now — the discovery sources (crt.sh / urlscan) are overloaded or the zone is quiet. Try again in a few minutes.`)
-      return res.status(200).send('OK')
+      if (candidates.length && dig > 0) {
+        await send(chatId, `⛏ The newest sites were all ones you'd already received — dug deeper and found ${candidates.length} site${candidates.length === 1 ? '' : 's'} you haven't seen yet.`)
+      }
     }
-    const byDom = new Map()
-    for (const c of pools.filter(Boolean).flat()) {
-      const prev = byDom.get(c.domain)
-      if (!prev || c.notBefore > prev.notBefore) byDom.set(c.domain, c)
-    }
-    let candidates = [...byDom.values()].sort((a, b) => b.notBefore - a.notBefore)
-    // Freshness cut: a lead card is only worth pitching while it's new. Only
-    // applied when it still leaves enough candidates to work with, so a quiet
-    // week on a small zone doesn't zero out the run.
-    const maxCertAgeMs = (parseInt(process.env.HUNT_MAX_CERT_AGE_DAYS) || 14) * 86400000
-    const freshCut = candidates.filter(c => !c.notBefore || (Date.now() - c.notBefore) <= maxCertAgeMs)
-    if (freshCut.length >= Math.min(30, want * 2)) candidates = freshCut
-    const seenMap = await getSeenBatch(candidates.map(c => `ai:${c.domain}`))
-    candidates = candidates.filter(c => !seenMap[`ai:${c.domain}`]).slice(0, 300)
     if (!candidates.length) {
-      await send(chatId, `✓ The newest sites in this pool are all ones you've already received. Nothing new right now — try again later.`)
+      await send(chatId, rawTotal
+        ? `✓ Every site in reach of this zone is already on your received list inside the ${ageLabel(age)} window.\n\n⛏ Two ways to get more:\n• Hunt menu → 🗓 Sites from → ♾ Any age — I'll dig the whole archive for sites you've never received (that pool basically never runs dry).\n• Wait for fresh sites — new certificates land every day, and I track them automatically.`
+        : `Nothing found right now — the discovery sources (crt.sh / urlscan) are overloaded or the zone is quiet. Try again in a few minutes.`)
       return res.status(200).send('OK')
     }
     const q = await getUserQueue(userId)
-    q.aiHunt = { srcKey, label: src.label, want, mode, country, candidates, results: [], delivered: 0, done: false }
+    q.aiHunt = { srcKey, label: src.label, want, mode, country, age, dig, candidates, results: [], delivered: 0, done: false }
     await saveUserQueue(userId, q)
     return await runAiHuntBatch(chatId, userId, q)
   }
@@ -1919,7 +1996,27 @@ module.exports = async (req, res) => {
         ? (r.country.code !== 'US' && r.country.code !== 'CA')
         : r.country.code !== h.country.toUpperCase()))
     const goodSoFar = () => h.results.filter(r => r.status === 'OK' && r.builder && !isSkippedDev(r) && !isCountryMiss(r))
-    while (Date.now() < deadline && h.candidates.length && goodSoFar().length < h.want) {
+    while (Date.now() < deadline && !h.done && goodSoFar().length < h.want) {
+      // Pool dry mid-hunt → dig deeper instead of finishing. crt.sh steps
+      // 200 certs further back each round, urlscan widens its window; the
+      // dig counter lives in the Redis queue so any ping resumes the dig.
+      if (!h.candidates.length) {
+        if (!h.dig) h.dig = 1
+        const src = AI_HUNT_SOURCES[h.srcKey]
+        if (!src || h.dig > 4) { h.done = true; break }
+        await send(chatId, `⛏ Pool dry so far — digging deeper into the archive (round ${h.dig})…`)
+        const pool = await buildHuntPool(src, h.dig)
+        const round = h.dig
+        h.dig++
+        await saveUserQueue(userId, userQueue)
+        const seenMap = await getSeenBatch(pool.map(c => `ai:${c.domain}`))
+        const fresh = pool.filter(c => !seenMap[`ai:${c.domain}`] && huntAgeOk(c, h.age || 'newest', round))
+        if (fresh.length) {
+          h.candidates.push(...fresh.slice(0, 300))
+          await send(chatId, `⛏ +${Math.min(fresh.length, 300)} site${fresh.length === 1 ? '' : 's'} you haven't received yet — checking them now.`)
+        }
+        continue
+      }
       const chunk = h.candidates.splice(0, CONCURRENCY)
       const results = await Promise.all(chunk.map(c => analyzeAiSite(c.url || `https://${c.domain}`, c.notBefore || 0)))
       h.results.push(...results)
@@ -1930,13 +2027,15 @@ module.exports = async (req, res) => {
     const fresh = live.slice(h.delivered)
     const prevDelivered = h.delivered
     h.delivered = live.length
-    h.done = live.length >= h.want || !h.candidates.length
+    h.done = live.length >= h.want || (!h.candidates.length && (h.dig || 1) > 4)
     const skippedDev = h.results.filter(r => r.status === 'OK' && r.builder && isSkippedDev(r)).length
     const skippedCountry = (h.country && h.country !== 'any') ? h.results.filter(r => r.status === 'OK' && r.builder && isCountryMiss(r)).length : 0
 
     let header
     if (live.length >= h.want) header = `✅ ALL DONE — ${live.length} AI-built sites as requested (${h.label}), checked ${h.results.length} new domains to find them.`
-    else if (!h.candidates.length) header = `✓ Pool finished — ${live.length} live AI-built sites of ${h.results.length} new domains checked (${h.label}).`
+    else if (!h.candidates.length) header = (h.dig || 1) > 4
+      ? `✓ Archive dug to the bottom — ${live.length} live AI-built sites of ${h.results.length} domains checked (${h.label}). Nothing unseen left in the ${ageLabel(h.age || 'newest')} window — new sites land every day, and 🗓 Freshness → ♾ Any age gives the deepest pool.`
+      : `⏳ ${live.length} of ${h.want} — pool dry, the dig continues on your next message.`
     else header = `⏳ ${live.length} of ${h.want} so far (checked ${h.results.length}) — send anything and I'll keep hunting.`
     if (h.mode === 'business' && skippedDev > 0) {
       header += `\n🏢 Skipped ${skippedDev} developer/portfolio site${skippedDev === 1 ? '' : 's'} — tap 🌐 Show everything in the hunt menu to include them.`
@@ -3702,6 +3801,29 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         return res.status(200).send('OK')
       }
 
+      if (data.startsWith('huntage:')) {
+        const srcKey = data.slice('huntage:'.length)
+        if (!AI_HUNT_SOURCES[srcKey]) return res.status(200).send('OK')
+        await sendKeyboard(cbChatId,
+          `🗓 How old can the sites be?\n\nFresh sites pitch best — but when the newest ones are already on your received list, ♾ Any age makes me dig the whole archive for sites you've never received instead of giving up.`,
+          huntAgeKeyboard(srcKey, await getHuntAge(cbUserId)))
+        return res.status(200).send('OK')
+      }
+
+      if (data.startsWith('hageset:')) {
+        const [, srcKey, val] = data.split(':')
+        if (!AI_HUNT_SOURCES[srcKey] || !HUNT_AGES.includes(val)) return res.status(200).send('OK')
+        await redis('SET', `hunt:age:${cbUserId}`, val)
+        await send(cbChatId, val === 'any'
+          ? `♾ Any age — from now on hunts dig the whole archive for sites you've never received, newest first. That pool basically never runs dry.`
+          : `🗓 Freshness set: ${ageLabel(val)} — hunts only deliver sites born in that window (by certificate/scan date).`)
+        const huntTier = isOwner ? 'owner' : await tierOf(cbUserId)
+        await sendKeyboard(cbChatId,
+          `🤖 ${AI_HUNT_SOURCES[srcKey].label} — how many fresh AI-built sites?`,
+          huntCountButtons(srcKey, huntTier, await getHuntMode(cbUserId), await getHuntCountry(cbUserId), val))
+        return res.status(200).send('OK')
+      }
+
       if (data === 'countryhint') {
         await send(cbChatId, `✍️ To target another country, just send:\n/country NG — or US, UK, IN, GH, KE, ZA, PH, DE, BR, CA, AU…\n\n/country any removes the filter.`)
         return res.status(200).send('OK')
@@ -3737,9 +3859,10 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         const huntTier = isOwner ? 'owner' : await tierOf(cbUserId)
         const huntMode = await getHuntMode(cbUserId)
         const huntCountry = await getHuntCountry(cbUserId)
+        const huntAge = await getHuntAge(cbUserId)
         await sendKeyboard(cbChatId,
           `🤖 ${AI_HUNT_SOURCES[srcKey].label} — how many fresh AI-built sites?`,
-          huntCountButtons(srcKey, huntTier, huntMode, huntCountry))
+          huntCountButtons(srcKey, huntTier, huntMode, huntCountry, huntAge))
         return res.status(200).send('OK')
       }
 
