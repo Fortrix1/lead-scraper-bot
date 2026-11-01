@@ -234,11 +234,16 @@ module.exports = async (req, res) => {
   function activeFlowFlags(q) {
     return !!(q && (q.awaitingReviewCap || q.awaitingCompanyList || q.awaitingMessages ||
       q.awaitingCustomQuery || q.awaitingLeadCount || q.awaitingLockedFilter ||
+      q.awaitingScoutAgeGate ||
       q.awaitingCustomDate || q.awaitingSocialFilter || q.awaitingHuntUrl || q.wizard || q.answeringGift))
   }
 
   async function saveFilteredOut(userId, list) {
-    await redis('SET', `filtered:${userId}`, JSON.stringify(list))
+    // Merge with what's already stored — a hunt drops leads across several
+    // batches/messages, replacing the list each time would lose earlier drops.
+    const prev = await getFilteredOut(userId)
+    const merged = [...prev, ...list].slice(-200)
+    await redis('SET', `filtered:${userId}`, JSON.stringify(merged))
   }
 
   async function getFilteredOut(userId) {
@@ -1393,28 +1398,60 @@ module.exports = async (req, res) => {
   //  on a builder's free host is a fresh AI-built site. This module only
   //  READS public pages and public APIs (no logins, no posting anywhere).
   // ══════════════════════════════════════════════
+  // TIER A: every site on the host gets its OWN certificate, so one crt.sh
+  // wildcard query enumerates the zone's newest sites. TIER B: the builder
+  // covers ALL customer sites with ONE wildcard cert — verified live, crt.sh
+  // holds exactly one `*.framer.website` row and nothing else — so certificate
+  // logs can NEVER list these sites, and discovery goes through urlscan's
+  // recent-scan index instead (fetchUrlscanBuilderDomains below).
   const AI_HUNT_SOURCES = {
-    lovable: { label: 'Lovable',        suffixes: ['lovable.app'] },
-    framer:  { label: 'Framer',         suffixes: ['framer.app'] },
-    all:     { label: 'All AI builders', suffixes: ['lovable.app', 'framer.app', 'vercel.app', 'netlify.app', 'pages.dev'] }
+    lovable: { label: 'Lovable',         tier: 'A',   suffixes: ['lovable.app'] },
+    framer:  { label: 'Framer',          tier: 'B',   suffixes: ['framer.website'] },
+    durable: { label: 'Durable',         tier: 'B',   suffixes: ['durable.site'] },
+    wix:     { label: 'Wix sites',       tier: 'B',   suffixes: ['wixsite.com'] },
+    all:     { label: 'All AI builders', tier: 'A+B', suffixes: ['lovable.app', 'framer.website', 'durable.site', 'wixsite.com'] }
   }
   // vercel.app / netlify.app / pages.dev cert logs are enormous — only keep
   // subdomains that look like a real small business (keyword filter).
-  const AI_HUNT_BIG_HOSTS = ['vercel.app', 'netlify.app', 'pages.dev']
+  // Same gate for the two HUGE free-host zones (framer.website gets ~600
+  // scans/4d, wixsite.com ~3300 — mostly phishing; the keywords cut that
+  // noise before we spend a fetch on it). durable.site stays UNGATED: its
+  // whole zone is ~30 scans/4d and its site slugs (alisayurkinaperformance)
+  // rarely contain niche words — the classifier handles quality there.
+  // lovable.app also ungated (small zone, high hit rate).
+  const AI_HUNT_BIG_HOSTS = ['vercel.app', 'netlify.app', 'pages.dev', 'framer.website', 'wixsite.com']
   const AI_HUNT_KEYWORDS = ['roof','dental','law','plumb','agency','salon','clinic','landscap','clean','fitness','gym',
-    'restaurant','bakery','realty','estate','coach','consult','repair','detail','movers','moving','pest','hvac',
+    'restaurant','bakery','cafe','coffee','food','realty','estate','coach','consult','repair','detail','movers','moving','pest','hvac',
     'electric','photo','wedding','tutor','account','insur','mortgage','chiro','therapy','spa','barber','auto',
-    'studio','shop','store','care','homes','build','design','market']
+    'studio','shop','store','care','homes','build','design','market','hotel','travel','yoga','nails','hair','fashion','beauty','event']
 
-  const AI_SUBDOMAIN_BUILDERS = { 'lovable.app': 'Lovable', 'framer.app': 'Framer' }
+  // Subdomain zones where the host alone proves the builder. Values are
+  // objects now (name + category + confidence) — wixsite.com sites are
+  // no-code template sites, NOT AI builds, and must be labelled as such.
+  const AI_SUBDOMAIN_BUILDERS = {
+    'lovable.app':    { name: 'Lovable', category: 'AI_BUILDER', conf: 0.99 },
+    'framer.website': { name: 'Framer',  category: 'AI_BUILDER', conf: 0.99 },
+    'durable.site':   { name: 'Durable', category: 'AI_BUILDER', conf: 0.95 },
+    'wixsite.com':    { name: 'Wix',     category: 'NO_CODE',    conf: 0.95 },
+  }
   const AI_BUILDER_MARKERS = [
     { builder: 'Lovable',      category: 'AI_BUILDER', conf: 0.9,  tests: [/lovable-uploads\//i, /lovable-logo-mono/i] },
     { builder: 'Framer',       category: 'AI_BUILDER', conf: 0.9,  tests: [/framerusercontent\.com/i, /data-framer-/i] },
-    { builder: 'Durable',      category: 'AI_BUILDER', conf: 0.85, tests: [/cdn\.durable\.co/i, /<meta[^>]+generator[^>]+durable/i] },
+    { builder: 'Durable',      category: 'AI_BUILDER', conf: 0.9,  tests: [/cdn\.durable\.co/i, /<meta[^>]+generator[^>]+durable/i] },
     { builder: 'Hostinger AI', category: 'AI_BUILDER', conf: 0.85, tests: [/<meta[^>]+name=["']generator["'][^>]*hostinger/i] },
-    { builder: 'Wix',          category: 'NO_CODE',    conf: 0.9,  tests: [/static\.wixstatic\.com/i] },
+    { builder: 'Wix',          category: 'NO_CODE',    conf: 0.9,  tests: [/static\.wixstatic\.com/i, /<meta[^>]+generator[^>]+wix\.com/i] },
     { builder: 'Webflow',      category: 'NO_CODE',    conf: 0.9,  tests: [/cdn\.prod\.website-files\.com/i, /data-wf-page/i] },
-    { builder: 'Squarespace',  category: 'NO_CODE',    conf: 0.9,  tests: [/static1\.squarespace\.com/i, /squarespace\.com\/assets/i] },
+    { builder: 'Squarespace',  category: 'NO_CODE',    conf: 0.9,  tests: [/static1\.squarespace\.com/i, /assets\.squarespace\.com/i, /squarespace\.com\/assets/i] },
+  ]
+  // Builder "site missing" pages — urlscan indexes plenty of taken-down
+  // free-host sites (verified live: whole recent Framer/Wix result pages were
+  // these). They carry no builder markers, but the title check is cheaper
+  // than marker scanning and gives a cleaner "dead" verdict.
+  const AI_DEAD_TITLES = [
+    /^site not found\s*\|\s*framer/i,
+    /^404 error:\s*page not found\s*\|\s*wix/i,
+    /^page not found/i,
+    /^site (not found|unavailable|suspended)/i,
   ]
   // "AI wrote this" copy heuristics — each match counts once (spec §5.2).
   const AI_COPY_PATTERNS = [
@@ -1427,27 +1464,41 @@ module.exports = async (req, res) => {
 
   function aiDomainAllowed(host) {
     if (!/^[a-z0-9][a-z0-9.-]*$/.test(host) || host.includes('..')) return false
-    const big = AI_HUNT_BIG_HOSTS.find(s => host.endsWith('.' + s))
-    if (!big) return true   // lovable.app / framer.app: every subdomain is an AI-built site
+    const big = AI_HUNT_BIG_HOSTS.find(s => host === s || host.endsWith('.' + s))
+    if (!big) return true   // lovable.app: every subdomain is an AI-built site
     const sub = host.slice(0, -(big.length + 1))
     return !!sub && AI_HUNT_KEYWORDS.some(k => sub.includes(k))
   }
 
-  function huntCountButtons(srcKey, tier) {
-    if (tier === 'daily')   return [[B(`🎁 Free hunt (${DAILY_RESULT_CAP})`, `huntgo:${srcKey}:${DAILY_RESULT_CAP}`)]]
-    if (tier === 'onetime') return [[B(`🎁 Free hunt (${FREE_RESULT_CAP})`, `huntgo:${srcKey}:${FREE_RESULT_CAP}`)]]
-    return [[B('10', `huntgo:${srcKey}:10`), B('20', `huntgo:${srcKey}:20`), B('50', `huntgo:${srcKey}:50`)]]
+  function huntCountButtons(srcKey, tier, mode = 'business') {
+    const countRow = tier === 'daily'   ? [[B(`🎁 Free hunt (${DAILY_RESULT_CAP})`, `huntgo:${srcKey}:${DAILY_RESULT_CAP}`)]]
+                   : tier === 'onetime' ? [[B(`🎁 Free hunt (${FREE_RESULT_CAP})`, `huntgo:${srcKey}:${FREE_RESULT_CAP}`)]]
+                   : [[B('10', `huntgo:${srcKey}:10`), B('20', `huntgo:${srcKey}:20`), B('50', `huntgo:${srcKey}:50`)]]
+    return [...countRow, [
+      B(mode === 'business' ? '🏢 Business sites only ✅' : '🏢 Business sites only', 'huntmode:business'),
+      B(mode === 'all' ? '🌐 Show everything ✅' : '🌐 Show everything', 'huntmode:all')
+    ]]
   }
 
-  // Newest certs for one builder suffix. Returns null on failure (crt.sh is
-  // often overloaded — one retry with backoff), [] when genuinely empty.
-  // Uses the same CRTSH_RELAY_URL relay as the store-age lookups when set.
+  // Per-user AI Hunter filter mode — 'business' (default) drops developer
+  // portfolios/demos/side projects; 'all' shows everything, tagged.
+  async function getHuntMode(userId) {
+    try {
+      const { result } = await redis('GET', `hunt:mode:${userId}`)
+      return result === 'all' ? 'all' : 'business'
+    } catch { return 'business' }
+  }
+
+  // Newest certs for one builder suffix (TIER A only). Returns null on
+  // failure (crt.sh 502s are normal under load — 3 attempts, growing
+  // backoff), [] when genuinely empty. Uses the same CRTSH_RELAY_URL relay
+  // as the store-age lookups when set.
   async function fetchCrtshNewestDomains(suffix, limit = 200) {
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const r = await fetch(`${CRTSH_BASE}?q=${encodeURIComponent('%.' + suffix)}&output=json`,
           { signal: AbortSignal.timeout(25000), headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AIHunter/1.0' } })
-        if (!r.ok) { if (!attempt) await new Promise(r2 => setTimeout(r2, 4000)); continue }
+        if (!r.ok) { if (attempt < 2) await new Promise(r2 => setTimeout(r2, attempt ? 10000 : 4000)); continue }
         const rows = await r.json()
         const newest = new Map()
         for (const row of rows || []) {
@@ -1461,10 +1512,50 @@ module.exports = async (req, res) => {
         return [...newest.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit)
           .map(([domain, notBefore]) => ({ domain, notBefore }))
       } catch (e) {
-        if (!attempt) await new Promise(r2 => setTimeout(r2, 4000))
+        if (attempt < 2) await new Promise(r2 => setTimeout(r2, attempt ? 10000 : 4000))
       }
     }
     return null
+  }
+
+  // TIER B discovery — urlscan's index of recent public scans. These builder
+  // zones sit behind a single wildcard certificate, so crt.sh can't enumerate
+  // them (verified live: crt.sh holds exactly one `*.framer.website` row).
+  // Two things this query must keep, both verified live today:
+  //   1. page.status:200 — without it the pool is dominated by taken-down
+  //      phishing/stub pages that will just burn the fetch stage.
+  //   2. the FULL page.url, not just the domain — Wix free sites live at a
+  //      PATH (sub.wixsite.com/mysite); the bare subdomain root 404s.
+  // Same shape as the crt.sh pool: { domain, notBefore } plus url.
+  async function fetchUrlscanBuilderDomains(suffix, limit = 200) {
+    const to = new Date().toISOString().slice(0, 10)
+    const from = new Date(Date.now() - 4 * 86400000).toISOString().slice(0, 10)
+    const query = `page.domain:${suffix} AND page.status:200 AND date:[${from} TO ${to}]`
+    const found = new Map()   // domain -> { domain, url, notBefore }
+    let searchAfter = null
+    for (let page = 0; page < 4 && found.size < limit; page++) {
+      const data = await fetchUrlscanPage(query, searchAfter)
+      if (!data) break
+      const items = data.results || []
+      if (!items.length) break
+      for (const item of items) {
+        const pageUrl = String(item.page?.url || '')
+        const m = pageUrl.match(/^https?:\/\/([^/]+)/i)
+        if (!m) continue
+        const host = m[1].toLowerCase().replace(/^www\./, '')
+        // Builder-internal preview/staging subdomains (verified live:
+        // *.preview.durable.site is Durable's own test bench) are never leads.
+        if (/(^|\.)preview\./.test(host)) continue
+        if (!host.endsWith('.' + suffix) || !aiDomainAllowed(host)) continue
+        const t = Date.parse(item.task?.time || '') || 0
+        const prev = found.get(host)
+        if (!prev || t > prev.notBefore) found.set(host, { domain: host, url: pageUrl, notBefore: t })
+      }
+      const last = items[items.length - 1]
+      if (!last?.sort || items.length < 100) break
+      searchAfter = last.sort.join(',')
+    }
+    return [...found.values()].sort((a, b) => b.notBefore - a.notBefore).slice(0, limit)
   }
 
   function htmlToVisibleText(html) {
@@ -1485,13 +1576,60 @@ module.exports = async (req, res) => {
   }
 
   function detectAiBuilder(host, html) {
-    for (const [suffix, name] of Object.entries(AI_SUBDOMAIN_BUILDERS)) {
-      if (host === suffix || host.endsWith('.' + suffix)) return { builder: name, confidence: 0.99, category: 'AI_BUILDER' }
+    for (const [suffix, info] of Object.entries(AI_SUBDOMAIN_BUILDERS)) {
+      if (host === suffix || host.endsWith('.' + suffix)) return { builder: info.name, confidence: info.conf, category: info.category }
     }
     for (const m of AI_BUILDER_MARKERS) {
       if (m.tests.some(t => t.test(html))) return { builder: m.builder, confidence: m.conf, category: m.category }
     }
     return null
+  }
+
+  // ── Business vs developer/portfolio classifier (rules only, no extra
+  // network calls). Decides lead_kind for the 🏢 Business-sites-only toggle.
+  // DEV_HOST_SEGMENTS are matched as EXACT hyphen/dot segments of the
+  // subdomain label — "dev" must not match "devonplumbing".
+  const AI_DEV_HOST_SEGMENTS = ['portfolio', 'demo', 'test', 'clone', 'playground', 'sandbox', 'staging', 'dev', 'v1', 'v2', 'v3', 'copy', 'backup', 'template', 'my', 'site']
+  const AI_DEV_TEXT_SIGNALS = [
+    ['portfolio',            /portfolio/i],
+    ['developer wording',    /\b(software|web|front.?end|back.?end|full.?stack)\s+(engineer|developer)\b/i],
+    ['"hire me"',            /\bhire me\b/i],
+    ['resume / CV',          /\bmy (resume|cv)\b|download my (resume|cv)/i],
+    ['side project',         /\bside project\b|\bhackathon\b/i],
+    ['"built with" credit',  /built with (lovable|bolt|v0|framer|durable|wix|wordpress)/i],
+    ['demo/test notice',     /this is a (demo|test|sample)|sample (project|site)|\bplayground\b/i],
+    ['placeholder text',     /lorem ipsum/i],
+    ['placeholder names',    /\b(john|jane) doe\b|\bacme (corp|inc|llc|company)\b|\byour (company|business) name\b/i],
+    ['example.com email',    /@(example\.com|example\.org|test\.com)\b/i],
+    ['github link',          /(www\.)?github\.com\//i],
+  ]
+  const AI_BIZ_TEXT_SIGNALS = [
+    ['phone (tel: link)',    /href=["']tel:/i],
+    ['prices',               /[$\u00a3\u20ac]\s?\d|\b\d{1,3}(?:[.,]\d{3})+\s?(?:\u20ac|USD|EUR|GBP)\b/i],
+    ['booking widget',       /calendly\.com|booksy\.|squareup\.com\/appointments|acuityscheduling|setmore|simplybook/i],
+    ['street address',       /\b(street|road|avenue|suite|boulevard|blvd|lane)\b/i],
+    ['opening hours',        /opening hours|business hours|\bmon(day)?\s*[-\u2013]\s*(fri|sat|sun)/i],
+    ['contact page',         /href=["'][^"']*contact[^"']*["']/i],
+  ]
+
+  function classifySiteKind(host, html) {
+    const label = (host.split('.')[0] || '').toLowerCase()
+    const segments = label.split(/[-_.]/)
+    const text = htmlToVisibleText(html).slice(0, 8000)
+    const raw = html.slice(0, 150000)
+    const dev = [], biz = []
+    for (const [name, rx] of AI_DEV_TEXT_SIGNALS) if (rx.test(raw) || rx.test(text)) dev.push(name)
+    for (const [name, rx] of AI_BIZ_TEXT_SIGNALS) if (rx.test(raw) || rx.test(text)) biz.push(name)
+    for (const w of AI_DEV_HOST_SEGMENTS) {
+      if (segments.includes(w)) { dev.push(`"${w}" in the site address`); break }
+    }
+    if (AI_HUNT_KEYWORDS.some(k => label.includes(k))) biz.push('business niche in the site address')
+    const internalLinks = new Set(raw.match(/href=["']\/[a-z0-9][a-z0-9\-/]{0,40}["']/gi) || [])
+    if (!biz.length && internalLinks.size < 3) dev.push('single-page site with no business signals')
+    let kind = 'UNCERTAIN'
+    if (dev.length >= 2) kind = 'DEVELOPER'
+    else if (biz.length >= 2) kind = 'REAL_BUSINESS'
+    return { kind, dev, biz }
   }
 
   function aiSiteWeaknesses(html) {
@@ -1528,10 +1666,13 @@ module.exports = async (req, res) => {
   // Full single-site pass: fetch homepage raw HTML -> fingerprint the builder,
   // score the copy for "AI wrote this", pull contacts (homepage -> contact
   // pages -> socials -> RDAP), and list pitchable weaknesses.
-  async function analyzeAiSite(url) {
+  // certMs (optional) = the discovery timestamp (cert not_before / urlscan
+  // scan time) — shown on the lead card as 🆕 date so you can see how new it is.
+  async function analyzeAiSite(url, certMs = 0) {
     const host = url.replace(/^https?:\/\//, '').split('/')[0].toLowerCase()
     const out = { url, host, status: 'dead', builder: null, confidence: 0, category: 'HUMAN',
-      ai_score: 0, emails: [], socials: {}, formUrl: '', weaknesses: [], title: '' }
+      ai_score: 0, emails: [], socials: {}, formUrl: '', weaknesses: [], title: '',
+      kind: 'UNCERTAIN', kindWhy: null, certDate: certMs ? new Date(certMs).toISOString().slice(0, 10) : '' }
     let html = ''
     try {
       const r = await fetch(url, { signal: AbortSignal.timeout(8000), redirect: 'follow',
@@ -1543,6 +1684,10 @@ module.exports = async (req, res) => {
 
     const tm = html.match(/<title[^>]*>([^<]*)<\/title>/i)
     out.title = tm ? tm[1].trim().slice(0, 60) : ''
+    // Taken-down builder pages ("Site Not Found | Framer", Wix 404 stubs —
+    // both seen live in urlscan's index) return HTTP 200 but are dead ends:
+    // stop here before wasting contact-page fetches on them.
+    if (AI_DEAD_TITLES.some(rx => rx.test(out.title))) return out
     const copyPts = aiCopyScore(htmlToVisibleText(html))
     const det = detectAiBuilder(host, html)
     if (det) {
@@ -1556,12 +1701,17 @@ module.exports = async (req, res) => {
       }
     }
     out.weaknesses = aiSiteWeaknesses(html)
+    const kind = classifySiteKind(host, html)
+    out.kind = kind.kind
+    out.kindWhy = { dev: kind.dev, biz: kind.biz }
 
     // Contacts, in priority order: inline emails -> contact pages -> socials -> RDAP.
     out.emails = [...new Set(cleanEmails(html))].slice(0, 3)
     out.socials = extractSocials(html)
     if (!out.emails.length) {
-      const base = `https://${host}`
+      // Keep the original path when the site lives at one (Wix free sites:
+      // sub.wixsite.com/mysite — probing /contact at the bare host 404s).
+      const base = url.replace(/\/$/, '')
       const pages = await Promise.all(['/contact', '/contact-us', '/about'].map(async p => {
         try {
           const r2 = await fetch(base + p, { signal: AbortSignal.timeout(5000), redirect: 'follow',
@@ -1588,31 +1738,56 @@ module.exports = async (req, res) => {
     return out
   }
 
-  function aiLeadCard(lead, idx) {
+  const KIND_TAGS = { REAL_BUSINESS: '🏢 real business', DEVELOPER: '👨‍💻 developer/portfolio', UNCERTAIN: '❔ unclear' }
+
+  function aiLeadCard(lead, idx, showWhy = false) {
     const contactBits = []
     if (lead.emails.length) contactBits.push(`📧 ${lead.emails.join(', ')}`)
     const socialBits = Object.entries(lead.socials || {}).map(([k, v]) => `${k}: ${v}`)
     if (socialBits.length) contactBits.push(`💬 ${socialBits.join(' · ')}`)
     if (lead.formUrl) contactBits.push(`📝 form: ${lead.formUrl}`)
     const conf = lead.confidence ? ` (conf ${lead.confidence.toFixed(2)})` : ''
+    const kindTag = KIND_TAGS[lead.kind] || ''
+    const whyLines = []
+    if (showWhy && lead.kindWhy) {
+      if (lead.kindWhy.dev.length) whyLines.push(`why dev: ${lead.kindWhy.dev.join(', ')}`)
+      if (lead.kindWhy.biz.length) whyLines.push(`why business: ${lead.kindWhy.biz.join(', ')}`)
+    }
     return `${idx}. 🔗 ${lead.url}` +
       (lead.title ? `\n    🏷️ ${lead.title}` : '') +
       `\n    🛠 ${lead.builder || 'unknown'}${conf} · ai_score: ${lead.ai_score}` +
+      (kindTag ? ` · ${kindTag}` : '') +
+      (lead.certDate ? `\n    🆕 spotted: ${lead.certDate}` : '') +
       `\n    ${contactBits.length ? contactBits.join('\n    ') : '⚠️ no public contact found'}` +
-      (lead.weaknesses.length ? `\n    ⚠️ Weak: ${lead.weaknesses.join('; ')}` : '')
+      (lead.weaknesses.length ? `\n    ⚠️ Weak: ${lead.weaknesses.join('; ')}` : '') +
+      whyLines.map(w => `\n    ℹ️ ${w}`).join('')
   }
 
   async function startAiHunt(chatId, userId, srcKey, want) {
     const src = AI_HUNT_SOURCES[srcKey]
     if (!src) { await send(chatId, 'Unknown builder — pick one from the 🤖 AI-Built Sites menu.'); return res.status(200).send('OK') }
+    const mode = await getHuntMode(userId)
     await send(chatId,
       `🤖 AI Site Hunter — ${src.label}\n\n` +
-      `Scanning certificate logs for the newest AI-built sites, then opening each one live: ` +
-      `builder check, AI-copy score, contacts, weaknesses. Hunting for ${want} lead${want === 1 ? '' : 's'}.\n\n` +
+      `Scanning the newest ${src.tier === 'A' ? 'certificate records' : 'public scans'} for fresh ${src.label} sites, then opening each one live: ` +
+      `builder check, AI-copy score, contacts, weaknesses. Hunting for ${want} lead${want === 1 ? '' : 's'}\n` +
+      `Filter: ${mode === 'business' ? '🏢 business sites only (tap 🌐 in the hunt menu to include developers)' : '🌐 everything, developer sites tagged'}.\n\n` +
       `⏱️ Give it a few minutes — if the time budget cuts me short, send anything and I'll keep hunting.`)
-    const pools = await Promise.all(src.suffixes.map(s => fetchCrtshNewestDomains(s, 200)))
-    if (pools.every(p => p === null)) {
-      await send(chatId, `crt.sh didn't answer — it's often overloaded (and your relay isn't set). Try again in a minute or two.`)
+    // Per-zone fetch with cross-fallback: crt.sh zones fall back to urlscan
+    // when crt.sh 502s (it does that a lot), and urlscan zones fall back to
+    // crt.sh when the recent-scan window is dry. A dead source never kills the run.
+    const pools = await Promise.all(src.suffixes.map(async s => {
+      if (src.tier === 'A') {
+        const crt = await fetchCrtshNewestDomains(s, 200)
+        if (crt) return crt
+        return await fetchUrlscanBuilderDomains(s, 200)
+      }
+      const us = await fetchUrlscanBuilderDomains(s, 200)
+      if (us && us.length) return us
+      return await fetchCrtshNewestDomains(s, 200) || []
+    }))
+    if (pools.every(p => p === null || (Array.isArray(p) && !p.length))) {
+      await send(chatId, `Nothing found right now — the discovery sources (crt.sh / urlscan) are overloaded or the zone is quiet. Try again in a few minutes.`)
       return res.status(200).send('OK')
     }
     const byDom = new Map()
@@ -1621,14 +1796,20 @@ module.exports = async (req, res) => {
       if (!prev || c.notBefore > prev.notBefore) byDom.set(c.domain, c)
     }
     let candidates = [...byDom.values()].sort((a, b) => b.notBefore - a.notBefore)
+    // Freshness cut: a lead card is only worth pitching while it's new. Only
+    // applied when it still leaves enough candidates to work with, so a quiet
+    // week on a small zone doesn't zero out the run.
+    const maxCertAgeMs = (parseInt(process.env.HUNT_MAX_CERT_AGE_DAYS) || 14) * 86400000
+    const freshCut = candidates.filter(c => !c.notBefore || (Date.now() - c.notBefore) <= maxCertAgeMs)
+    if (freshCut.length >= Math.min(30, want * 2)) candidates = freshCut
     const seenMap = await getSeenBatch(candidates.map(c => `ai:${c.domain}`))
     candidates = candidates.filter(c => !seenMap[`ai:${c.domain}`]).slice(0, 300)
     if (!candidates.length) {
-      await send(chatId, `✓ The newest certificates are all sites you've already received. Nothing new right now — try again later.`)
+      await send(chatId, `✓ The newest sites in this pool are all ones you've already received. Nothing new right now — try again later.`)
       return res.status(200).send('OK')
     }
     const q = await getUserQueue(userId)
-    q.aiHunt = { srcKey, label: src.label, want, candidates, results: [], delivered: 0, done: false }
+    q.aiHunt = { srcKey, label: src.label, want, mode, candidates, results: [], delivered: 0, done: false }
     await saveUserQueue(userId, q)
     return await runAiHuntBatch(chatId, userId, q)
   }
@@ -1640,10 +1821,14 @@ module.exports = async (req, res) => {
     const h = userQueue.aiHunt
     if (!h) return res.status(200).send('OK')
     const deadline = Date.now() + 40000
-    const goodSoFar = () => h.results.filter(r => r.status === 'OK' && r.builder)
+    // Business mode: developer/portfolio leads don't count toward `want` and
+    // are never delivered — but they're still checked, counted and skipped
+    // loudly so you know the filter is alive.
+    const isSkippedDev = r => h.mode === 'business' && r.kind === 'DEVELOPER'
+    const goodSoFar = () => h.results.filter(r => r.status === 'OK' && r.builder && !isSkippedDev(r))
     while (Date.now() < deadline && h.candidates.length && goodSoFar().length < h.want) {
       const chunk = h.candidates.splice(0, CONCURRENCY)
-      const results = await Promise.all(chunk.map(c => analyzeAiSite(`https://${c.domain}`)))
+      const results = await Promise.all(chunk.map(c => analyzeAiSite(c.url || `https://${c.domain}`, c.notBefore || 0)))
       h.results.push(...results)
       await markSeenBatch(chunk.map((c, i) => [`ai:${c.domain}`, { status: results[i].status, builder: results[i].builder || '', checkedAt: new Date().toISOString() }]))
       await saveUserQueue(userId, userQueue)
@@ -1653,11 +1838,15 @@ module.exports = async (req, res) => {
     const prevDelivered = h.delivered
     h.delivered = live.length
     h.done = live.length >= h.want || !h.candidates.length
+    const skippedDev = h.results.filter(r => r.status === 'OK' && r.builder && isSkippedDev(r)).length
 
     let header
     if (live.length >= h.want) header = `✅ ALL DONE — ${live.length} AI-built sites as requested (${h.label}), checked ${h.results.length} new domains to find them.`
     else if (!h.candidates.length) header = `✓ Pool finished — ${live.length} live AI-built sites of ${h.results.length} new domains checked (${h.label}).`
     else header = `⏳ ${live.length} of ${h.want} so far (checked ${h.results.length}) — send anything and I'll keep hunting.`
+    if (h.mode === 'business' && skippedDev > 0) {
+      header += `\n🏢 Skipped ${skippedDev} developer/portfolio site${skippedDev === 1 ? '' : 's'} — tap 🌐 Show everything in the hunt menu to include them.`
+    }
 
     let reply = header
     let n = prevDelivered
@@ -1685,6 +1874,10 @@ module.exports = async (req, res) => {
       lead.category === 'NO_CODE'    ? `🧩 Built with ${lead.builder} (no-code — pitch a redesign, not "your site looks AI")` :
       lead.category === 'LIKELY_AI'  ? `🤔 Likely AI-built (${lead.builder})` :
                                        `👤 Looks hand-built (no AI-builder markers, low AI-copy score)`
+    const kindLine =
+      lead.kind === 'REAL_BUSINESS' ? `🏢 Classified: real business site` :
+      lead.kind === 'DEVELOPER'     ? `👨‍💻 Classified: developer/portfolio site` :
+                                      `❔ Classified: unclear (not enough signals either way)`
     const promptGuess = lead.title ? `"a website for ${lead.title.toLowerCase()}"` : '—'
     const pitchHook = lead.weaknesses.length
       ? `their site ${lead.weaknesses[0]}${lead.weaknesses[1] ? ' and ' + lead.weaknesses[1] : ''} — easy wins to offer.`
@@ -1692,8 +1885,9 @@ module.exports = async (req, res) => {
     await send(chatId,
       `🔬 Deep check — ${lead.host}\n\n` +
       `${verdict}\n` +
+      `${kindLine}\n` +
       `Confidence: ${lead.confidence ? lead.confidence.toFixed(2) : '—'} · AI-copy score: ${lead.ai_score}/100\n\n` +
-      `${aiLeadCard(lead, 1).replace(/^1\. /, '')}\n\n` +
+      `${aiLeadCard(lead, 1, true).replace(/^1\. /, '')}\n\n` +
       `💬 Likely prompt: ${promptGuess}\n` +
       `💡 Pitch hook: ${pitchHook}`)
   }
@@ -1764,16 +1958,31 @@ module.exports = async (req, res) => {
     return true
   }
 
-  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked, month = null, freshDays = null, dateRange = null, requiredSocial = null) {
+  // Window length in days for the /scout age gate — from a custom range
+  // (inclusive) or one of the month-picker presets. null = no computable window.
+  function scoutWindowDays(dateRange, month) {
+    if (dateRange && dateRange.from && dateRange.to) {
+      const days = Math.round((Date.parse(dateRange.to + 'T00:00:00Z') - Date.parse(dateRange.from + 'T00:00:00Z')) / 86400000) + 1
+      return days >= 1 ? days : null
+    }
+    if (month === 'last7') return 7
+    if (month === 'last14') return 14
+    if (month === 'last30') return 30
+    if (month === 'thismonth') return Math.min(30, new Date().getUTCDate())
+    return null
+  }
+
+  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked, month = null, freshDays = null, dateRange = null, requiredSocial = null, ageGate = false) {
     const scope = dateRange ? dateRangeLabel(dateRange) : ymLabel(month)
-    await send(chatId, `🔍 Hunting for ${wantCount} leads — "${label}" (${scope}${freshDays ? `, ≤${freshDays}d old` : ''}${requiredSocial ? `, must have ${requiredSocial === 'x' ? 'X' : requiredSocial[0].toUpperCase() + requiredSocial.slice(1)}` : ''})...\n\n` +
+    const ageNote = ageGate && freshDays ? ` · 🎂 store age ≤${freshDays}d ✅ enforced` : ''
+    await send(chatId, `🔍 Hunting for ${wantCount} leads — "${label}" (${scope}${freshDays ? `, ≤${freshDays}d old` : ''}${ageNote}${requiredSocial ? `, must have ${requiredSocial === 'x' ? 'X' : requiredSocial[0].toUpperCase() + requiredSocial.slice(1)}` : ''})...\n\n` +
       `⏱️ This can take several minutes: I keep pulling stores and checking each one live — age, email, socials, page speed — ` +
       `until I have ${wantCount} that pass your filters. If a run's time budget cuts me short, send anything and I'll pick up exactly where I stopped.`)
     const userQueue = {
       pending: [], results: [], delivered: 0, done: false,
       awaitingMessages: false, messages: [], awaitingCustomQuery: false,
       label: label || '', includeLocked: !!includeLocked,
-      wantCount, freshDays, requiredSocial,
+      wantCount, freshDays, requiredSocial, ageGate: !!ageGate,
       searchCtx: { query: applyScoutDateFilter(query, month, dateRange), searchAfter: null, exhausted: false, total: null }
     }
     await saveUserQueue(userId, userQueue)
@@ -1829,6 +2038,11 @@ module.exports = async (req, res) => {
       userQueue.pending = userQueue.pending.slice(BATCH_SIZE)
       const results = await processBatch(batch)
       userQueue.results.push(...results)
+      // With the age gate on, record every provably-too-old store so /others
+      // can show exactly what was dropped and why.
+      const droppedOld = results.filter(r => freshDays && typeof r.ageDays === 'number' && r.ageDays > freshDays)
+        .map(r => `${r.url} — store too old (${r.ageDays}d, window ${freshDays}d)`)
+      if (droppedOld.length) await saveFilteredOut(userId, droppedOld)
       await markSeenBatch(results.map(r => [normalizeForDedupe(r.url), { status: r.status, email: r.email, checkedAt: new Date().toISOString() }]))
       await saveUserQueue(userId, userQueue)
     }
@@ -1846,6 +2060,7 @@ module.exports = async (req, res) => {
     if (reached) header = `✅ ALL DONE — ${usableAll.length} leads as requested${freshDays ? ` (≤${freshDays}d old)` : ''}, checked ${userQueue.results.length} stores to find them.`
     else if (sourceExhausted) header = `✓ Source finished — ${usableAll.length} usable of ${userQueue.results.length} checked.`
     else header = `⏳ ${usableAll.length} of ${want} so far (checked ${userQueue.results.length}) — send anything and I'll keep hunting automatically.`
+    if (userQueue.ageGate && freshDays) header += `\n🎂 Store age ≤ ${freshDays}d enforced — older stores dropped (see /others).`
     if (userQueue.searchCtx && userQueue.searchCtx.total != null && !sourceExhausted) header += `\n📊 ${userQueue.searchCtx.total} total matches in this window.`
 
     let reply = header
@@ -1860,7 +2075,7 @@ module.exports = async (req, res) => {
       const emailNote = r.email !== 'no email' ? `\n    📧 ${r.email}${genericNote}` : ''
       const hotTag = r.score >= 70 ? ' 🔥' : ''
       const scoreNote = `\n    📊 score: ${r.score}${hotTag}` + (r.scoreReasons?.length ? ` (${r.scoreReasons.join(', ')})` : '')
-      const ageNote = (typeof r.ageDays === 'number') ? `\n    🎂 age: ${r.ageDays}d${r.ageDays <= 30 ? ' 🔥' : ''}` : ''
+      const ageNote = (typeof r.ageDays === 'number') ? `\n    🎂 age: ${r.ageDays}d${r.ageDays <= 30 ? ' 🔥' : ''}` : (userQueue.ageGate ? '\n    🎂 age unknown — no source could prove it' : '')
       const hook = auditHookLine(r)
       const hookNote = hook ? `\n    💡 ${hook}` : ''
       reply += `\n\n${leadNum}. ${nameLine}${scoreNote}${ageNote}${hookNote}${socialsNote}${contactNote}${emailNote}`
@@ -1986,15 +2201,20 @@ module.exports = async (req, res) => {
         return {
           text:
             `<b>🤖 AI Site Hunter</b>\n\n` +
-            `Finds brand-new websites built by AI builders (Lovable, Framer, v0/Bolt, Durable...) — ` +
+            `Finds brand-new websites built by AI builders (Lovable, Framer, Durable, Wix, v0/Bolt...) — ` +
             `their owners usually need a proper redesign, and you can pitch exactly that.\n\n` +
             `Each lead comes with: the builder it was made with, an AI-copy score, the owner's ` +
-            `contact channels (email / socials / contact form), and the site's weaknesses.\n\n` +
-            `⚡ <b>Hunt</b> — scan the newest certificate records for fresh AI-built sites\n` +
+            `contact channels (email / socials / contact form), the site's weaknesses, and whether it's a ` +
+            `<b>real business</b> or a developer's portfolio.\n\n` +
+            `🏢 <b>Business filter</b> — every hunt keyboard has a 🏢/🌐 row: business-only mode silently skips ` +
+            `developer portfolios, demos and side projects and tells you how many it skipped.\n\n` +
+            `⚡ <b>Hunt</b> — scan the newest sources for fresh AI-built sites\n` +
             `🔬 <b>Check one site</b> — deep analysis of any URL: builder, confidence, contacts, weaknesses, likely prompt, pitch hook`,
           kb: [
             [go('⚡ Hunt Lovable sites', 'hunt:lovable')],
             [go('🖼 Hunt Framer sites', 'hunt:framer')],
+            [go('🧱 Hunt Durable sites', 'hunt:durable')],
+            [go('🎨 Hunt Wix sites', 'hunt:wix')],
             [go('🌐 Hunt ALL AI builders', 'hunt:all')],
             [go('🔬 Check one site', 'huntcheck')],
             nav()
@@ -2061,7 +2281,7 @@ module.exports = async (req, res) => {
             `/find &lt;city&gt; &lt;niche&gt; [count] — local businesses\n` +
             `/scout — search Shopify stores\n` +
             `/fresh [age_days] [count] — watch for new Shopify stores\n` +
-            `/hunt &lt;lovable|framer|all&gt; [count] — find AI-built websites\n` +
+            `/hunt &lt;lovable|framer|durable|wix|all&gt; [count] — find AI-built websites (🏢 business-only toggle on every hunt screen)\n` +
             `/check &lt;url&gt; — deep-check one site (builder, contacts, weaknesses)\n` +
             `/freshoff — stop watching\n` +
             `/campaigns — your campaigns\n` +
@@ -2841,6 +3061,28 @@ module.exports = async (req, res) => {
         return res.status(200).send('OK')
       }
 
+      if (data.startsWith('scoutagegate:')) {
+        const q = await getUserQueue(cbUserId)
+        if (!q.pendingSearch || q.pendingSearch.isDirectList) {
+          await send(cbChatId, 'That search expired — send /scout to start again.')
+          return res.status(200).send('OK')
+        }
+        const enforce = data.endsWith(':enforce')
+        q.pendingSearch.ageGate = enforce
+        q.awaitingScoutAgeGate = false
+        q.awaitingLockedFilter = true
+        await saveUserQueue(cbUserId, q)
+        await sendKeyboard(cbChatId,
+          (enforce
+            ? `🆕 Age gate ON — only stores whose first-ever certificate falls inside your window will be shown. Old ones get skipped and logged (see /others). Slower, since every candidate needs an age lookup.\n\n`
+            : `♻️ Any store age — old stores scanned inside your window will show as before.\n\n`) +
+          `🔐 Include password-protected / "coming soon" stores?`, [
+          [{ text: '✅ Yes, show them', callback_data: 'lockedyes' }],
+          [{ text: '🚫 No, skip them', callback_data: 'lockedno' }]
+        ])
+        return res.status(200).send('OK')
+      }
+
       if (data.startsWith('scout_')) {
         const key = data.replace('scout_', '')
         const search = SAVED_SEARCHES[key]
@@ -2901,6 +3143,15 @@ module.exports = async (req, res) => {
         return res.status(200).send('OK')
       }
 
+      if (data.startsWith('huntmode:')) {
+        const mode = data.endsWith(':all') ? 'all' : 'business'
+        await redis('SET', `hunt:mode:${cbUserId}`, mode)
+        await send(cbChatId, mode === 'business'
+          ? `🏢 Business sites only — from now on developer portfolios, demos and side projects are skipped during hunts (each run tells you how many were skipped).`
+          : `🌐 Show everything — developer/portfolio sites come back in the results, tagged 👨‍💻 so you can tell at a glance.`)
+        return res.status(200).send('OK')
+      }
+
       if (data.startsWith('huntgo:')) {
         const [, srcKey, nStr] = data.split(':')
         const want = Math.min(Math.max(parseInt(nStr) || 10, 1), 50)
@@ -2911,9 +3162,10 @@ module.exports = async (req, res) => {
         const srcKey = data.slice('hunt:'.length)
         if (!AI_HUNT_SOURCES[srcKey]) return res.status(200).send('OK')
         const huntTier = isOwner ? 'owner' : await tierOf(cbUserId)
+        const huntMode = await getHuntMode(cbUserId)
         await sendKeyboard(cbChatId,
           `🤖 ${AI_HUNT_SOURCES[srcKey].label} — how many fresh AI-built sites?`,
-          huntCountButtons(srcKey, huntTier))
+          huntCountButtons(srcKey, huntTier, huntMode))
         return res.status(200).send('OK')
       }
 
@@ -2953,7 +3205,7 @@ module.exports = async (req, res) => {
     midFlowQueue.awaitingCompanyList || midFlowQueue.awaitingReviewCap ||
     midFlowQueue.awaitingMessages || midFlowQueue.awaitingCustomQuery ||
     midFlowQueue.awaitingLeadCount || midFlowQueue.awaitingLockedFilter ||
-    midFlowQueue.awaitingScoutMonth || midFlowQueue.awaitingFreshFilter ||
+    midFlowQueue.awaitingScoutMonth || midFlowQueue.awaitingFreshFilter || midFlowQueue.awaitingScoutAgeGate ||
     midFlowQueue.awaitingCustomDate || midFlowQueue.awaitingSocialFilter ||
     midFlowQueue.awaitingHuntUrl ||
     midFlowQueue.wizard || midFlowQueue.answeringGift
@@ -3309,7 +3561,7 @@ module.exports = async (req, res) => {
   if (/^\/cancel(@\w+)?$/.test(text)) {
     const q = await getUserQueue(userId)
     q.awaitingMessages = false; q.awaitingReviewCap = false; q.awaitingCompanyList = false
-    q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false; q.awaitingScoutMonth = false; q.awaitingFreshFilter = false
+    q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false; q.awaitingScoutMonth = false; q.awaitingFreshFilter = false; q.awaitingScoutAgeGate = false
     q.awaitingCustomDate = false; q.awaitingSocialFilter = false; q.customDate = null; q.pendingSearch = null
     q.awaitingHuntUrl = false; q.aiHunt = null
     q.awaitingPayContact = false; q.awaitingPayPrice = false; q.awaitingTrialSize = false
@@ -3934,14 +4186,19 @@ module.exports = async (req, res) => {
       if (windowChosen) {
         s0.freshDays = null
         userQueue.awaitingFreshFilter = false
-        userQueue.awaitingLockedFilter = true
+        userQueue.awaitingScoutAgeGate = true
         await saveUserQueue(userId, userQueue)
         const chosenScope = s0.dateRange ? dateRangeLabel(s0.dateRange) : ymLabel(s0.month)
+        // The urlscan window filters when stores were last SCANNED, not when
+        // they were created — an old store scanned inside the window still
+        // matches. Offer the strict real-age gate here (root cause of the
+        // "1000-day-old store in a 5-day window" reports).
         await sendKeyboard(chatId,
-          `✅ Got it — ${wantCount} leads, strictly from ${chosenScope}. No extra age filter on top of your chosen dates.\n\n` +
-          `🔐 Include password-protected / "coming soon" stores?`, [
-          [{ text: '✅ Yes, show them', callback_data: 'lockedyes' }],
-          [{ text: '🚫 No, skip them', callback_data: 'lockedno' }]
+          `✅ Got it — ${wantCount} leads, strictly from ${chosenScope}.\n\n` +
+          `Heads-up: that window filters when stores were last SCANNED — an old store scanned inside your window still matches it.\n\n` +
+          `Want me to also enforce the window on the store's REAL age (its first-ever certificate)?`, [
+          [{ text: '🆕 Only stores born in this window', callback_data: 'scoutagegate:enforce' }],
+          [{ text: '♻️ Any store age (faster)', callback_data: 'scoutagegate:any' }]
         ])
         return res.status(200).send('OK')
       }
@@ -3977,8 +4234,14 @@ module.exports = async (req, res) => {
         const scoutTier = await tierOf(userId)
         if (!(await spendFreeCredit(chatId, scoutTier, userId))) return res.status(200).send('OK')
       }
+      // Age gate ON → the chosen window doubles as the store-age limit:
+      // a 5-day range means only stores whose first-ever certificate falls
+      // inside those 5 days get reported. Age gate OFF → the freshness
+      // preset from the 🌱 question ("Any time" searches) applies as before.
+      const gateDays = search.ageGate ? scoutWindowDays(search.dateRange, search.month) : null
+      const scoutFresh = search.ageGate ? gateDays : (search.freshDays || null)
       return await startScoutJob(chatId, userId, search.query, search.label, search.wantCount,
-        !!search.includeLocked, search.month, search.freshDays || null, search.dateRange || null, requiredSocial)
+        !!search.includeLocked, search.month, scoutFresh, search.dateRange || null, requiredSocial, !!search.ageGate)
     }
 
     // ── Awaiting a URL for the AI Site Hunter deep check ──

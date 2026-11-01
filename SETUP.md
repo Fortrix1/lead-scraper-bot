@@ -413,6 +413,8 @@ Send `/scout` in Telegram → pick a search → choose a date window → reply w
 
 Under **Custom date or backward range**, choose one exact day or a backward range, then type the year, month, and day. A range asks for its total number of days and counts backward while including the selected end date. URLScan's public index only reaches back about 30 days, so older custom dates are rejected rather than returning an unexplained empty search.
 
+After picking a date window, /scout asks one extra question — **🆕 Only stores born in this window** or **♻️ Any store age (faster)**. The date window filters when stores were last *scanned* (an old store scanned yesterday still matches it); the age-gate option additionally enforces the window on each store's REAL age (its first-ever SSL certificate). With the gate on, too-old stores are dropped, listed under `/others`, and the report header shows `🎂 Store age ≤ Nd enforced`.
+
 A required social platform is mandatory: stores without it are skipped and do not count toward the requested lead total. Social extraction rejects Shopify/default placeholder handles, non-profile links, dead profiles, and redirects away from the social platform. If a social network blocks automated profile checks, a structurally valid link is kept unless there is positive evidence that it is invalid.
 
 Results come back in batches. Send any message to continue searching until the requested number of qualifying leads is found or URLScan is exhausted.
@@ -427,6 +429,19 @@ Send a `.txt` file with one URL per line. The bot extracts, dedupes, and checks 
 
 ---
 
+### AI-Built Sites (/hunt) — Lovable, Framer, Durable, Wix
+
+In Telegram, send:
+```
+/hunt lovable 10      # newest Lovable sites (via certificate logs)
+/hunt framer 10       # newest Framer sites
+/hunt wix 10          # newest Wix sites
+/hunt all 20          # a mix of every builder
+```
+Every hunt screen has a **🏢 Business sites only / 🌐 Show everything** row. Business mode (default) silently skips developer portfolios, demos and side projects and tells you how many it skipped. Leads are tagged 🏢 real business / 👨‍💻 developer / ❔ unclear, and `/check <url>` shows exactly why a site was classified that way.
+
+How discovery works: Lovable gives every project its own SSL certificate, so new sites show up in public certificate logs (crt.sh). Framer, Wix and Durable put every customer site behind ONE wildcard certificate — certificate logs can't see them at all — so those three are discovered through urlscan's index of recent public scans instead (last 4 days, successful scans only, business-keyword filter on the big zones). Either source failing falls back to the other automatically.
+
 ## Commands
 
 | Command | What it does |
@@ -436,6 +451,8 @@ Send a `.txt` file with one URL per line. The bot extracts, dedupes, and checks 
 | `/find <city> <niche> [count]` | Scrape Google Maps (asks for a review cap, then runs the daemon) |
 | `/fresh [age_days] [count]` | Turn ON fresh-Shopify-store monitoring via crt.sh ticks (default: ≤30 days, top 15/tick) |
 | `/freshoff` | Turn OFF fresh-store monitoring |
+| `/hunt <lovable|framer|durable|wix|all> [count]` | Find AI-built websites (🏢 business-only toggle on every hunt screen) |
+| `/check <url>` | Deep-check one site: builder, contacts, weaknesses, business-vs-developer verdict |
 | `/audit` | Show the last 50 commands run, by whom and when |
 | `/newuk [days] [count]` | Newly incorporated UK companies via Companies House (default: last 1 day, top 20) |
 | `/campaigns` | List campaigns and how many leads each has |
