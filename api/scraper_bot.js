@@ -1636,18 +1636,50 @@ module.exports = async (req, res) => {
     return parseInt(process.env.HUNT_MAX_DIG) || 12
   }
 
+  // ── Seen-memory rules (v7.3 — fixes the "checked 0 domains, 0 matched" loop).
+// Every checked domain used to be blocked forever, so after a day of testing
+// the whole archive was "seen" and hunts checked literally nothing while the
+// pings kept saying "digging". Now the seen memory is smart:
+//   • dead sites          → blocked forever (re-checking them is wasted time)
+//   • delivered leads     → blocked forever (you already got them — no dupes)
+//   • developer-skipped   → re-checkable once the mode filter allows devs
+//   • country-skipped     → re-checkable once the country filter changes/relaxes
+//   • legacy entries (pre-v7.3, no skip info) → re-checkable exactly once,
+//     then re-marked with the new format (one-time re-check wave, after which
+//     the memory is precise again).
+  const normC = c => { c = String(c || '').toUpperCase(); return c === 'CA' ? 'US' : c }
+  function seenBlocks(s, mode, country) {
+    if (!s) return false
+    if (s.status !== 'OK') return true                       // dead — never again
+    if (s.skip === '') return true                           // delivered — never re-deliver
+    if (s.skip === 'dev') return mode !== 'all'              // devs now allowed? re-check
+    if (s.skip === 'stub') return true                       // live-but-empty page — never again
+    if (s.skip === 'country') {
+      if (!country || country === 'any') return false        // filter gone → re-check
+      return normC(s.skipC) === normC(country)               // same target? stays skipped
+    }
+    return false                                             // legacy entry — one re-check
+  }
+
   // URLs of results that passed every hunt filter (live + builder + business
   // mode + country) — the pool the 🔬 DEEP SEARCH ALL button draws from.
+  // After a top-up (h.topUpUsed) the country filter only drops PROVEN
+  // mismatches, so the added unverified sites are deep-searchable too.
   function huntGoodUrls(h) {
     const isSkippedDev = r => h.mode === 'business' && r.kind === 'DEVELOPER'
-    const isCountryMiss = r => h.country && h.country !== 'any' &&
-      (!r.country || (h.country.toUpperCase() === 'US'
+    const hasC = !!(h.country && h.country !== 'any')
+    const provenMiss = r => hasC && r.country &&
+      (normC(h.country) === 'US'
         ? (r.country.code !== 'US' && r.country.code !== 'CA')
-        : r.country.code !== h.country.toUpperCase()))
+        : r.country.code !== h.country.toUpperCase())
+    // STRICT (no top-up): a site must PROVE the country — no signal at all
+    // counts as a miss while proven leads are still being found.
+    // TOP-UP mode: only PROVEN mismatches are dropped.
+    const countryOk = r => !hasC || (h.topUpUsed ? !provenMiss(r) : (!!r.country && !provenMiss(r)))
     return {
-      urls: [...new Set(h.results.filter(r => r.status === 'OK' && r.builder && !isSkippedDev(r) && !isCountryMiss(r)).map(r => r.url))],
+      urls: [...new Set(h.results.filter(r => r.status === 'OK' && r.builder && !isSkippedDev(r) && countryOk(r)).map(r => r.url))],
       skippedDev: h.results.filter(r => r.status === 'OK' && r.builder && isSkippedDev(r)).length,
-      skippedCountry: (h.country && h.country !== 'any') ? h.results.filter(r => r.status === 'OK' && r.builder && isCountryMiss(r)).length : 0,
+      skippedCountry: (hasC && !h.topUpUsed) ? h.results.filter(r => r.status === 'OK' && r.builder && !isSkippedDev(r) && (!r.country || provenMiss(r))).length : 0,
       dead: h.results.filter(r => r.status !== 'OK').length
     }
   }
@@ -2022,7 +2054,7 @@ module.exports = async (req, res) => {
       rawTotal += pool.length
       if (!pool.length) continue
       const seenMap = await getSeenBatch(pool.map(c => `ai:${c.domain}`))
-      const unseen = pool.filter(c => !seenMap[`ai:${c.domain}`])
+      const unseen = pool.filter(c => !seenBlocks(seenMap[`ai:${c.domain}`], mode, country))
       const aged = unseen.filter(c => huntAgeOk(c, age, dig))
       if (aged.length) candidates = aged.slice(0, 300)
       else if (dig === 0 && age === 'newest' && unseen.length) {
@@ -2039,9 +2071,9 @@ module.exports = async (req, res) => {
       // mid-hunt dry pool. The archive is hundreds of certs deeper than the
       // first two slices.
       const q = await getUserQueue(userId)
-      q.aiHunt = { srcKey, label: src.label, want, mode, country, age, dig, candidates: [], results: [], delivered: 0, done: false }
+      q.aiHunt = { srcKey, label: src.label, want, mode, country, age, dig, candidates: [], results: [], delivered: 0, done: false, topUpUsed: false }
       await saveUserQueue(userId, q)
-      await send(chatId, `⛏ The newest slices are all sites you've already received — keeping it moving: I'll dig up to ${huntMaxDig(src, age) * 400} certs into the archive for ones you haven't seen. Send anything to power the next dig.`)
+      await send(chatId, `⛏ The newest ${rawTotal} certs are all already on your checked list — keeping it moving: I'll dig up to ${huntMaxDig(src, age) * 400} certs into the archive, and filter-skipped sites get re-checked where your filters now allow. Send anything to power the next dig.`)
       return await runAiHuntBatch(chatId, userId, q)
     }
     if (!candidates.length) {
@@ -2049,7 +2081,7 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
     const q = await getUserQueue(userId)
-    q.aiHunt = { srcKey, label: src.label, want, mode, country, age, dig, candidates, results: [], delivered: 0, done: false }
+    q.aiHunt = { srcKey, label: src.label, want, mode, country, age, dig, candidates, results: [], delivered: 0, done: false, topUpUsed: false }
     await saveUserQueue(userId, q)
     return await runAiHuntBatch(chatId, userId, q)
   }
@@ -2065,40 +2097,69 @@ module.exports = async (req, res) => {
     // are never delivered — but they're still checked, counted and skipped
     // loudly so you know the filter is alive.
     const isSkippedDev = r => h.mode === 'business' && r.kind === 'DEVELOPER'
-    // Country filter: only sites whose detected country matches are counted as
-    // leads. A site whose country can't be proven also misses (you asked for a
-    // country, not a maybe) — the skip counter in the header keeps it honest.
-    const isCountryMiss = r => h.country && h.country !== 'any' &&
-      (!r.country || (h.country.toUpperCase() === 'US'
+    // Country filter: PROVEN mismatches (a page that shows another country)
+    // always miss. A page with NO country signal at all misses too while the
+    // hunt is running (proven leads fill `want` first) — but if the archive
+    // runs dry before `want` is met, the top-up below delivers those tagged
+    // "country unverified" instead of leaving you with zero.
+    const provenMiss = r => h.country && h.country !== 'any' && r.country &&
+      (normC(h.country) === 'US'
         ? (r.country.code !== 'US' && r.country.code !== 'CA')
-        : r.country.code !== h.country.toUpperCase()))
+        : r.country.code !== h.country.toUpperCase())
+    const isCountryMiss = r => (h.country && h.country !== 'any') ? (!r.country || provenMiss(r)) : false
     const goodSoFar = () => h.results.filter(r => r.status === 'OK' && r.builder && !isSkippedDev(r) && !isCountryMiss(r))
+    let archiveExhausted = false
     while (Date.now() < deadline && !h.done && goodSoFar().length < h.want) {
       // Pool dry mid-hunt → dig deeper instead of finishing. crt.sh steps
-      // 200 certs further back each round, urlscan widens its window; the
+      // 400 certs further back each round, urlscan widens its window; the
       // dig counter lives in the Redis queue so any ping resumes the dig.
       if (!h.candidates.length) {
         if (!h.dig) h.dig = 1
         const src = AI_HUNT_SOURCES[h.srcKey]
         const maxDig = huntMaxDig(src, h.age || 'newest')
         if (!src || h.dig > maxDig) { h.done = true; break }
-        await send(chatId, `⛏ Pool dry so far — digging deeper into the archive (round ${h.dig}/${maxDig})…`)
+        await send(chatId, `⛏ Pool dry — dig round ${h.dig}/${maxDig} (archive depth ${Math.min(h.dig, maxDig) * 400} certs)…`)
         const pool = await buildHuntPool(src, h.dig)
         const round = h.dig
         h.dig++
         await saveUserQueue(userId, userQueue)
+        if (!pool.length) {
+          // Archive genuinely exhausted — no fake rounds, wrap up honestly.
+          // archiveExhausted guards this against the h.done recomputation
+          // below (dig is still < maxDig here, so without the flag the old
+          // code flipped done back to false and the hunt said "dig continues
+          // on your next message" FOREVER on an empty archive — the zero loop).
+          archiveExhausted = true
+          h.done = true
+          await send(chatId, `⛏ Archive bottom reached for ${src.label} — every slice in this cache (~6,000 certs, refreshes every ~20h) is used up. Wrapping up with the honest count below.`)
+          break
+        }
         const seenMap = await getSeenBatch(pool.map(c => `ai:${c.domain}`))
-        const fresh = pool.filter(c => !seenMap[`ai:${c.domain}`] && huntAgeOk(c, h.age || 'newest', round))
+        const fresh = pool.filter(c => !seenBlocks(seenMap[`ai:${c.domain}`], h.mode, h.country) && huntAgeOk(c, h.age || 'newest', round))
+        const already = pool.length - fresh.length
         if (fresh.length) {
           h.candidates.push(...fresh.slice(0, 300))
-          await send(chatId, `⛏ +${Math.min(fresh.length, 300)} site${fresh.length === 1 ? '' : 's'} you haven't received yet — checking them now.`)
+          await send(chatId, `⛏ +${Math.min(fresh.length, 300)} site${fresh.length === 1 ? '' : 's'} to check (${already} already on your checked list) — checking now.`)
+        } else {
+          await send(chatId, `⛏ Round ${round}: all ${pool.length} certs already on your checked list — digging further back.`)
         }
         continue
       }
       const chunk = h.candidates.splice(0, CONCURRENCY)
       const results = await Promise.all(chunk.map(c => analyzeAiSite(c.url || `https://${c.domain}`, c.notBefore || 0)))
       h.results.push(...results)
-      await markSeenBatch(chunk.map((c, i) => [`ai:${c.domain}`, { status: results[i].status, builder: results[i].builder || '', checkedAt: new Date().toISOString() }]))
+      // Seen memory with the skip reason — delivered leads and dead sites
+      // block forever, filter-skipped sites re-check when filters change.
+      await markSeenBatch(chunk.map((c, i) => {
+        const r = results[i]
+        // 'stub' = HTTP 200 but an empty/taken-down page (dead title, no
+        // builder fingerprint) — same as dead for re-check purposes.
+        const skip = r.status !== 'OK' ? 'dead'
+          : !r.builder ? 'stub'
+          : isSkippedDev(r) ? 'dev'
+          : isCountryMiss(r) ? 'country' : ''
+        return [`ai:${c.domain}`, { status: r.status, builder: r.builder || '', checkedAt: new Date().toISOString(), skip, skipC: skip === 'country' ? String(h.country || '').toUpperCase() : '' }]
+      }))
       await saveUserQueue(userId, userQueue)
     }
     const live = goodSoFar()
@@ -2107,26 +2168,59 @@ module.exports = async (req, res) => {
     h.delivered = live.length
     const huntSrc = AI_HUNT_SOURCES[h.srcKey]
     const maxDig = huntMaxDig(huntSrc, h.age || 'newest')
+    h.done = archiveExhausted || live.length >= h.want || (!h.candidates.length && (h.dig || 1) > maxDig)
+    const gaveUpShort = h.done && live.length < h.want
+
+    // ── TOP-UP (v7.3): hunt ended short of `want` with a country filter on.
+    // Fill the gap from the live business sites whose page showed NO country
+    // signal at all — tagged, never re-delivered, and back to excluded on
+    // the next strict hunt. Better than "0 matched your filters".
+    let topUp = []
+    if (gaveUpShort && h.country && h.country !== 'any') {
+      const chosen = new Set(live.map(r => r.url))
+      const unvPool = h.results.filter(r => r.status === 'OK' && r.builder && !isSkippedDev(r) && !r.country && !chosen.has(r.url))
+      if (unvPool.length) {
+        const sm = await getSeenBatch(unvPool.map(r => `ai:${r.host}`))
+        topUp = unvPool.filter(r => { const s = sm[`ai:${r.host}`]; return !s || s.skip === 'dev' || s.skip === 'country' }).slice(0, h.want - live.length)
+      }
+    }
+    if (topUp.length) {
+      h.topUpUsed = true
+      await markSeenBatch(topUp.map(r => [`ai:${r.host}`, { status: 'OK', builder: r.builder || '', checkedAt: new Date().toISOString(), skip: '', skipC: '' }]))
+      await saveUserQueue(userId, userQueue)
+    }
+
+    // Honest math of where every checked domain went (recomputed from raw
+    // results — counts never disappear when they're zero, the lines do).
+    // 'dead or parked' covers both unreachable sites and the HTTP-200
+    // taken-down stub pages that carry no builder fingerprint.
+    const deadCount = h.results.filter(r => r.status !== 'OK' || !r.builder).length
+    const devCount = h.results.filter(r => r.status === 'OK' && r.builder && isSkippedDev(r)).length
+    const otherC = h.results.filter(r => r.status === 'OK' && r.builder && !isSkippedDev(r) && r.country && provenMiss(r)).length
+    const unvCount = h.results.filter(r => r.status === 'OK' && r.builder && !isSkippedDev(r) && !r.country).length
     const good = huntGoodUrls(h)
-    h.done = live.length >= h.want || (!h.candidates.length && (h.dig || 1) > maxDig)
     const skippedDev = good.skippedDev
     const skippedCountry = good.skippedCountry
-    const gaveUpShort = h.done && live.length < h.want
 
     let header
     if (live.length >= h.want) header = `✅ ALL DONE — ${live.length} AI-built sites as requested (${h.label}), checked ${h.results.length} new domains to find them.`
     else if (gaveUpShort) {
       // Dug to the bottom of the archive and still short of `want` — no dead
-      // end. Give the honest math of where every checked domain went, plus
-      // one-tap buttons that loosen a filter and restart the hunt.
-      header = `✓ Archive fully dug (${h.label}) — checked ${h.results.length} domains, ${live.length} matched ALL your filters:\n` +
-        [good.dead ? `• ${good.dead} dead or parked` : '',
-         (h.mode === 'business' && skippedDev) ? `• ${skippedDev} developer/portfolio — 🏢 business filter` : '',
-         (h.country && h.country !== 'any' && skippedCountry) ? `• ${skippedCountry} other country — 🌍 filter` : ''
-        ].filter(Boolean).join('\n') + `\n` +
-        `That's every unseen ${h.label} site in reach right now — new ones land every day and I track them automatically.\n\n` +
-        `Want the full ${h.want}? Loosen ONE filter and I restart instantly:`
-    } else if (!h.candidates.length) header = `⏳ ${live.length} of ${h.want} — pool dry, the dig continues on your next message (archive round ${Math.min(h.dig || 1, maxDig)}/${maxDig}).`
+      // end. Honest math of every checked domain + one-tap filter loosening.
+      const buckets = [deadCount ? `• ${deadCount} dead or parked` : '',
+        devCount ? `• ${devCount} developer/portfolio — 🏢 business filter` : '',
+        otherC ? `• ${otherC} proven other country — 🌍 ${COUNTRY_LABELS[h.country.toUpperCase()] || h.country.toUpperCase()} filter` : '',
+        unvCount ? `• ${unvCount} live business sites with no country proof on the page` : ''
+      ].filter(Boolean)
+      header = `✓ Archive fully dug (${h.label}) — this hunt checked ${h.results.length} domain${h.results.length === 1 ? '' : 's'}` +
+        (buckets.length ? `. Honest math:\n${buckets.join('\n')}\n` : ' — every site checked came back as a lead.\n') +
+        (topUp.length
+          ? `\n➕ Filling your ${h.want}: ${topUp.length} from the no-signal pile added below, tagged "country unverified" — could be anywhere, eyeball before pitching.`
+          : h.results.length
+            ? `\nThat's every ${h.label} site in reach right now — new ones land every day and I track them automatically.`
+            : `\nNothing new was checkable this round — this zone's whole archive is already on your checked list (delivered leads and dead sites never re-check; skipped ones re-check automatically when a filter changes).`) +
+        `\n\nWant different results? Loosen ONE filter and I restart instantly:`
+    } else if (!h.candidates.length) header = `⏳ ${live.length} of ${h.want} — pool dry, the dig continues on your next message (archive round ${Math.min(h.dig || 1, maxDig)}/${maxDig}, ${h.results.length} checked so far).`
     else header = `⏳ ${live.length} of ${h.want} so far (checked ${h.results.length}) — send anything and I'll keep hunting.`
     if (h.mode === 'business' && skippedDev > 0 && !gaveUpShort) {
       header += `\n🏢 Skipped ${skippedDev} developer/portfolio site${skippedDev === 1 ? '' : 's'} — tap 🌐 Show everything in the hunt menu to include them.`
@@ -2138,6 +2232,10 @@ module.exports = async (req, res) => {
     let reply = header
     let n = prevDelivered
     for (const r of fresh) { n++; reply += `\n\n${aiLeadCard(r, n)}` }
+    if (topUp.length) {
+      reply += `\n\n🌍 FILLING THE GAP — no country proof on these pages, included so you don't end up with zero:`
+      for (const r of topUp) { n++; reply += `\n\n${aiLeadCard(r, n)}` }
+    }
     await saveUserQueue(userId, userQueue)
 
     // 🔬 DEEP SEARCH ALL rides on EVERY message that has results — progress
@@ -3881,7 +3979,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
 
       if (data.startsWith('huntmode:')) {
         const mode = data.endsWith(':all') ? 'all' : 'business'
-        await redis('SET', `hunt:mode:${cbUserId}`, mode)
+        await redis('SET', `hunt:mode:${cbUserId}`, mode, 'EX', 604800)
         await send(cbChatId, mode === 'business'
           ? `🏢 Business sites only — from now on developer portfolios, demos and side projects are skipped during hunts (each run tells you how many were skipped).`
           : `🌐 Show everything — developer/portfolio sites come back in the results, tagged 👨‍💻 so you can tell at a glance.`)
@@ -3890,12 +3988,12 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
 
       if (data.startsWith('huntcountry:')) {
         const code = data.slice('huntcountry:'.length).toLowerCase()
-        if (code === 'any') await redis('SET', `hunt:country:${cbUserId}`, 'any')
-        else if (COUNTRY_LABELS[code.toUpperCase()]) await redis('SET', `hunt:country:${cbUserId}`, code.toLowerCase())
+        if (code === 'any') await redis('SET', `hunt:country:${cbUserId}`, 'any', 'EX', 43200)
+        else if (COUNTRY_LABELS[code.toUpperCase()]) await redis('SET', `hunt:country:${cbUserId}`, code.toLowerCase(), 'EX', 43200)
         const saved = await getHuntCountry(cbUserId)
         await send(cbChatId, saved === 'any'
           ? `🌍 Any country — hunts scan every country again.`
-          : `🌍 Country filter set: ${COUNTRY_LABELS[saved.toUpperCase()]} — future hunts only deliver sites that look ${COUNTRY_LABELS[saved.toUpperCase()].replace(/^\S+\s/, '')} (matched by domain ending, phone numbers and page content).`)
+          : `🌍 Country filter set: ${COUNTRY_LABELS[saved.toUpperCase()]} (auto-expires after 12h) — future hunts only deliver sites that look ${COUNTRY_LABELS[saved.toUpperCase()].replace(/^\S+\s/, '')} (matched by domain ending, phone numbers and page content).`)
         return res.status(200).send('OK')
       }
 
@@ -3911,7 +4009,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       if (data.startsWith('hageset:')) {
         const [, srcKey, val] = data.split(':')
         if (!AI_HUNT_SOURCES[srcKey] || !HUNT_AGES.includes(val)) return res.status(200).send('OK')
-        await redis('SET', `hunt:age:${cbUserId}`, val)
+        await redis('SET', `hunt:age:${cbUserId}`, val, 'EX', 604800)
         await send(cbChatId, val === 'any'
           ? `♾ Any age — from now on hunts dig the whole archive for sites you've never received, newest first. That pool basically never runs dry.`
           : `🗓 Freshness set: ${ageLabel(val)} — hunts only deliver sites born in that window (by certificate/scan date).`)
@@ -3971,9 +4069,9 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         const [, srcKey, what, wantStr] = data.split(':')
         if (!AI_HUNT_SOURCES[srcKey]) return res.status(200).send('OK')
         const want = Math.min(Math.max(parseInt(wantStr) || 10, 1), 50)
-        if (what === 'dev') { await redis('SET', `hunt:mode:${cbUserId}`, 'all'); await send(cbChatId, `🌐 Developers included — restarting the hunt…`) }
-        else if (what === 'country') { await redis('SET', `hunt:country:${cbUserId}`, 'any'); await send(cbChatId, `🌍 Any country — restarting the hunt…`) }
-        else if (what === 'age') { await redis('SET', `hunt:age:${cbUserId}`, 'any'); await send(cbChatId, `♾ Any age — restarting with the full archive open…`) }
+        if (what === 'dev') { await redis('SET', `hunt:mode:${cbUserId}`, 'all', 'EX', 604800); await send(cbChatId, `🌐 Developers included — restarting the hunt…`) }
+        else if (what === 'country') { await redis('SET', `hunt:country:${cbUserId}`, 'any', 'EX', 43200); await send(cbChatId, `🌍 Any country — restarting the hunt…`) }
+        else if (what === 'age') { await redis('SET', `hunt:age:${cbUserId}`, 'any', 'EX', 604800); await send(cbChatId, `♾ Any age — restarting with the full archive open…`) }
         return await startAiHunt(cbChatId, cbUserId, srcKey, want)
       }
 
@@ -4814,7 +4912,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       return res.status(200).send('OK')
     }
     if (arg === 'any') {
-      await redis('SET', `hunt:country:${userId}`, 'any')
+      await redis('SET', `hunt:country:${userId}`, 'any', 'EX', 43200)
       await send(chatId, `🌍 Country filter removed — hunts scan every country again.`)
       return res.status(200).send('OK')
     }
@@ -4822,8 +4920,8 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       await send(chatId, `❓ Unknown country code "${arg.toUpperCase()}". Use a 2-letter code like /country NG, /country US, /country UK — or /country any to remove the filter.`)
       return res.status(200).send('OK')
     }
-    await redis('SET', `hunt:country:${userId}`, arg.toLowerCase())
-    await send(chatId, `🌍 Country filter set: ${COUNTRY_LABELS[arg.toUpperCase()]}.\nFrom now on AI hunts only deliver sites that look ${COUNTRY_LABELS[arg.toUpperCase()].replace(/^\S+\s/, '')} — matched by domain ending, phone numbers and page content.`)
+    await redis('SET', `hunt:country:${userId}`, arg.toLowerCase(), 'EX', 43200)
+    await send(chatId, `🌍 Country filter set: ${COUNTRY_LABELS[arg.toUpperCase()]} (auto-expires after 12h).\nFrom now on AI hunts only deliver sites that look ${COUNTRY_LABELS[arg.toUpperCase()].replace(/^\S+\s/, '')} — matched by domain ending, phone numbers and page content.`)
     return res.status(200).send('OK')
   }
 
