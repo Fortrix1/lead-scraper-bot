@@ -1501,7 +1501,8 @@ module.exports = async (req, res) => {
     ['+82', 'JP'], ['+86', 'JP'], ['+84', 'VN'], ['+66', 'VN'], ['+61', 'AU'],
     ['+64', 'AU'], ['+1', 'US']
   ]
-  function detectCountry(host, text) {
+  const COUNTRY_LANG = { de: 'DE', fr: 'FR', es: 'ES', it: 'IT', nl: 'NL', pt: 'PT', tr: 'TR', vi: 'VN', id: 'ID', pl: 'DE' }
+  function detectCountry(host, text, html) {
     const h = String(host || '').toLowerCase()
     const t = String(text || '')
     for (const [cc, code] of Object.entries(COUNTRY_CCTLDS)) {
@@ -1516,6 +1517,14 @@ module.exports = async (req, res) => {
     let best = null
     for (const [code, n] of counts) if (!best || n > best.n) best = { code, n }
     if (best) return { code: best.code, label: COUNTRY_LABELS[best.code], why: [`${best.code} phone numbers ×${best.n}`] }
+    // Last-resort signal: the page's declared language (de/fr/es/it/nl/pt…).
+    // Weak on its own — a .com with lang="en" proves nothing — so it only
+    // fires when the domain and the phones stayed silent.
+    const lang = (String(html || '').match(/<html[^>]*?\slang=["']([a-z]{2})(?:[-_][a-zA-Z]{2})?["']/i) || [])[1]
+    if (lang && COUNTRY_LANG[lang.toLowerCase()]) {
+      const code = COUNTRY_LANG[lang.toLowerCase()]
+      return { code, label: COUNTRY_LABELS[code], why: [`page language "${lang}"`] }
+    }
     return null
   }
 
@@ -1774,7 +1783,7 @@ module.exports = async (req, res) => {
       }
     }
     out.weaknesses = aiSiteWeaknesses(html)
-    out.country = detectCountry(host, htmlToVisibleText(html).slice(0, 12000))
+    out.country = detectCountry(host, htmlToVisibleText(html).slice(0, 12000), html)
     const kind = classifySiteKind(host, html)
     out.kind = kind.kind
     out.kindWhy = { dev: kind.dev, biz: kind.biz }
@@ -1952,7 +1961,7 @@ module.exports = async (req, res) => {
         await saveUserQueue(userId, userQueue)
         await sendKeyboard(chatId,
           `🧠 Want the FULL intel on all ${deepUrls.length} lead${deepUrls.length === 1 ? '' : 's'}?\n\n` +
-          `DEEP SEARCH crawls every page of each site top-to-bottom, then the AI writes the complete dossier: what the business really is, how the site is built, every weakness found, the likely prompt they typed, your rebuild plan and a ready-to-send pitch DM.\n\n` +
+          `DEEP SEARCH crawls every page of each site AND reads its CSS, then writes the complete dossier: what the business really is, the full VISUAL DNA — exact colors, fonts, buttons, every section top to bottom — every weakness, the likely prompt they typed, a paste-ready REBUILD BLUEPRINT for Lovable/v0, and a ready-to-send pitch DM.\n\n` +
           `⏱️ ~1 site/min, runs in the background — send anything to keep it going.`,
           [[B(`🔬 DEEP SEARCH ALL ${deepUrls.length}`, 'deepsearch:go'), B('✋ Skip', 'deepsearch:skip')]])
       }
@@ -2030,6 +2039,239 @@ module.exports = async (req, res) => {
     return [{ path: '/ (home)', html: homeHtml }, ...inners.filter(Boolean)]
   }
 
+  // ── VISUAL X-RAY — read the site's actual design DNA ──
+  // The dossier above says WHAT the business is. This reads what the site
+  // LOOKS like: every color with its exact hex, the real font families,
+  // weights, type sizes, corner radii, gradients, shadows, Tailwind tokens,
+  // plus the DOM outline in document order (nav items, headings, buttons,
+  // CTAs, form fields, imagery). From this the bot assembles a paste-ready
+  // REBUILD BLUEPRINT the user drops into Lovable / v0 / Bolt to get a
+  // close rebuild of the site.
+  function collectCssSources(html) {
+    const inline = [...String(html).matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map(m => m[1]).join('\n')
+    const links = [...new Set([...String(html).matchAll(/<link[^>]+>/gi)]
+      .filter(t => /rel=["']?stylesheet/i.test(t[0]))
+      .map(t => (t[0].match(/href=["']([^"']+)["']/i) || [])[1])
+      .filter(Boolean))].slice(0, 4)
+    return { inline, links }
+  }
+
+  // Inline <style> + up to 3 linked stylesheets (Framer/Wix/Durable keep the
+  // good tokens in external CSS on their CDNs — same-origin, fetchable).
+  async function fetchCssBundle(baseUrl, sources) {
+    const abs = sources.links.map(h => { try { return new URL(h, baseUrl).href } catch { return null } }).filter(Boolean).slice(0, 3)
+    const sheets = await Promise.all(abs.map(async u => {
+      try {
+        const r = await fetch(u, { signal: AbortSignal.timeout(7000), redirect: 'follow', headers: DEEP_FETCH_UA })
+        return r.ok ? (await r.text()).slice(0, 300000) : ''
+      } catch { return '' }
+    }))
+    return (sources.inline + '\n' + sheets.join('\n')).slice(0, 700000)
+  }
+
+  function normHex(h) {
+    h = h.toLowerCase()
+    if (h.length === 4) return '#' + [...h.slice(1)].map(c => c + c).join('')
+    if (h.length >= 8) return h.slice(0, 7)   // #rrggbbaa → drop alpha
+    return h
+  }
+  function rgbToHex(s) {
+    const m = s.match(/(\d{1,3})\D+(\d{1,3})\D+(\d{1,3})/)
+    if (!m) return null
+    const [r, g, b] = [+m[1], +m[2], +m[3]]
+    if (r > 255 || g > 255 || b > 255) return null
+    return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('')
+  }
+  function hexChroma(h) {
+    const r = parseInt(h.slice(1, 3), 16), g = parseInt(h.slice(3, 5), 16), b = parseInt(h.slice(5, 7), 16)
+    return Math.max(r, g, b) - Math.min(r, g, b)
+  }
+  function hexLum(h) {
+    const r = parseInt(h.slice(1, 3), 16), g = parseInt(h.slice(3, 5), 16), b = parseInt(h.slice(5, 7), 16)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+  }
+
+  function extractVisualDNA(html, css) {
+    const raw = String(html || '')
+    const cssClean = String(css || '').replace(/\/\*[\s\S]*?\*\//g, ' ')
+    // ── colors: hex + rgb() from CSS and inline styles, ranked by use ──
+    const colors = new Map()
+    const bump = h => { if (h && /^#[0-9a-f]{6}$/.test(h)) colors.set(h, (colors.get(h) || 0) + 1) }
+    for (const m of (cssClean + ' ' + raw).matchAll(/#(?:[0-9a-f]{6}|[0-9a-f]{3})\b/gi)) bump(normHex(m[0]))
+    for (const m of cssClean.matchAll(/rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}/g)) bump(rgbToHex(m[0]))
+    const ranked = [...colors.entries()].sort((a, b) => b[1] - a[1])
+    const neutrals = ranked.filter(([h]) => hexChroma(h) < 40).slice(0, 4)
+    const accents = ranked.filter(([h]) => hexChroma(h) >= 40).slice(0, 5)
+    // ── typography ──
+    const fam = new Map()
+    for (const m of cssClean.matchAll(/font-family\s*:\s*([^;}]{2,90})/gi)) {
+      const f = m[1].split(',')[0].replace(/["']/g, '').trim()
+      if (!f || !/[a-z]/i.test(f) || /^(inherit|initial|unset|sans-serif|serif|monospace|system-ui|ui-sans-serif|var\(--.*)$/i.test(f)) continue
+      fam.set(f, (fam.get(f) || 0) + 1)
+    }
+    for (const m of cssClean.matchAll(/@font-face\s*{[^}]{0,300}?font-family\s*:\s*["']?([^;"'}]{2,40})/gi)) {
+      const f = m[1].trim().replace(/["']/g, '')
+      if (f && /[a-z]/i.test(f)) fam.set(f, (fam.get(f) || 0) + 2)
+    }
+    const google = []
+    for (const m of raw.matchAll(/<link[^>]+fonts\.googleapis\.com[^>]*>/gi)) {
+      const href = (m[0].match(/href=["']([^"']+)["']/i) || [])[1] || ''
+      for (const f of href.matchAll(/[?&]family=([^&"'\s]+)/g)) {
+        const name = decodeURIComponent(f[1]).replace(/\+/g, ' ').replace(/:.*$/, '').trim()
+        if (name && !google.includes(name)) google.push(name)
+      }
+    }
+    const weights = {}
+    for (const m of cssClean.matchAll(/font-weight\s*:\s*(\d{3})/g)) weights[m[1]] = (weights[m[1]] || 0) + 1
+    const sizes = {}
+    for (const m of cssClean.matchAll(/font-size\s*:\s*([\d.]+)(px|rem|em)\b/g)) {
+      const px = Math.round(parseFloat(m[1]) * (m[2] === 'px' ? 1 : 16))
+      if (px >= 9 && px <= 120) sizes[px] = (sizes[px] || 0) + 1
+    }
+    const fonts = [...new Set([...google, ...[...fam.entries()].sort((a, b) => b[1] - a[1]).map(([n]) => n)])].slice(0, 5)
+    // ── shapes ──
+    const radii = {}
+    for (const m of cssClean.matchAll(/border-radius\s*:\s*([\d.]+)(px|rem)\b/g)) {
+      const px = Math.round(parseFloat(m[1]) * (m[2] === 'px' ? 1 : 16))
+      if (px > 0 && px <= 60) radii[px] = (radii[px] || 0) + 1
+    }
+    for (const m of raw.matchAll(/rounded-(full|sm|md|lg|xl|2xl|3xl)\b/g)) radii[m[1]] = (radii[m[1]] || 0) + 1
+    const topRadius = Object.entries(radii).sort((a, b) => b[1] - a[1]).slice(0, 3)
+    const shadowCount = (cssClean.match(/box-shadow\s*:[^;{}]{4,120}/g) || []).filter(s => !/none/i.test(s)).length
+    const gradients = [...new Set([...cssClean.matchAll(/linear-gradient\(([^;{}]{4,140})\)/g)].map(m => m[1].replace(/\s+/g, ' ').trim()))].slice(0, 2)
+    // ── Tailwind tokens (Lovable/v0 output is Tailwind — these rebuild 1:1) ──
+    const tw = {}
+    for (const m of raw.matchAll(/\b(?:bg|text|from|to|via|border)-\[([0-9a-fA-F]{6})\]|\b(?:bg|text|border)-(red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose|slate|gray|zinc|neutral|stone)-(?:50|[1-9]00)\b/g)) {
+      const key = m[1] ? '#' + m[1].toLowerCase() : `${m[2]}-${m[3]}`
+      tw[key] = (tw[key] || 0) + 1
+    }
+    const tailwind = Object.entries(tw).sort((a, b) => b[1] - a[1]).slice(0, 5)
+    // ── DOM outline, document order ──
+    const headings = []
+    const seenH = new Set()
+    for (const m of raw.matchAll(/<h([123])[^>]*>([\s\S]{0,220}?)<\/h\1>/gi)) {
+      const t = htmlToVisibleText(m[2]).replace(/\s+/g, ' ').trim()
+      if (!t || headings.length >= 14) continue
+      const key = t.toLowerCase()
+      if (seenH.has(key)) continue   // repeated brand name in a sticky header/duplicate hero
+      seenH.add(key)
+      headings.push({ lvl: +m[1], text: clip(t, 90) })
+    }
+    const navM = raw.match(/<nav[\s\S]{0,4000}?<\/nav>/i)
+    const navItems = navM ? [...new Set([...navM[0].matchAll(/<a[^>]*>([\s\S]{0,80}?)<\/a>/gi)]
+      .map(m => htmlToVisibleText(m[1]).replace(/\s+/g, ' ').trim())
+      .filter(t => t && t.length <= 30))].slice(0, 8) : []
+    const buttons = []
+    for (const m of raw.matchAll(/<button[^>]*>([\s\S]{0,120}?)<\/button>|<a[^>]*class=["'][^"']*(?:btn|button|cta)[^"']*["'][^>]*>([\s\S]{0,120}?)<\/a>/gi)) {
+      const t = htmlToVisibleText(m[1] || m[2] || '').replace(/\s+/g, ' ').trim()
+      if (t && t.length <= 40 && !buttons.includes(t)) buttons.push(t)
+      if (buttons.length >= 8) break
+    }
+    const formFields = []
+    for (const m of raw.matchAll(/<(?:input|textarea|select)\b[^>]*>/gi)) {
+      const tag = m[0]
+      const type = (tag.match(/type=["']([^"']{1,20})["']/i) || [])[1] || (/textarea/i.test(tag) ? 'message box' : 'select')
+      if (/hidden|submit|checkbox|radio|file/i.test(type)) continue
+      const ph = (tag.match(/(?:placeholder|name|aria-label)=["']([^"']{1,30})["']/i) || [])[1]
+      const label = ph && ph.toLowerCase() !== type ? `${type} "${ph}"` : type
+      if (!formFields.includes(label)) formFields.push(label)
+      if (formFields.length >= 7) break
+    }
+    const imgCount = (raw.match(/<img\b/gi) || []).length
+    const imgAlts = [...raw.matchAll(/<img[^>]*alt=["']([^"']{2,60})["']/gi)].map(m => m[1]).slice(0, 4)
+    const videos = (raw.match(/<video\b/gi) || []).length
+    // Role assignment: lightest neutral ≈ background, darkest ≈ text,
+    // most-used chroma color ≈ primary accent.
+    const bg = neutrals.length ? neutrals.slice().sort((a, b) => hexLum(b[0]) - hexLum(a[0]))[0] : null
+    const text = neutrals.length ? neutrals.slice().sort((a, b) => hexLum(a[0]) - hexLum(b[0]))[0] : null
+    return {
+      bg, text, accent: accents[0] || null, accent2: accents[1] || null, neutrals, accents,
+      fonts, weights, sizes, topRadius, shadowCount, gradients, tailwind,
+      headings, navItems, buttons, formFields, imgCount, imgAlts, videos
+    }
+  }
+
+  // Compact facts for the LLM dossier — the model must quote these, not
+  // invent its own palette.
+  function visualDnaLines(vd) {
+    const top = (o, n = 3) => Object.entries(o).sort((a, b) => b[1] - a[1]).slice(0, n).map(([k, v]) => `${k}×${v}`).join(' ')
+    const L = []
+    if (vd.neutrals.length || vd.accents.length) {
+      L.push('COLORS: ' + [...vd.neutrals, ...vd.accents].map(([h, n]) => `${h}×${n}`).join(' '))
+    }
+    if (vd.fonts.length) L.push(`FONTS: ${vd.fonts.join(', ')}${Object.keys(vd.weights).length ? ` | weights ${top(vd.weights, 3)}` : ''}${Object.keys(vd.sizes).length ? ` | sizes(px) ${top(vd.sizes, 4)}` : ''}`)
+    if (vd.topRadius.length || vd.shadowCount || vd.gradients.length) {
+      L.push(`SHAPES: radius ${vd.topRadius.map(([k, v]) => `${k}×${v}`).join(' ') || '—'} | shadows ${vd.shadowCount}${vd.gradients.length ? ` | gradient: ${clip(vd.gradients[0], 80)}` : ''}`)
+    }
+    if (vd.tailwind.length) L.push('TAILWIND TOKENS: ' + vd.tailwind.map(([k, v]) => `${k}×${v}`).join(' '))
+    if (vd.navItems.length) L.push('NAV: ' + vd.navItems.join(' · '))
+    if (vd.headings.length) L.push('OUTLINE: ' + vd.headings.slice(0, 10).map(h => `H${h.lvl} "${h.text}"`).join(' | '))
+    if (vd.buttons.length) L.push('BUTTONS/CTAs: ' + vd.buttons.slice(0, 6).join(' | '))
+    if (vd.formFields.length) L.push('FORM: ' + vd.formFields.join(', '))
+    L.push(`IMAGERY: ${vd.imgCount} images${vd.imgAlts.length ? ` (e.g. "${vd.imgAlts.join('", "')}")` : ''}${vd.videos ? `, ${vd.videos} video element(s)` : ''}`)
+    return L
+  }
+
+  // The paste-ready deliverable: a build prompt the user drops into Lovable /
+  // v0 / Bolt. Deterministic style facts come from the Visual X-Ray (exact
+  // hexes, real font names, real section order). When the AI brain is
+  // connected, its blueprint narrative leads and the measured facts ride
+  // along so the model can't drift from the real design.
+  function buildRebuildBlueprint({ url, vd, homeSum, det, ai, pagePaths }) {
+    const host = url.replace(/^https?:\/\//, '').split('/')[0]
+    const name = clip(homeSum.title || host, 60)
+    const b = det ? det.builder : 'unknown builder'
+    const parts = []
+    const aiBp = ai && ai.blueprint && String(ai.blueprint).trim().length > 80 ? String(ai.blueprint).trim() : null
+    if (aiBp) {
+      parts.push(clip(aiBp.replace(/[ \t]+\n/g, '\n'), 2300))
+    } else {
+      const what = clip(homeSum.meta || (vd.headings[0] ? vd.headings[0].text : '') || 'a small-business site', 160)
+      const sizeTop = Object.entries(vd.sizes).sort((a, b) => b[1] - a[1])
+      const bodyPx = sizeTop.length ? sizeTop[0][0] : '16'
+      const heroPx = sizeTop.length ? Math.max(...sizeTop.map(([p]) => +p)) : null
+      const wTop = Object.entries(vd.weights).sort((a, b) => b[1] - a[1]).map(([w]) => w)
+      const fH = vd.fonts[0] || 'a bold modern sans-serif'
+      const fB = vd.fonts[1] || vd.fonts[0] || 'a clean readable sans-serif'
+      const colLine = vd.bg
+        ? `background ${vd.bg[0]}, headings/body text ${vd.text ? vd.text[0] : 'near-black'}, primary accent ${vd.accent ? vd.accent[0] : 'one strong brand color'}${vd.accent2 ? `, secondary highlight ${vd.accent2[0]}` : ''} — exact codes from their current CSS`
+        : 'not readable from their CSS — use a clean neutral background, near-black text and one strong accent color'
+      const shapeBits = [vd.topRadius.length ? `corner radius ~${vd.topRadius[0][0]}px` : 'square corners',
+        vd.shadowCount >= 3 ? 'soft drop shadows on cards' : 'flat surfaces, no heavy shadows']
+      if (vd.gradients.length) shapeBits.push(`gradient accents (${clip(vd.gradients[0], 70)})`)
+      parts.push(
+        `Rebuild "${name}" (${b} site) as a fast, modern, mobile-first website.\n` +
+        `WHAT IT IS: ${what}\n` +
+        (pagePaths && pagePaths.length > 1 ? `PAGES: ${pagePaths.join(', ')}\n` : '') +
+        `STYLE\n` +
+        `- Colors: ${colLine}\n` +
+        `- Fonts: headings "${fH}"${wTop.length ? ` weight ${wTop[0]}` : ''}, body "${fB}"; body text ~${bodyPx}px${heroPx ? `, biggest display text ~${heroPx}px` : ''}\n` +
+        `- Shapes: ${shapeBits.join('; ')}\n` +
+        (vd.tailwind.length ? `- Their accent tokens (Tailwind): ${vd.tailwind.map(([k]) => k).join(', ')}\n` : '') +
+        `STRUCTURE (top to bottom)\n` +
+        `- Header/nav: ${vd.navItems.length ? vd.navItems.join(' · ') : 'logo left, few links, one CTA'}${vd.buttons[0] ? ` — main CTA "${vd.buttons[0]}"` : ''}\n` +
+        (vd.headings.length ? `- Sections in order: ${vd.headings.slice(0, 10).map(h => `H${h.lvl} "${h.text}"`).join(' → ')}\n` : '') +
+        (vd.buttons.length > 1 ? `- Buttons/CTAs to include: ${vd.buttons.slice(0, 6).join(' | ')}\n` : '') +
+        (vd.formFields.length ? `- Contact form fields: ${vd.formFields.join(', ')}\n` : '- No contact form on the original — add a simple one (name, email, message)\n') +
+        `- Imagery: ${vd.imgCount} photos${vd.imgAlts.length ? ` (subjects: ${vd.imgAlts.join('; ')})` : ''}${vd.videos ? ' + embedded video' : ''}\n` +
+        `TONE: keep their own wording — headline "${clip(vd.headings[0] ? vd.headings[0].text : name, 80)}"${homeSum.meta ? `, tagline "${clip(homeSum.meta, 90)}"` : ''}`
+      )
+    }
+    if (aiBp) {
+      const facts = []
+      if (vd.bg) facts.push(`colors: background ${vd.bg[0]}, text ${vd.text ? vd.text[0] : '—'}, accent ${vd.accent ? vd.accent[0] : '—'}${vd.accent2 ? `, secondary ${vd.accent2[0]}` : ''}`)
+      if (vd.fonts.length) facts.push(`fonts: ${vd.fonts.slice(0, 3).join(', ')}`)
+      if (vd.topRadius.length) facts.push(`corners ~${vd.topRadius[0][0]}px`)
+      if (vd.tailwind.length) facts.push(`tokens: ${vd.tailwind.map(([k]) => k).join(', ')}`)
+      if (facts.length) parts.push('STYLE FACTS measured from their CSS (keep exact): ' + facts.join(' · '))
+    }
+    return clip(
+      `🎨 REBUILD BLUEPRINT — ${url}\n` +
+      `Paste everything between the lines into Lovable / v0 / Bolt to get close to this site.\n\n` +
+      `───────── COPY BELOW ─────────\n${parts.join('\n\n')}\n` +
+      `───────── COPY ABOVE ─────────`, 3800)
+  }
+
   // LLM chain — Groq → Gemini → OpenRouter, all free tiers, all optional.
   // No key configured → returns null and the deep report degrades to the
   // structured crawl (still detailed, just no AI prose).
@@ -2049,7 +2291,7 @@ module.exports = async (req, res) => {
       try {
         const r = await fetch(a.url, {
           method: 'POST', signal: AbortSignal.timeout(30000), headers: a.headers,
-          body: JSON.stringify({ model: a.model, temperature: 0.3, max_tokens: 2000,
+          body: JSON.stringify({ model: a.model, temperature: 0.3, max_tokens: 3000,
             response_format: { type: 'json_object' },
             messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }] }) })
         if (!r.ok) continue
@@ -2063,7 +2305,7 @@ module.exports = async (req, res) => {
         const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`, {
           method: 'POST', signal: AbortSignal.timeout(30000), headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ contents: [{ parts: [{ text: systemPrompt + '\n\n' + userContent }] }],
-            generationConfig: { temperature: 0.3, maxOutputTokens: 2000, responseMimeType: 'application/json' } }) })
+            generationConfig: { temperature: 0.3, maxOutputTokens: 3000, responseMimeType: 'application/json' } }) })
         if (r.ok) {
           const txt = (await r.json()).candidates?.[0]?.content?.parts?.[0]?.text || ''
           const j = txt.match(/\{[\s\S]*\}/)
@@ -2075,16 +2317,18 @@ module.exports = async (req, res) => {
   }
 
   const DEEP_SYSTEM_PROMPT = `You are a meticulous website analyst working for a freelance web designer who pitches paid redesigns to small businesses. You receive the raw crawl of a website (every page, top to bottom). Reply with ONLY a JSON object, no markdown:
-{"business":"3-5 sentence description of what this business is, what it sells/does, who it serves and how it presents itself","structure":"one short sentence per crawled page saying what is on it","build":"how the site is built and feels: builder tool, design quality, mobile/completeness","weaknesses":["up to 6 SPECIFIC problems visible in the content or markup"],"prompt":"the likely prompt the owner typed into an AI site builder to generate this site, written as one quoted paragraph","rebuild":["up to 5 concrete improvements to offer"],"pitch":"a ready-to-send outreach DM of 60-110 words: friendly, mentions 2-3 specific weaknesses seen on THIS site, offers a paid redesign, ends with a light question","country":"best-guess country of the business from addresses, city names, phone codes, currency and language, or 'unknown'","country_why":"short reason for the country guess","quality":0}
+{"business":"3-5 sentence description of what this business is, what it sells/does, who it serves and how it presents itself","structure":"one short sentence per crawled page saying what is on it","build":"how the site is built and feels: builder tool, design quality, mobile/completeness","blueprint":"a paste-ready build prompt of 180-300 words for an AI site builder (Lovable/v0/Bolt) that recreates this site closely: walk the page top to bottom — header/nav, hero with its real headline, every section in order using the OUTLINE headings, forms, footer — and specify the visual style using the COLORS/FONTS/SHAPES/IMAGERY data provided (quote the exact hex codes and font names, never invent new ones), plus imagery style and tone of voice. Written as build instructions ('Build...', 'Use...'), not analysis","weaknesses":["up to 6 SPECIFIC problems visible in the content or markup"],"prompt":"the likely prompt the owner typed into an AI site builder to generate this site, written as one quoted paragraph","rebuild":["up to 5 concrete improvements to offer"],"pitch":"a ready-to-send outreach DM of 60-110 words: friendly, mentions 2-3 specific weaknesses seen on THIS site, offers a paid redesign, ends with a light question","country":"best-guess country of the business from addresses, city names, phone codes, currency and language, or 'unknown'","country_why":"short reason for the country guess","quality":0}
 quality is an integer 0-100 overall site quality. Be specific and concrete everywhere. Never invent facts you cannot see in the crawl.`
 
   // Full pipeline for one URL: crawl → heuristics → (LLM) → formatted report.
   async function deepAnalyzeUrl(url) {
     const host = url.replace(/^https?:\/\//i, '').split('/')[0].toLowerCase()
     const pages = await deepCrawlSite(url)
-    if (!pages) return `❌ Couldn't reach ${host} (down, blocking, or not a real site).`
+    if (!pages) return { main: `❌ Couldn't reach ${host} (down, blocking, or not a real site).`, blueprint: null }
     const pageData = pages.map(p => ({ path: p.path, sum: deepPageSummary(p.html), html: p.html }))
     const home = pageData[0]
+    // Visual X-Ray: homepage CSS (inline + linked stylesheets) + DOM outline.
+    const vd = extractVisualDNA(home.html, await fetchCssBundle(url, collectCssSources(home.html)))
     const det = detectAiBuilder(host, home.html)
     const copy = aiCopyScore(home.sum.textAll.slice(0, 8000))
     const kind = classifySiteKind(host, home.html)
@@ -2093,7 +2337,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     const phones = [...new Set(pageData.flatMap(p => p.sum.phones))].slice(0, 5)
     const socials = Object.assign({}, ...pageData.map(p => p.sum.socials))
     const allText = pageData.map(p => p.sum.textAll).join(' ')
-    const country = detectCountry(host, allText)
+    const country = detectCountry(host, allText, home.html)
 
     let dossier = `SITE: ${url}\nBUILDER: ${det ? det.builder + ' (' + det.category + ', confidence ' + det.conf + ')' : 'no stable builder marker'}\n`
     for (const p of pageData) {
@@ -2103,6 +2347,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       if (p.sum.forms) dossier += `HAS CONTACT FORM\n`
     }
     dossier += `\nHEURISTIC FINDINGS: ${weaknesses.join('; ') || 'none'}\n`
+    dossier += visualDnaLines(vd).map(l => `\n${l}`).join('') + '\n'
     if (country) dossier += `COUNTRY SIGNALS: ${country.label} (${country.why.join(', ')})\n`
 
     const ai = await llmJson(DEEP_SYSTEM_PROMPT, dossier.slice(0, 14000))
@@ -2116,19 +2361,21 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       Object.keys(socials).length ? `💬 ${Object.entries(socials).map(([k, v]) => `${k}: ${v}`).join(' · ')}` : ''
     ].filter(Boolean).join('\n') || '⚠️ no public contact found'
 
-    if (!ai) {
-      return clip(
-        `🔬🔬 DEEP CRAWL — ${url}\n` +
-        `🌍 Country: ${cLabel}${cWhy ? ` — ${cWhy}` : ''}\n` +
-        `🛠 ${det ? det.builder : 'unknown builder'} · AI-copy ${copy}/100 · ${kindTag}\n` +
-        `📄 Pages crawled: ${pageData.map(p => p.path).join(' · ')}\n\n` +
-        `📝 What's on the site:\n${pageData.map(p => `  • ${p.path} — ${p.sum.title || '(no title)'}: ${clip(p.sum.text, 150)}`).join('\n')}\n\n` +
-        `⚠️ Issues found: ${weaknesses.length ? weaknesses.join('; ') : 'none obvious'}\n\n` +
-        `💬 Likely prompt guess: ${home.sum.title ? `"a website for ${home.sum.title.toLowerCase()}"` : '—'}\n\n` +
-        `${contactLine}\n\n` +
-        `🧠 AI brain not connected — add GROQ_API_KEY (free at console.groq.com) to your Vercel env and redeploy to unlock the full dossier: business breakdown, the real likely prompt, rebuild plan and a ready-to-send pitch DM.`, 3900)
-    }
-    return clip(
+    // Report body — same two shapes as before, but now returned together with
+    // the paste-ready rebuild blueprint so callers can send it as its own
+    // Telegram message (the two together exceed the 4096-char cap).
+    const main = !ai ? clip(
+      `🔬🔬 DEEP CRAWL — ${url}\n` +
+      `🌍 Country: ${cLabel}${cWhy ? ` — ${cWhy}` : ''}\n` +
+      `🛠 ${det ? det.builder : 'unknown builder'} · AI-copy ${copy}/100 · ${kindTag}\n` +
+      `📄 Pages crawled: ${pageData.map(p => p.path).join(' · ')}\n\n` +
+      `📝 What's on the site:\n${pageData.map(p => `  • ${p.path} — ${p.sum.title || '(no title)'}: ${clip(p.sum.text, 150)}`).join('\n')}\n\n` +
+      `⚠️ Issues found: ${weaknesses.length ? weaknesses.join('; ') : 'none obvious'}\n\n` +
+      `💬 Likely prompt guess: ${home.sum.title ? `"a website for ${home.sum.title.toLowerCase()}"` : '—'}\n\n` +
+      `${contactLine}\n\n` +
+      `🎨 The REBUILD BLUEPRINT (colors, fonts, sections) follows in the next message — measured from their CSS, no AI key needed.\n\n` +
+      `🧠 AI brain not connected — add GROQ_API_KEY (free at console.groq.com) to your Vercel env and redeploy to also unlock: business breakdown, the real likely prompt, rebuild plan and a ready-to-send pitch DM.`, 3900)
+    : clip(
       `🔬🔬 DEEP INTEL — ${url}\n` +
       `🌍 Country: ${cLabel}${cWhy ? ` — ${cWhy}` : ''}${quality !== null ? `  ·  💯 site quality: ${quality}/100` : ''}\n` +
       `🛠 ${det ? det.builder : 'unknown builder'} · AI-copy ${copy}/100 · ${kindTag}\n` +
@@ -2140,6 +2387,8 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       `💬 LIKELY PROMPT THEY USED:\n"${clip(ai.prompt, 600)}"\n\n` +
       `🔨 YOUR REBUILD PLAN:\n${(Array.isArray(ai.rebuild) ? ai.rebuild : []).slice(0, 5).map((r2, i) => `  ${i + 1}. ${clip(r2, 150)}`).join('\n')}\n\n` +
       `📨 READY-TO-SEND PITCH:\n"${clip(ai.pitch, 800)}"`, 3900)
+    const blueprint = buildRebuildBlueprint({ url, vd, homeSum: home.sum, det, ai, pagePaths: pageData.map(p => p.path) })
+    return { main, blueprint }
   }
 
   // Deep-search continuation loop: one site per round, persistent queue in
@@ -2151,16 +2400,17 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     const deadline = Date.now() + 40000
     while (userQueue.deepIdx < total && Date.now() < deadline) {
       const url = dq.urls[userQueue.deepIdx]
-      const report = await deepAnalyzeUrl(url)
+      const rep = await deepAnalyzeUrl(url)
       userQueue.deepIdx++
       await saveUserQueue(userId, userQueue)
-      await send(chatId, `📡 Deep intel ${userQueue.deepIdx}/${total}${dq.label ? ` — ${dq.label}` : ''}\n\n${report}`)
+      await send(chatId, `📡 Deep intel ${userQueue.deepIdx}/${total}${dq.label ? ` — ${dq.label}` : ''}\n\n${rep.main}`)
+      if (rep.blueprint) await send(chatId, rep.blueprint)
     }
     if (userQueue.deepIdx >= total) {
       userQueue.deepQ = null
       userQueue.deepIdx = 0
       await saveUserQueue(userId, userQueue)
-      await send(chatId, `✅ Deep search complete — ${total} full dossier${total === 1 ? '' : 's'} delivered. Every one has the likely prompt + a ready-to-send pitch.`)
+      await send(chatId, `✅ Deep search complete — ${total} full dossier${total === 1 ? '' : 's'} delivered, each with its paste-ready rebuild blueprint + pitch. Copy any blueprint into Lovable/v0 and pitch the owner.`)
     } else {
       await send(chatId, `⏳ Deep intel ${userQueue.deepIdx}/${total} delivered — time budget hit. Send anything to continue where it stopped.`)
     }
@@ -2175,8 +2425,10 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       await send(chatId, `That doesn't look like a URL — send e.g. https://some-site.com`)
       return
     }
-    await send(chatId, `🔬 Deep-crawling ${url.replace(/^https?:\/\//, '')} — every page top to bottom, then the AI dossier. ~30–60s…`)
-    await send(chatId, await deepAnalyzeUrl(url))
+    await send(chatId, `🔬 Deep-crawling ${url.replace(/^https?:\/\//, '')} — every page top to bottom + the CSS, then the dossier and a paste-ready rebuild blueprint. ~30–60s…`)
+    const rep = await deepAnalyzeUrl(url)
+    await send(chatId, rep.main)
+    if (rep.blueprint) await send(chatId, rep.blueprint)
   }
 
   // ── URLSCAN.IO ──
