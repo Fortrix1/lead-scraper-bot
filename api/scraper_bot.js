@@ -1654,13 +1654,18 @@ module.exports = async (req, res) => {
 
   // The 🔬 DEEP SEARCH ALL button — attached to EVERY hunt message that has
   // at least one deliverable result (progress pings included), so the button
-  // is never "missing at the end" again.
+  // is never "missing at the end" again. The queue it saves is an OFFER:
+  // started=false until the user actually taps the button, so it can never
+  // hijack the pings that are meant to keep the hunt digging.
   async function attachDeepButton(chatId, userId, userQueue, h, reply) {
     const good = huntGoodUrls(h)
     const done = new Set(h.deepDone || [])
     const urls = good.urls.filter(u => !done.has(u))
     if (!urls.length) return reply
-    userQueue.deepQ = { urls, label: h.label }
+    // A deep search the user explicitly started keeps its queue — never
+    // clobber a run in progress with a fresh offer.
+    if (userQueue.deepQ && userQueue.deepQ.started && userQueue.deepIdx < userQueue.deepQ.urls.length) return reply
+    userQueue.deepQ = { urls, label: h.label, started: false }
     userQueue.deepIdx = 0
     await saveUserQueue(userId, userQueue)
     return { reply, keyboard: [[B(`🔬 DEEP SEARCH ALL ${urls.length}`, 'deepsearch:go'), B('✋ Skip', 'deepsearch:skip')]] }
@@ -1985,6 +1990,16 @@ module.exports = async (req, res) => {
   async function startAiHunt(chatId, userId, srcKey, want) {
     const src = AI_HUNT_SOURCES[srcKey]
     if (!src) { await send(chatId, 'Unknown builder — pick one from the 🤖 AI-Built Sites menu.'); return res.status(200).send('OK') }
+    // Fresh hunt → a deep-search OFFER that was never tapped dies here, so an
+    // old button (e.g. a 47-site queue from yesterday's hunt) can't eat the
+    // pings meant for this hunt. A deep search the user explicitly started
+    // pauses and stays resumable from its button.
+    const preQ = await getUserQueue(userId)
+    if (preQ.deepQ) {
+      if (preQ.deepQ.started) preQ.deepQ.started = false
+      else { preQ.deepQ = null; preQ.deepIdx = 0 }
+      await saveUserQueue(userId, preQ)
+    }
     const mode = await getHuntMode(userId)
     const country = await getHuntCountry(userId)
     const age = await getHuntAge(userId)
@@ -2569,6 +2584,9 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
   async function runDeepSearchBatch(chatId, userId, userQueue) {
     const dq = userQueue.deepQ
     if (!dq || !Array.isArray(dq.urls)) return res.status(200).send('OK')
+    // Tapping the button (or resuming) flips the queue from OFFER to RUN —
+    // from here on, pings belong to the deep search until it drains.
+    if (!dq.started) { dq.started = true; await saveUserQueue(userId, userQueue) }
     const total = dq.urls.length
     const deadline = Date.now() + 40000
     while (userQueue.deepIdx < total && Date.now() < deadline) {
@@ -2589,7 +2607,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       userQueue.deepQ = null
       userQueue.deepIdx = 0
       await saveUserQueue(userId, userQueue)
-      await send(chatId, `✅ Deep search complete — ${total} full dossier${total === 1 ? '' : 's'} delivered, each with its paste-ready rebuild blueprint + pitch. Copy any blueprint into Lovable/v0 and pitch the owner.`)
+      await send(chatId, `✅ Deep search complete — ${total} full dossier${total === 1 ? '' : 's'} delivered, each with its paste-ready rebuild blueprint + pitch. Copy any blueprint into Lovable/v0 and pitch the owner.${userQueue.aiHunt && !userQueue.aiHunt.done ? '\n\n⛏ Your hunt was paused for this — send anything and it keeps digging.' : ''}`)
     } else {
       await send(chatId, `⏳ Deep intel ${userQueue.deepIdx}/${total} delivered — time budget hit. Send anything to continue where it stopped.`)
     }
@@ -4010,7 +4028,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     midFlowQueue.awaitingLeadCount || midFlowQueue.awaitingLockedFilter ||
     midFlowQueue.awaitingScoutMonth || midFlowQueue.awaitingFreshFilter || midFlowQueue.awaitingScoutAgeGate ||
     midFlowQueue.awaitingCustomDate || midFlowQueue.awaitingSocialFilter ||
-    midFlowQueue.awaitingHuntUrl || midFlowQueue.deepQ ||
+    midFlowQueue.awaitingHuntUrl || (midFlowQueue.deepQ && midFlowQueue.deepQ.started) ||
     midFlowQueue.wizard || midFlowQueue.answeringGift
   ))
   if (!isOwner && !isAccessCmd && !isGiftCmd && !midFlow && !doc) {
@@ -5160,8 +5178,10 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       return res.status(200).send('OK')
     }
 
-    // ── Continue a deep search run cut short by the time budget ──
-    if (userQueue.deepQ && userQueue.deepIdx < userQueue.deepQ.urls.length) {
+    // ── Continue a deep search run the user EXPLICITLY started (button tap).
+    // A fresh offer under a hunt message is started=false and must NEVER
+    // hijack the ping — "send anything to keep hunting" stays true.
+    if (userQueue.deepQ && userQueue.deepQ.started && userQueue.deepIdx < userQueue.deepQ.urls.length) {
       return await runDeepSearchBatch(chatId, userId, userQueue)
     }
 
