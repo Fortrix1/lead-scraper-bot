@@ -1625,6 +1625,47 @@ module.exports = async (req, res) => {
     ]
   }
 
+  // How deep one hunt may dig into the archive. crt.sh zones (TIER A) slice
+  // 400 certs per round from the 20h cache, so 12 rounds ≈ 4,800 certs deep.
+  // urlscan zones (TIER B) physically cap at its ~30-day public index — round
+  // 3 already covers it. Fixed age windows (last7/last30/thismonth) can't be
+  // widened by digging, so 3 rounds covers their whole pool too.
+  function huntMaxDig(src, age) {
+    if (src && src.tier === 'B') return 3
+    if (age === 'last7' || age === 'last30' || age === 'thismonth') return 3
+    return parseInt(process.env.HUNT_MAX_DIG) || 12
+  }
+
+  // URLs of results that passed every hunt filter (live + builder + business
+  // mode + country) — the pool the 🔬 DEEP SEARCH ALL button draws from.
+  function huntGoodUrls(h) {
+    const isSkippedDev = r => h.mode === 'business' && r.kind === 'DEVELOPER'
+    const isCountryMiss = r => h.country && h.country !== 'any' &&
+      (!r.country || (h.country.toUpperCase() === 'US'
+        ? (r.country.code !== 'US' && r.country.code !== 'CA')
+        : r.country.code !== h.country.toUpperCase()))
+    return {
+      urls: [...new Set(h.results.filter(r => r.status === 'OK' && r.builder && !isSkippedDev(r) && !isCountryMiss(r)).map(r => r.url))],
+      skippedDev: h.results.filter(r => r.status === 'OK' && r.builder && isSkippedDev(r)).length,
+      skippedCountry: (h.country && h.country !== 'any') ? h.results.filter(r => r.status === 'OK' && r.builder && isCountryMiss(r)).length : 0,
+      dead: h.results.filter(r => r.status !== 'OK').length
+    }
+  }
+
+  // The 🔬 DEEP SEARCH ALL button — attached to EVERY hunt message that has
+  // at least one deliverable result (progress pings included), so the button
+  // is never "missing at the end" again.
+  async function attachDeepButton(chatId, userId, userQueue, h, reply) {
+    const good = huntGoodUrls(h)
+    const done = new Set(h.deepDone || [])
+    const urls = good.urls.filter(u => !done.has(u))
+    if (!urls.length) return reply
+    userQueue.deepQ = { urls, label: h.label }
+    userQueue.deepIdx = 0
+    await saveUserQueue(userId, userQueue)
+    return { reply, keyboard: [[B(`🔬 DEEP SEARCH ALL ${urls.length}`, 'deepsearch:go'), B('✋ Skip', 'deepsearch:skip')]] }
+  }
+
   // One round of pool building for a hunt. dig=0 fetches the newest slice;
   // each further round digs deeper: crt.sh steps 200 certs further back in
   // time, urlscan widens its scan window (public index holds ~30 days).
@@ -1633,13 +1674,13 @@ module.exports = async (req, res) => {
   async function buildHuntPool(src, dig = 0) {
     const pools = await Promise.all(src.suffixes.map(async s => {
       if (src.tier === 'A') {
-        const crt = await fetchCrtshNewestDomains(s, 200, dig * 200)
+        const crt = await fetchCrtshNewestDomains(s, 400, dig * 400)
         if (crt) return crt
         return await fetchUrlscanBuilderDomains(s, 200, 4 + dig * 10)
       }
       const us = await fetchUrlscanBuilderDomains(s, 200, 4 + dig * 10)
       if (us && us.length) return us
-      return await fetchCrtshNewestDomains(s, 200, dig * 200) || []
+      return await fetchCrtshNewestDomains(s, 400, dig * 400) || []
     }))
     if (pools.every(p => p === null || (Array.isArray(p) && !p.length))) return []
     const byDom = new Map()
@@ -1654,7 +1695,17 @@ module.exports = async (req, res) => {
   // failure (crt.sh 502s are normal under load — 3 attempts, growing
   // backoff), [] when genuinely empty. Uses the same CRTSH_RELAY_URL relay
   // as the store-age lookups when set.
-  async function fetchCrtshNewestDomains(suffix, limit = 200, offset = 0) {
+  async function fetchCrtshNewestDomains(suffix, limit = 400, offset = 0) {
+    // 20-hour Redis cache of the newest-first list — deep digs (round 1..12)
+    // slice from the cache instead of re-downloading crt.sh's full JSON every
+    // round, which also makes a slow/502-ing crt.sh unable to stall a dig.
+    try {
+      const { result } = await redis('GET', `hunt:crtcache:${suffix}`)
+      if (result) {
+        const cached = JSON.parse(result)
+        if (Array.isArray(cached) && cached.length) return cached.slice(offset, offset + limit)
+      }
+    } catch { /* cache is best-effort */ }
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const r = await fetch(`${CRTSH_BASE}?q=${encodeURIComponent('%.' + suffix)}&output=json`,
@@ -1670,8 +1721,10 @@ module.exports = async (req, res) => {
             if (nb >= (newest.get(n) || 0)) newest.set(n, nb)
           }
         }
-        return [...newest.entries()].sort((a, b) => b[1] - a[1]).slice(offset, offset + limit)
+        const all = [...newest.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6000)
           .map(([domain, notBefore]) => ({ domain, notBefore }))
+        try { await redis('SET', `hunt:crtcache:${suffix}`, JSON.stringify(all), 'EX', 72000) } catch {}
+        return all.slice(offset, offset + limit)
       } catch (e) {
         if (attempt < 2) await new Promise(r2 => setTimeout(r2, attempt ? 10000 : 4000))
       }
@@ -1965,10 +2018,19 @@ module.exports = async (req, res) => {
         await send(chatId, `⛏ The newest sites were all ones you'd already received — dug deeper and found ${candidates.length} site${candidates.length === 1 ? '' : 's'} you haven't seen yet.`)
       }
     }
+    if (!candidates.length && rawTotal) {
+      // DON'T die here — queue the hunt with an empty pool and keep digging
+      // (round 2, 3, … up to huntMaxDig) on every ping, exactly like a
+      // mid-hunt dry pool. The archive is hundreds of certs deeper than the
+      // first two slices.
+      const q = await getUserQueue(userId)
+      q.aiHunt = { srcKey, label: src.label, want, mode, country, age, dig, candidates: [], results: [], delivered: 0, done: false }
+      await saveUserQueue(userId, q)
+      await send(chatId, `⛏ The newest slices are all sites you've already received — keeping it moving: I'll dig up to ${huntMaxDig(src, age) * 400} certs into the archive for ones you haven't seen. Send anything to power the next dig.`)
+      return await runAiHuntBatch(chatId, userId, q)
+    }
     if (!candidates.length) {
-      await send(chatId, rawTotal
-        ? `✓ Every site in reach of this zone is already on your received list inside the ${ageLabel(age)} window.\n\n⛏ Two ways to get more:\n• Hunt menu → 🗓 Sites from → ♾ Any age — I'll dig the whole archive for sites you've never received (that pool basically never runs dry).\n• Wait for fresh sites — new certificates land every day, and I track them automatically.`
-        : `Nothing found right now — the discovery sources (crt.sh / urlscan) are overloaded or the zone is quiet. Try again in a few minutes.`)
+      await send(chatId, `Nothing found right now — the discovery sources (crt.sh / urlscan) are overloaded or the zone is quiet. Try again in a few minutes.`)
       return res.status(200).send('OK')
     }
     const q = await getUserQueue(userId)
@@ -2003,8 +2065,9 @@ module.exports = async (req, res) => {
       if (!h.candidates.length) {
         if (!h.dig) h.dig = 1
         const src = AI_HUNT_SOURCES[h.srcKey]
-        if (!src || h.dig > 4) { h.done = true; break }
-        await send(chatId, `⛏ Pool dry so far — digging deeper into the archive (round ${h.dig})…`)
+        const maxDig = huntMaxDig(src, h.age || 'newest')
+        if (!src || h.dig > maxDig) { h.done = true; break }
+        await send(chatId, `⛏ Pool dry so far — digging deeper into the archive (round ${h.dig}/${maxDig})…`)
         const pool = await buildHuntPool(src, h.dig)
         const round = h.dig
         h.dig++
@@ -2027,20 +2090,33 @@ module.exports = async (req, res) => {
     const fresh = live.slice(h.delivered)
     const prevDelivered = h.delivered
     h.delivered = live.length
-    h.done = live.length >= h.want || (!h.candidates.length && (h.dig || 1) > 4)
-    const skippedDev = h.results.filter(r => r.status === 'OK' && r.builder && isSkippedDev(r)).length
-    const skippedCountry = (h.country && h.country !== 'any') ? h.results.filter(r => r.status === 'OK' && r.builder && isCountryMiss(r)).length : 0
+    const huntSrc = AI_HUNT_SOURCES[h.srcKey]
+    const maxDig = huntMaxDig(huntSrc, h.age || 'newest')
+    const good = huntGoodUrls(h)
+    h.done = live.length >= h.want || (!h.candidates.length && (h.dig || 1) > maxDig)
+    const skippedDev = good.skippedDev
+    const skippedCountry = good.skippedCountry
+    const gaveUpShort = h.done && live.length < h.want
 
     let header
     if (live.length >= h.want) header = `✅ ALL DONE — ${live.length} AI-built sites as requested (${h.label}), checked ${h.results.length} new domains to find them.`
-    else if (!h.candidates.length) header = (h.dig || 1) > 4
-      ? `✓ Archive dug to the bottom — ${live.length} live AI-built sites of ${h.results.length} domains checked (${h.label}). Nothing unseen left in the ${ageLabel(h.age || 'newest')} window — new sites land every day, and 🗓 Freshness → ♾ Any age gives the deepest pool.`
-      : `⏳ ${live.length} of ${h.want} — pool dry, the dig continues on your next message.`
+    else if (gaveUpShort) {
+      // Dug to the bottom of the archive and still short of `want` — no dead
+      // end. Give the honest math of where every checked domain went, plus
+      // one-tap buttons that loosen a filter and restart the hunt.
+      header = `✓ Archive fully dug (${h.label}) — checked ${h.results.length} domains, ${live.length} matched ALL your filters:\n` +
+        [good.dead ? `• ${good.dead} dead or parked` : '',
+         (h.mode === 'business' && skippedDev) ? `• ${skippedDev} developer/portfolio — 🏢 business filter` : '',
+         (h.country && h.country !== 'any' && skippedCountry) ? `• ${skippedCountry} other country — 🌍 filter` : ''
+        ].filter(Boolean).join('\n') + `\n` +
+        `That's every unseen ${h.label} site in reach right now — new ones land every day and I track them automatically.\n\n` +
+        `Want the full ${h.want}? Loosen ONE filter and I restart instantly:`
+    } else if (!h.candidates.length) header = `⏳ ${live.length} of ${h.want} — pool dry, the dig continues on your next message (archive round ${Math.min(h.dig || 1, maxDig)}/${maxDig}).`
     else header = `⏳ ${live.length} of ${h.want} so far (checked ${h.results.length}) — send anything and I'll keep hunting.`
-    if (h.mode === 'business' && skippedDev > 0) {
+    if (h.mode === 'business' && skippedDev > 0 && !gaveUpShort) {
       header += `\n🏢 Skipped ${skippedDev} developer/portfolio site${skippedDev === 1 ? '' : 's'} — tap 🌐 Show everything in the hunt menu to include them.`
     }
-    if (skippedCountry > 0) {
+    if (skippedCountry > 0 && !gaveUpShort) {
       header += `\n🌍 Country filter ${COUNTRY_LABELS[h.country.toUpperCase()] || h.country.toUpperCase()} — skipped ${skippedCountry} site${skippedCountry === 1 ? '' : 's'} that didn't match.`
     }
 
@@ -2048,25 +2124,23 @@ module.exports = async (req, res) => {
     let n = prevDelivered
     for (const r of fresh) { n++; reply += `\n\n${aiLeadCard(r, n)}` }
     await saveUserQueue(userId, userQueue)
-    if (h.done) {
-      const deepUrls = [...new Set(h.results
-        .filter(r => r.status === 'OK' && r.builder && !isSkippedDev(r) && !isCountryMiss(r))
-        .map(r => r.url))]
-      reply += `\n\n────────\n🔬 Deep-check one site: /check <url>`
-      await send(chatId, reply)
-      if (deepUrls.length) {
-        userQueue.deepQ = { urls: deepUrls, label: h.label }
-        userQueue.deepIdx = 0
-        await saveUserQueue(userId, userQueue)
-        await sendKeyboard(chatId,
-          `🧠 Want the FULL intel on all ${deepUrls.length} lead${deepUrls.length === 1 ? '' : 's'}?\n\n` +
-          `DEEP SEARCH crawls every page of each site AND reads its CSS, then writes the complete dossier: what the business really is, the full VISUAL DNA — exact colors, fonts, buttons, every section top to bottom — every weakness, the likely prompt they typed, a paste-ready REBUILD BLUEPRINT for Lovable/v0, and a ready-to-send pitch DM.\n\n` +
-          `⏱️ ~1 site/min, runs in the background — send anything to keep it going.`,
-          [[B(`🔬 DEEP SEARCH ALL ${deepUrls.length}`, 'deepsearch:go'), B('✋ Skip', 'deepsearch:skip')]])
-      }
-      return res.status(200).send('OK')
+
+    // 🔬 DEEP SEARCH ALL rides on EVERY message that has results — progress
+    // pings included — so the button is always right there at the end, not
+    // only on the final wrap-up.
+    const attached = await attachDeepButton(chatId, userId, userQueue, h, reply)
+    let replyText = typeof attached === 'string' ? attached : attached.reply
+    let keyboard = attached.keyboard ? [...attached.keyboard] : []
+    if (gaveUpShort) {
+      if (h.mode === 'business') keyboard.push([B('🌐 Include developer sites too', `huntrelax:${h.srcKey}:dev:${h.want}`)])
+      if (h.country && h.country !== 'any') keyboard.push([B('🌍 Any country', `huntrelax:${h.srcKey}:country:${h.want}`)])
+      if (h.age !== 'any') keyboard.push([B('♾ Any age (deepest archive)', `huntrelax:${h.srcKey}:age:${h.want}`)])
     }
-    await send(chatId, reply)
+    if (h.done) {
+      replyText += `\n\n────────\n🔬 Deep-check one site: /check <url>\n🧠 DEEP SEARCH ALL = full crawl of every page + CSS → complete dossier, VISUAL DNA, paste-ready rebuild blueprint + pitch DM for each lead.`
+    }
+    if (keyboard.length) await sendKeyboard(chatId, replyText, keyboard)
+    else await send(chatId, replyText)
     return res.status(200).send('OK')
   }
 
@@ -2501,6 +2575,12 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       const url = dq.urls[userQueue.deepIdx]
       const rep = await deepAnalyzeUrl(url)
       userQueue.deepIdx++
+      // Remember what's been deep-searched inside this hunt so the button
+      // never re-runs the same site after the queue rebuilds mid-hunt.
+      if (userQueue.aiHunt) {
+        if (!Array.isArray(userQueue.aiHunt.deepDone)) userQueue.aiHunt.deepDone = []
+        userQueue.aiHunt.deepDone.push(url)
+      }
       await saveUserQueue(userId, userQueue)
       await send(chatId, `📡 Deep intel ${userQueue.deepIdx}/${total}${dq.label ? ` — ${dq.label}` : ''}\n\n${rep.main}`)
       if (rep.blueprint) await send(chatId, rep.blueprint)
@@ -3838,6 +3918,19 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       if (data === 'deepsearch:go') {
         const dq = await getUserQueue(cbUserId)
         if (!dq.deepQ || !Array.isArray(dq.deepQ.urls) || dq.deepIdx >= dq.deepQ.urls.length) {
+          // No live deepQ — rebuild it straight from the hunt's results so
+          // the button works mid-hunt too (before the hunt's final message).
+          if (dq.aiHunt && Array.isArray(dq.aiHunt.results) && dq.aiHunt.results.length) {
+            const already = new Set(dq.aiHunt.deepDone || [])
+            const urls = huntGoodUrls(dq.aiHunt).urls.filter(u => !already.has(u))
+            if (urls.length) {
+              dq.deepQ = { urls, label: dq.aiHunt.label }
+              dq.deepIdx = 0
+              await saveUserQueue(cbUserId, dq)
+            }
+          }
+        }
+        if (!dq.deepQ || !Array.isArray(dq.deepQ.urls) || dq.deepIdx >= dq.deepQ.urls.length) {
           await send(cbChatId, `Nothing queued — run a hunt first, then tap the deep search button under the results.`)
           return res.status(200).send('OK')
         }
@@ -3851,6 +3944,19 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         await saveUserQueue(cbUserId, dq)
         await send(cbChatId, `Skipped. Deep-check any single site anytime with /check <url>.`)
         return res.status(200).send('OK')
+      }
+
+      if (data.startsWith('huntrelax:')) {
+        // One-tap filter loosening from a "dug to the bottom" message —
+        // saves the new preference, then restarts the hunt with the same
+        // requested count.
+        const [, srcKey, what, wantStr] = data.split(':')
+        if (!AI_HUNT_SOURCES[srcKey]) return res.status(200).send('OK')
+        const want = Math.min(Math.max(parseInt(wantStr) || 10, 1), 50)
+        if (what === 'dev') { await redis('SET', `hunt:mode:${cbUserId}`, 'all'); await send(cbChatId, `🌐 Developers included — restarting the hunt…`) }
+        else if (what === 'country') { await redis('SET', `hunt:country:${cbUserId}`, 'any'); await send(cbChatId, `🌍 Any country — restarting the hunt…`) }
+        else if (what === 'age') { await redis('SET', `hunt:age:${cbUserId}`, 'any'); await send(cbChatId, `♾ Any age — restarting with the full archive open…`) }
+        return await startAiHunt(cbChatId, cbUserId, srcKey, want)
       }
 
       if (data.startsWith('hunt:')) {
