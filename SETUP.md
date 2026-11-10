@@ -254,11 +254,21 @@ Separately, `/scout` results are tagged with store age too (`🎂 age: 12d 🔥`
 
 In Telegram, send:
 ```
-/newuk 1 20      # companies incorporated in the last 1 day, up to 20 reported
+/newuk 1 20        # companies incorporated in the last 1 day, up to 20 reported
+/newuk 50          # one number >30 = how many RESULTS you want (today, 50 companies)
+/newuk 5           # one number ≤30 = days back (default 20 results)
+/newuk 7 50 with   # last 7 days, 50 results, only companies WITH a verified website
+/newuk 1 20 nosite # only companies where NO website could be found
+/newuk range       # pick your own exact FROM–TO date window (plus count)
 ```
-`1` = how many days back to search (default 1, capped at 30), `20` = how many to report (default 20, capped at 100).
 
-This calls the UK government's own [Companies House Advanced Search API](https://developer.company-information.service.gov.uk/api/docs/search/advanced-search/advancedSearchCompanies.html) directly — free, official, no scraping, and unlike crt.sh it's fast and reliable, so it runs straight from Vercel with no daemon involved. Each company includes its incorporation date, type, registered address, and a link to its public Companies House page. Results are deduplicated the same way `/scout` leads are, so re-running `/newuk` won't re-send companies you've already seen.
+**You always get exactly the count you ask for.** `/newuk` never spends a search credit, so the free-tier result caps no longer shrink it — if you see a "free accounts" message you're not recognized as the owner, which means `SCRAPER_ADMIN_ID` in Vercel doesn't match your Telegram ID (check it with `/access`).
+
+**The date window is strict.** "Last N days" INCLUDES today (`/newuk 1` = today only — the old version started from yesterday, so results never matched the window you picked), computed on the **London calendar** (Companies House is a UK register). An extra client-side filter re-checks every company's incorporation date against the window before reporting, and `/newuk range` lets you pick an exact from–to window. Note: Companies House loads each day's incorporations with a delay, so "today" fills up as the day goes on — a few missing companies at 9am is normal, not a bug.
+
+**Website verification (with / nosite / all).** Companies House doesn't list websites, so the bot finds each company's site itself: it probes the likely domains built from the company name (`companyname.co.uk`, `.com`, `.org.uk`, `.uk`, hyphenated variants), and if none verify it searches the web for the company and probes what comes back. A site only counts when it PROVES itself: loads with HTTP 200, isn't a parked/for-sale page, isn't an aggregator or social site, and actually mentions the company name. Choose **🔗 Only WITH a website**, **🚫 Only WITHOUT a website**, or **📋 All companies** — every company gets the check either way, results are cached per company for 30 days, and if the time budget cuts the run short, send any message to continue exactly where it stopped.
+
+This calls the UK government's own [Companies House Advanced Search API](https://developer.company-information.service.gov.uk/api/docs/search/advanced-search/advancedSearchCompanies.html) directly — free, official, no scraping, and unlike crt.sh it's fast and reliable, so it runs straight from Vercel with no daemon involved. Each company includes its incorporation date, type, registered address, website verdict, and a link to its public Companies House page. Results are deduplicated the same way `/scout` leads are, so re-running `/newuk` won't re-send companies you've already seen.
 
 **One-time setup (free, ~2 minutes):**
 1. Register at [developer.company-information.service.gov.uk](https://developer.company-information.service.gov.uk/)
@@ -409,13 +419,17 @@ daemon run in `daemon.yml`:
 
 ### URLScan Scraping
 
-Send `/scout` in Telegram → pick a search → choose a date window → reply with how many leads → choose freshness and whether to include locked stores → type `all` or one required social platform (`linkedin`, `facebook`, `instagram`, or `x`).
+Send `/scout` in Telegram → pick a search → choose a date window → reply with how many leads → choose freshness and whether to include locked stores → type `all` or one required social platform (`linkedin`, `facebook`, `instagram`, `x`, or `tiktok`).
+
+**🛍️ Online stores — Shopify · Wix · Etsy · Webflow.** The scout menu has an **Online stores** button that opens a platform picker. Every platform runs the exact same flow as Shopify: date window → how many → real-store checks → social filter. Discovery queries (verified live against urlscan's public index): Shopify `page.domain:myshopify.com`, Wix `page.domain:wixsite.com`, Etsy `page.domain:etsy.com AND page.url:"/shop/"` (the shop PAGE is the lead, not the marketplace root), Webflow `page.domain:webflow.io`. Two platform limits worth knowing: store-age lookups (SSL birthday) only work on Shopify — Wix, Etsy and Webflow hide every customer site behind one shared wildcard certificate, so age stays "unknown" there; and Etsy blocks some cloud IPs, so if your Vercel IP gets a 403 from Etsy those candidates can't be live-checked and will be sparse until the IP is clean.
+
+**Niche presets are product-level now, not name-level.** The niche searches (Skincare/Beauty, Jewelry, Pet products, Fashion) no longer match keywords in the page TITLE — a cosmetics store called "Glow Labs" whose title never says cosmetics was invisible to the old queries. Instead they pull ALL stores of the platform, then open each store's LIVE product list: on Shopify the bot fetches `/products.json` and matches real product titles/tags/types; on other platforms it matches the visible product/listing texts on the page itself. A store only counts if it lists at least **3 matching products** (change `NICHE_MIN_PRODUCTS` at the top of `api/scraper_bot.js` if you want it tighter or looser), and the report shows exactly what matched (`🧴 Skincare/Beauty: 14 matching of 60 products (products.json)`). Stores that fail the product gate land in `/others` with the count that missed.
 
 Under **Custom date or backward range**, choose one exact day or a backward range, then type the year, month, and day. A range asks for its total number of days and counts backward while including the selected end date. URLScan's public index only reaches back about 30 days, so older custom dates are rejected rather than returning an unexplained empty search.
 
 After picking a date window, /scout asks one extra question — **🆕 Only stores born in this window** or **♻️ Any store age (faster)**. The date window filters when stores were last *scanned* (an old store scanned yesterday still matches it); the age-gate option additionally enforces the window on each store's REAL age (its first-ever SSL certificate). With the gate on, too-old stores are dropped, listed under `/others`, and the report header shows `🎂 Store age ≤ Nd enforced`.
 
-A required social platform is mandatory: stores without it are skipped and do not count toward the requested lead total. Social extraction rejects Shopify/default placeholder handles, non-profile links, dead profiles, and redirects away from the social platform. If a social network blocks automated profile checks, a structurally valid link is kept unless there is positive evidence that it is invalid.
+A required social platform is mandatory, and **strict means strict on every platform**: each Facebook / Instagram / X / LinkedIn / TikTok link found on a store is live-fetched and must load as a real profile — a live 404, a "page isn't available / account doesn't exist / suspended" response, a redirect to the platform's home or login, or a link that ends up off the platform is dropped and does NOT count toward your requested total. Facebook links are additionally business-pages-only (personal profiles, groups and events never pass extraction). Network blocks (401/403/429, timeouts) are NOT treated as proof an account is fake — those links stay, so strictness can't invent false negatives just because a platform rate-limited the bot. The keep-hunting-until-you-have-exactly-N behavior is unchanged.
 
 Results come back in batches. Send any message to continue searching until the requested number of qualifying leads is found or URLScan is exhausted.
 
@@ -447,14 +461,14 @@ How discovery works: Lovable gives every project its own SSL certificate, so new
 | Command | What it does |
 |---------|-------------|
 | `/start` | Show help |
-| `/scout` | URLScan.io search menu |
+| `/scout` | URLScan.io search menu — Shopify · Wix · Etsy · Webflow, niche presets product-checked |
 | `/find <city> <niche> [count]` | Scrape Google Maps (asks for a review cap, then runs the daemon) |
 | `/fresh [age_days] [count]` | Turn ON fresh-Shopify-store monitoring via crt.sh ticks (default: ≤30 days, top 15/tick) |
 | `/freshoff` | Turn OFF fresh-store monitoring |
 | `/hunt <lovable|framer|durable|wix|all> [count]` | Find AI-built websites (🏢 business-only toggle on every hunt screen) |
 | `/check <url>` | Deep-check one site: builder, contacts, weaknesses, business-vs-developer verdict |
 | `/audit` | Show the last 50 commands run, by whom and when |
-| `/newuk [days] [count]` | Newly incorporated UK companies via Companies House (default: last 1 day, top 20) |
+| `/newuk [days] [count] [with\|nosite\|all]` | UK companies via Companies House, website-verified; `/newuk range` = exact from–to window |
 | `/campaigns` | List campaigns and how many leads each has |
 | `/leads <status>` | List leads by status: new, contacted, replied, interested, not_interested, do_not_contact, client |
 | `/mark <number> <status>` | Mark lead #N from your last /find report with a status |
