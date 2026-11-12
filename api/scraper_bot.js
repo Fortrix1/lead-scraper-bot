@@ -6,23 +6,25 @@
 //     question); new AI Site Hunter module (/hunt + /check + 🤖 buttons) that
 //     finds AI-builder sites (Lovable/Framer/v0/Bolt...) via crt.sh CT logs,
 //     fingerprints them, scores AI copy, and pulls owner contacts.
-//     fingerprints them, scores AI copy, and pulls owner contacts.
-// v8 SINGLE FILE (merged): rebuilt on the NEWEST copy of scraper_bot.js (the
-//     one with country detection, the /country hunt filter, hunt age windows,
-//     seen-memory v7.3 and the LLM deep-report module) — the older copy that
-//     v6/v7 were built on is gone. On top of it: the strict product pipeline
-//     (9 niches, live catalogs, 3+ real products), the 🛍 Online-stores
-//     platform picker, strict live social validation (Facebook Page-plugin
-//     fallback), an anti-block fetch layer, an honest rejection ledger on
-//     every progress message, and the AUTO-CONTINUE hunt chain (keeps
-//     searching by itself until your count is reached — ✋ Stop included).
-
-const crypto = require('crypto')
+// v8 (this build):
+//   • 🏬 ONLINE STORES menu with a platform picker: Shopify / Wix / Etsy /
+//     More (WooCommerce, Squarespace, custom builders) — one deep pipeline.
+//   • PRODUCT-LEVEL niche verification (3+ matching products from the LIVE
+//     catalog, never just the page title): Shopify /products.json, Wix real
+//     product pages + sitemap, Etsy shop listing slugs, WooCommerce store API.
+//   • Strict social search: pick Facebook and you get Facebook-only results,
+//     exact count, dead pages proven dead (page-plugin + mbasic checks).
+//   • AUTO-CONTINUE: a hunt that runs out of its 40s budget now wakes itself
+//     up (self-webhook) and keeps going — progress messages, no pings needed.
+//   • ANTI-BLOCK: UA rotation, retry/backoff, captcha/403/429 detection;
+//     blocked candidates are retried instead of silently counted as dead.
+//   • /newuk fixed: default count 100, strict client-side date-range match,
+//     🌐 has-website / 🕸 no-website toggle with full site verification for
+//     brand-new UK companies that already have a site.
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*')
-  const REQ_HOST = (req.headers && req.headers.host) || ''
-  if (req.method === 'GET' && !(req.url || '').includes('cont=')) return res.status(200).send('OK')
+  if (req.method === 'GET') return res.status(200).send('OK')
 
   const BOT_TOKEN = process.env.SCRAPER_BOT_TOKEN || ''
   const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL   || ''
@@ -47,200 +49,15 @@ module.exports = async (req, res) => {
   const BATCH_SIZE  = 8
   const CONCURRENCY = 4
 
-  // ── STRICT PRODUCT-LEVEL NICHE VERIFICATION ──
-  // The old niche presets only matched niche words in the PAGE TITLE — so a
-  // cosmetics store called "Aurora Boutique" (no "cosmetic" anywhere in its
-  // title) was invisible, and a title like "Beauty Blog" could slip through
-  // without selling a single product. From now on EVERY niche search:
-  //   1. pulls the store's LIVE catalog (products.json on Shopify, the
-  //      platform's product API or sitemap elsewhere),
-  //   2. counts products whose title / tags / type / vendor / description
-  //      genuinely match the niche keywords,
-  //   3. only lets the store through with NICHE_MIN_PRODUCTS+ real matches.
-  const NICHE_MIN_PRODUCTS = parseInt(process.env.NICHE_MIN_PRODUCTS || '3') || 3
-  const NICHE_KEYWORDS = {
-    skincare_beauty: { label: '🧴 Skincare/beauty', kw: [
-      'skincare', 'skin care', 'beauty', 'cosmetic', 'makeup', 'serum', 'moisturizer', 'moisturiser',
-      'cleanser', 'face cream', 'face oil', 'face mask', 'eye cream', 'night cream', 'lip balm',
-      'lipstick', 'lip gloss', 'mascara', 'eyeliner', 'eyeshadow', 'foundation', 'concealer', 'blush',
-      'highlighter', 'toner', 'sunscreen', 'spf', 'shampoo', 'conditioner', 'hair oil', 'hair mask',
-      'body lotion', 'body oil', 'body scrub', 'body butter', 'sheet mask', 'clay mask', 'bath bomb',
-      'bath salt', 'nail polish', 'gel nails', 'press on nails', 'perfume', 'fragrance', 'eau de',
-      'beard oil', 'glycolic', 'retinol', 'niacinamide', 'hyaluronic', 'salicylic', 'vitamin c serum',
-      'rose water', 'toner pads', 'pimple patch', 'under eye', 'candle soap', 'soap bar', 'grooming kit' ] },
-    jewelry: { label: '💎 Jewelry', kw: [
-      'jewelry', 'jewellery', 'necklace', 'bracelet', 'earring', 'anklet', 'pendant', 'charm',
-      'ring sizer', 'gold filled', 'sterling silver', 'stainless steel', 'birthstone', 'cuban link',
-      'tennis chain', 'initial necklace', 'name necklace', 'beaded', 'hoops', 'hoop earrings',
-      'locket', 'brooch', 'cuff bracelet', 'signet', 'engagement ring', 'eternity band', 'jewel',
-      '18k', '14k', '925', 'ear stack', 'cartilage', 'nose ring', 'toe ring', 'charms' ] },
-    pet: { label: '🐾 Pet products', kw: [
-      'dog', 'puppy', 'cat', 'kitten', 'pet bed', 'leash', 'collar', 'harness', 'dog toy', 'cat toy',
-      'catnip', 'scratching post', 'litter box', 'cat litter', 'aquarium', 'bird cage', 'bird feeder',
-      'hamster', 'guinea pig', 'grooming brush', 'dog treat', 'cat treat', 'chew toy', 'paw balm',
-      'kennel', 'crate mat', 'squeaky', 'fish tank', 'dog bowl', 'cat bowl', 'slow feeder', 'pet carrier',
-      'poo bag', 'poop bag', 'dog bandana', 'dog jacket', 'puppy pad', 'pet fountain', 'cat tree',
-      'nail clipper', 'dog shampoo', 'pet tag', 'dog tag', 'rawhide', 'saddle' ] },
-    fashion_clothing: { label: '👗 Fashion/clothing', kw: [
-      'dress', 'hoodie', 'sweatshirt', 't-shirt', 'tshirt', 'crop top', 'jacket', 'coat', 'puffer',
-      'jeans', 'denim', 'trousers', 'leggings', 'skirt', 'blouse', 'shirt', 'jumpsuit', 'playsuit',
-      'activewear', 'loungewear', 'pyjama', 'pajama', 'sleepwear', 'swimwear', 'bikini', 'lingerie',
-      'socks', 'scarf', 'beanie', 'sneaker', 'sandal', 'boots', 'heels', 'loafers', 'flats',
-      'apparel', 'clothing', 'outfit', 'cardigan', 'knitwear', 'sweater', 'jogger', 'shorts',
-      'tracksuit', 'corset', 'abaya', 'kaftan', 'kimono', 'bodysuit', 'cargo pants', 'flannel',
-      'oversized tee', 'graphic tee', 'streetwear', 'tie dye', 'embroidered', 'velvet', 'satin dress' ] },
-    fitness_health: { label: '🏋️ Fitness/health', kw: [
-      'fitness', 'gym', 'workout', 'dumbbell', 'kettlebell', 'resistance band', 'yoga mat', 'yoga block',
-      'protein powder', 'supplement', 'vitamin', 'creatine', 'pre workout', 'whey', 'shaker',
-      'foam roller', 'massage gun', 'sauna blanket', 'ice bath', 'jump rope', 'ankle weights',
-      'hip band', 'glute band', 'posture corrector', 'electrolyte', 'collagen', 'greens powder',
-      'recovery', 'muscle rub', 'kinesiology', 'weightlifting', 'deadlift', 'pilates ring', 'core slider',
-      'protein bar', 'protein snack', 'meal prep', 'body scale', 'smart scale' ] },
-    home_living: { label: '🏠 Home/living', kw: [
-      'candle', 'diffuser', 'vase', 'throw pillow', 'cushion', 'blanket', 'throw rug', 'area rug',
-      'curtain', 'wall art', 'wall print', 'poster', 'table lamp', 'floor lamp', 'mirror', 'shelf',
-      'planter', 'plant pot', 'ceramic mug', 'dinnerware', 'cutlery', 'cookware', 'frying pan',
-      'bedding', 'duvet cover', 'pillowcase', 'towel', 'storage box', 'organizer', 'organiser',
-      'incense', 'room spray', 'linen spray', 'reed diffuser', 'tealight', 'wax melt', 'doormat',
-      'coat rack', 'key holder', 'side table', 'coffee mug', 'serving tray', 'coaster set',
-      'picture frame', 'photo frame', 'clock', 'bookend', 'decor' ] },
-    kids_baby: { label: '🧒 Kids/baby', kw: [
-      'baby', 'infant', 'toddler', 'kids', 'children', 'nursery', 'bib', 'onesie', 'romper',
-      'stroller', 'pram', 'crib', 'cot sheet', 'baby carrier', 'baby monitor', 'teether',
-      'teething', 'pacifier', 'dummy clip', 'diaper bag', 'nappy', 'baby wipes', 'baby blanket',
-      'muslin', 'swaddle', 'kids toy', 'wooden toy', 'montessori', 'playmat', 'play mat',
-      'feeding bottle', 'sippy cup', 'highchair', 'high chair', 'baby gift', 'baby shower',
-      'kids backpack', 'lunch box', 'kids pajamas', 'growth chart', 'sensory' ] },
-    tech_gadgets: { label: '📱 Tech/gadgets', kw: [
-      'phone case', 'laptop sleeve', 'laptop stand', 'charger', 'charging cable', 'fast charger',
-      'earbuds', 'headphones', 'bluetooth speaker', 'power bank', 'wireless charger', 'magsafe',
-      'smart watch', 'smartwatch', 'fitness tracker', 'ring light', 'tripod', 'gimbal',
-      'microphone', 'webcam', 'usb hub', 'adapter', 'screen protector', 'mechanical keyboard',
-      'keycap', 'mouse pad', 'desk mat', 'gaming', 'controller', 'drone', 'selfie stick',
-      'car mount', 'tablet stand', 'monitor arm', 'cable organizer', 'cctv', 'doorbell camera',
-      'projector', 'led strip', 'rgb light', 'usb c' ] },
-    food_drink: { label: '🍫 Food/drink', kw: [
-      'hot sauce', 'seasoning', 'spice blend', 'spice rub', 'coffee beans', 'ground coffee',
-      'espresso', 'instant coffee', 'tea', 'matcha', 'chai', 'herbal tea', 'loose leaf',
-      'honey', 'jam', 'marmalade', 'chutney', 'granola', 'cereal', 'protein snack', 'chocolate',
-      'truffle', 'brownie', 'cookie box', 'syrup', 'snack box', 'gift hamper', 'olive oil',
-      'balsamic', 'pasta sauce', 'salsa', 'marinade', 'baking mix', 'superfood', 'seaweed',
-      'dried fruit', 'nuts gift', 'cocoa', 'hot chocolate', 'sugar free', 'vegan snack' ] },
-  }
-  // Build one case-insensitive regex per niche once (word-boundary safe: \bring\b
-  // won't fire on "engineering", and an optional trailing "s" covers plurals).
-  const NICHE_REGEXES = {}
-  for (const [key, def] of Object.entries(NICHE_KEYWORDS)) {
-    const parts = def.kw.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + (k.endsWith('s') ? '' : 's?'))
-    NICHE_REGEXES[key] = new RegExp('(?:\\b|\\s)' + '(?:' + parts.join('|') + ')', 'i')
-  }
-  // A preset can pin its niche ("niche: 'jewelry'"); custom / platform searches
-  // get the niche picked from the 🧪 product-check question, or derived from the
-  // typed urlscan query itself (page.title:(skincare OR beauty) -> skincare).
-  function nicheFromQuery(query) {
-    const q = String(query || '').toLowerCase()
-    let best = null, bestHits = 0
-    for (const [key, def] of Object.entries(NICHE_KEYWORDS)) {
-      // word-boundary match so a bare "page.title:pet" still maps to the pet
-      // niche, but "page.title:tapete" doesn't
-      const hits = def.kw.filter(k => new RegExp('(?:^|[^a-z])' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:[^a-z]|$)', 'i').test(q)).length
-      if (hits > bestHits) { best = key; bestHits = hits }
-    }
-    return bestHits ? best : null
-  }
-  function nicheLabel(key) { return NICHE_KEYWORDS[key] ? NICHE_KEYWORDS[key].label : (key || 'any') }
-
-  // ── ONLINE STORE PLATFORMS (the 🛍 Online stores picker) ──
-  // Every platform runs the SAME deep product-check pipeline as Shopify: pull
-  // the live catalog, count products matching the niche, 3+ or it doesn't count.
-  // urlscan's index is what discovers candidate stores, so only platforms with
-  // a recognisable domain in the index are directly searchable; WooCommerce
-  // stores live on custom domains and are checked through the paste-a-list flow
-  // (or /scoutlist) with the exact same product verification.
-  const STORE_PLATFORMS = {
-    shopify:     { label: '🟢 Shopify',     query: 'page.domain:myshopify.com' },
-    etsy:        { label: '🟣 Etsy shops',  query: 'page.domain:etsy.com AND page.url:"/shop/"' },
-    wix:         { label: '🔵 Wix',         query: 'page.domain:wixsite.com' },
-    squarespace: { label: '⬛ Squarespace', query: 'page.domain:squarespace.com' },
-    bigcartel:   { label: '🟠 Big Cartel',  query: 'page.domain:bigcartel.com' },
-    webflow:     { label: '🌐 Webflow',     query: 'page.domain:webflow.io' },
-    any:         { label: '🧩 Any store platform',
-                   query: 'page.domain:myshopify.com OR page.domain:wixsite.com OR page.domain:squarespace.com OR page.domain:bigcartel.com OR page.domain:webflow.io' },
-  }
-  function platformPickerKeyboard() {
-    return [
-      [{ text: '🟢 Shopify', callback_data: 'scoutplat:shopify' },
-       { text: '🟣 Etsy shops', callback_data: 'scoutplat:etsy' }],
-      [{ text: '🔵 Wix', callback_data: 'scoutplat:wix' },
-       { text: '⬛ Squarespace', callback_data: 'scoutplat:squarespace' }],
-      [{ text: '🟠 Big Cartel', callback_data: 'scoutplat:bigcartel' },
-       { text: '🌐 Webflow', callback_data: 'scoutplat:webflow' }],
-      [{ text: '🧩 Any store platform', callback_data: 'scoutplat:any' },
-       { text: '🔌 WooCommerce (paste links)', callback_data: 'scoutplat:woocommerce' }],
-      [{ text: '⬅️ Back to searches', callback_data: 'scoutplatback' }]
-    ]
-  }
-  // 🧪 niche pick for the strict product check — shown after the lead count on
-  // every platform run. "any" still verifies a real catalog (3+ products).
-  function nichePickerKeyboard() {
-    const row = (a, b) => [{ text: NICHE_KEYWORDS[a].label, callback_data: `scoutniche:${a}` },
-                           ...(b ? [{ text: NICHE_KEYWORDS[b].label, callback_data: `scoutniche:${b}` }] : [])]
-    return [
-      row('skincare_beauty', 'jewelry'),
-      row('pet', 'fashion_clothing'),
-      row('fitness_health', 'home_living'),
-      row('kids_baby', 'tech_gadgets'),
-      row('food_drink', null),
-      [{ text: '🛍 Any products (still catalog-verified)', callback_data: 'scoutniche:any' }]
-    ]
-  }
-
   const SAVED_SEARCHES = {
-    '1': { label: '🛍️ All Shopify stores (newest first)', query: 'page.domain:myshopify.com' },
-    '2': { label: '🧴 Skincare/beauty — product-verified',  query: 'page.domain:myshopify.com', niche: 'skincare_beauty' },
-    '3': { label: '💎 Jewelry — product-verified',          query: 'page.domain:myshopify.com', niche: 'jewelry' },
-    '4': { label: '🐾 Pet products — product-verified',     query: 'page.domain:myshopify.com', niche: 'pet' },
-    '5': { label: '👗 Fashion/clothing — product-verified', query: 'page.domain:myshopify.com', niche: 'fashion_clothing' },
-  }
-
-
-  // ── v8 single-file merge helpers ────────────────────────────────────
-  const sleep = ms => new Promise(r => setTimeout(r, ms))
-  // One invocation's checking budget. The webhook still answers Telegram in
-  // time; anything left over continues on a fresh self-invoked hop (v8).
-  const SCOUT_BUDGET_MS = Math.min(Math.max(parseInt(process.env.SCOUT_BUDGET_MS || '45000') || 45000, 15000), 50000)
-  const MAX_AUTO_ROUNDS = Math.min(parseInt(process.env.MAX_AUTO_ROUNDS || '30') || 30, 60)
-  // Legacy niche labels — /others + audit lines from earlier runs still use them.
-  const NICHE_LABELS = { beauty: 'Skincare/Beauty', jewelry: 'Jewelry', pet: 'Pet products', fashion: 'Fashion/Clothing' }
-  // Seen-memory: only a PROVEN reject blocks a re-check.
-  //   status !== 'OK'    → site proven dead → skip forever
-  //   nicheOk === false  → catalog was READ and failed the niche gate → skip
-  //   socialOk === false → required social link found and PROVEN dead → skip
-  //   null fields (catalog unreadable / link behind a bot wall) → the store is
-  //     RE-CHECKED on later runs. This fixes the "checked 336, got 0, and every
-  //     re-run checked nothing new because the pool was burned" trap.
-  function seenSkips(s) {
-    if (!s || typeof s !== 'object') return false
-    if (s.status && s.status !== 'OK') return true
-    if (s.nicheOk === false) return true
-    if (s.socialOk === false) return true
-    return false
-  }
-  // Signature for the self-continue endpoint: sha256(userId + bot token) —
-  // only the bot itself can kick the chain, nobody from outside.
-  function contSig(userId) {
-    return crypto.createHash('sha256').update(String(userId) + '::' + BOT_TOKEN + '::cont').digest('hex').slice(0, 32)
-  }
-  // Fire-and-forget self-kick: dispatched BEFORE this invocation answers, so
-  // the request leaves the machine even though the reply is never awaited.
-  function fireSelfContinue(userId, mode) {
-    try {
-      const base = (process.env.SELF_BASE_URL || `https://${REQ_HOST || 'localhost'}/api/scraper_bot`).replace(/\/+$/, '')
-      const url = `${base}?cont=${encodeURIComponent(String(userId))}&mode=${encodeURIComponent(mode || 'scout')}&sig=${contSig(userId)}`
-      const p = fetch(url, { signal: AbortSignal.timeout(15000) })
-      if (p && p.catch) p.catch(() => {})
-      return true
-    } catch { return false }
+    '1': { label: 'All Shopify stores (newest first)', query: 'page.domain:myshopify.com' },
+    '2': { label: 'Skincare/beauty niche',            query: 'page.domain:myshopify.com AND page.title:(skincare OR beauty OR cosmetics)' },
+    '3': { label: 'Jewelry niche',                     query: 'page.domain:myshopify.com AND page.title:(jewelry OR jewellery)' },
+    '4': { label: 'Pet products niche',                query: 'page.domain:myshopify.com AND page.title:(pet OR pets OR dog OR cat)' },
+    '5': { label: 'Fashion/clothing niche',             query: 'page.domain:myshopify.com AND page.title:(fashion OR clothing OR apparel)' },
+    '6': { label: 'Toys & games niche',                 query: 'page.domain:myshopify.com AND page.title:(toys OR games OR puzzle)' },
+    '7': { label: 'Home & decor niche',                 query: 'page.domain:myshopify.com AND page.title:(home OR decor OR furniture OR candle)' },
+    '8': { label: 'Electronics/gadgets niche',          query: 'page.domain:myshopify.com AND page.title:(electronics OR gadgets OR tech)' },
   }
 
   // ── /scout month picker — limits the search to one calendar month using
@@ -317,11 +134,192 @@ module.exports = async (req, res) => {
     return ''
   }
 
+  // ════════════════════════════════════════════════════════════════
+  //  v8 CORE — platform picker, product-level niche proof, anti-block,
+  //  auto-continue. Everything below is used by the scout pipeline.
+  // ════════════════════════════════════════════════════════════════
+
+  // Platforms selectable in 🏬 Online Stores. `domain` is the urlscan clause
+  // swapped into saved-search queries; the deep check per platform lives in
+  // deepNicheCheck() below.
+  const PLATFORMS = {
+    shopify: { key: 'shopify', name: 'Shopify', emoji: '🛍️', domain: 'page.domain:myshopify.com',
+      desc: 'Every candidate is checked against its LIVE /products.json catalog — a lead only counts when 3+ real products match your niche.' },
+    wix:     { key: 'wix', name: 'Wix', emoji: '🧩', domain: 'page.domain:wixsite.com',
+      desc: 'Wix has no public products.json — I find each store\'s real product pages (links + sitemap) and match them. 3+ required.' },
+    etsy:    { key: 'etsy', name: 'Etsy', emoji: '🧵', domain: 'page.domain:etsy.com',
+      desc: 'Shop pages are fetched live and listing titles matched against your niche — 3+ real listings required.' },
+    more:    { key: 'more', name: 'More platforms', emoji: '➕', domain: null,
+      desc: 'Any builder — WooCommerce (live store API), Squarespace, BigCommerce, custom shops. The search widens beyond one platform\'s domain and the product-level check auto-detects each store\'s catalog.' },
+    all:     { key: 'all', name: 'All platforms', emoji: '🌐', domain: '(page.domain:myshopify.com OR page.domain:wixsite.com OR page.domain:etsy.com)',
+      desc: 'A mix of Shopify, Wix and Etsy candidates — each one verified with its own platform check.' },
+  }
+  async function getScoutPlatform(userId) {
+    try {
+      const { result } = await redis('GET', `scout:platform:${userId}`)
+      return (result && PLATFORMS[result]) ? result : 'shopify'
+    } catch { return 'shopify' }
+  }
+  async function setScoutPlatform(userId, key) {
+    try { await redis('SET', `scout:platform:${userId}`, PLATFORMS[key] ? key : 'shopify', 'EX', 2592000) } catch {}
+  }
+  // Swap the platform domain clause into a saved-search query. Shopify is the
+  // native shape (queries are written for myshopify.com); everything else
+  // rewrites the domain clause so the SAME niche filters apply. 'More'
+  // (domain: null) drops the domain clause entirely — candidates come from
+  // ANY builder and the product check auto-detects each store's catalog.
+  function buildPlatformQuery(query, platform) {
+    const p = PLATFORMS[platform] || PLATFORMS.shopify
+    if (!query || !query.includes('page.domain:myshopify.com')) return query
+    if (!p.domain) return query.replace(/page\.domain:myshopify\.com\s+AND\s+/g, '')
+    return query.replace(/page\.domain:myshopify\.com/g, p.domain)
+  }
+
+  // ── Niche terms from a urlscan query: every (a OR b OR c) group and every
+  // bare page.title: word becomes a match-group. A product counts as matching
+  // when ANY word of ANY group appears in its live catalog data.
+  function extractNicheTerms(query) {
+    const q = String(query || '')
+    const groups = []
+    let m
+    const groupRe = /\(([^()]*?)\)/g
+    while ((m = groupRe.exec(q))) {
+      if (!/\s+OR\s+/i.test(m[1])) continue
+      const words = m[1].split(/\s+OR\s+/i).map(s => s.trim().toLowerCase().replace(/["*]/g, ''))
+        .filter(s => /^[a-z][a-z '&-]{1,29}$/.test(s))
+      if (words.length) groups.push(words)
+    }
+    const titleRe = /page\.title:(\S+)/gi
+    while ((m = titleRe.exec(q))) {
+      const w = m[1].toLowerCase().replace(/["*()]/g, '')
+      if (/^[a-z][a-z-]{1,20}$/.test(w) && !groups.some(g => g.includes(w))) groups.push([w])
+    }
+    return groups
+  }
+  function wordVariants(w) {
+    const v = [w]
+    if (w.endsWith('y') && w.length > 3) v.push(w.slice(0, -1) + 'ies')
+    v.push(w + 's', w + 'es')
+    if (w === 'jewelry') v.push('jewellery', 'jewel')
+    if (w === 'jewellery') v.push('jewelry', 'jewel')
+    if (w === 'clothing') v.push('clothes')
+    if (w === 'pet') v.push('pets', 'dog', 'cat', 'puppy')
+    if (w === 'decor') v.push('decoration', 'decorations')
+    return v
+  }
+  function groupMatchesText(words, text) {
+    const t = String(text || '').toLowerCase()
+    if (!t) return false
+    return words.some(w => wordVariants(w).some(v => t.includes(v)))
+  }
+
+  // A lead is a niche hit only with NICHE_MATCH_MIN+ matching products from
+  // the live catalog — a matching page title alone is NOT enough.
+  const NICHE_MATCH_MIN = 3
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
+
+  // ── ANTI-BLOCK fetch: rotating UAs, one retry with backoff, and explicit
+  // detection of 403/429/503 + captcha/challenge pages. Used for every
+  // storefront, catalog and social check so a block is SEEN and retried,
+  // not silently mistaken for a dead lead.
+  const ROTATING_UAS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+  ]
+  const BLOCK_PATTERNS = /just a moment|attention required|challenge-platform|cf-browser-verification|captcha|access denied|unusual traffic|rate limit|too many requests/i
+  async function blockAwareFetch(url, opts = {}) {
+    const timeout = opts.timeout || 6000
+    const out = { ok: false, status: 0, blocked: false, html: '', json: null, finalUrl: url }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const ua = ROTATING_UAS[(attempt + Math.floor(Math.random() * ROTATING_UAS.length)) % ROTATING_UAS.length]
+        const r = await fetch(url, {
+          redirect: 'follow', signal: AbortSignal.timeout(timeout),
+          headers: { 'User-Agent': ua, 'Accept': 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' }
+        })
+        out.status = r.status
+        out.finalUrl = r.url || url
+        if ([429, 503].includes(r.status)) {
+          // Rate-limited by the origin — retry after backoff.
+          out.blocked = true
+        } else if ([200, 401, 403].includes(r.status)) {
+          // 200 = live page; 401/403 = often a Shopify/Wix password page or a
+          // bot-protected site that is STILL a real business (the original
+          // pipeline treated these as valid leads and that must not regress).
+          // But a 403 carrying a captcha/challenge body IS a block — retry.
+          const body = await r.text()
+          if (BLOCK_PATTERNS.test(body.slice(0, 4000))) {
+            out.blocked = true
+          } else {
+            out.ok = true
+            out.html = body
+            if (opts.json) { try { out.json = JSON.parse(body) } catch {} }
+          }
+        } else if (r.ok) {
+          // other 2xx
+          const body = await r.text()
+          out.ok = true
+          out.html = body
+          if (opts.json) { try { out.json = JSON.parse(body) } catch {} }
+        }
+        if (out.ok || out.status === 404 || out.status === 410) break
+      } catch (e) {
+        out.blocked = true   // timeout / network error — retryable, not proof of dead
+      }
+      if (attempt === 0) await sleep(1200 + Math.floor(Math.random() * 900))
+    }
+    return out
+  }
+
+  // ── AUTO-CONTINUE: keep hunting without the user sending anything. When a
+  // run hits its 40s budget with work still pending, we POST to our own
+  // webhook with an auto_wake marker; the next invocation resumes the saved
+  // queue exactly where this one stopped. Bounded by wake:runs (15 rounds
+  // ≈ 12+ minutes) so it can never loop forever.
+  async function scheduleAutoWake(chatId, userId, reason) {
+    try {
+      const { result: runs } = await redis('GET', `wake:runs:${userId}`)
+      const n = parseInt(runs || '0', 10) || 0
+      if (n >= 15) return false
+      await redis('SET', `wake:runs:${userId}`, String(n + 1), 'EX', 900)
+      const proto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim()
+      const host = req.headers['x-forwarded-host'] || req.headers.host || ''
+      const path = String(req.url || '/api/scraper_bot.js').split('?')[0]
+      const selfUrl = process.env.SCRAPER_SELF_URL || (host ? `${proto}://${host}${path}` : '')
+      if (!selfUrl) return false
+      fetch(selfUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-bot-wake': '1' },
+        body: JSON.stringify({ auto_wake: true, chat_id: chatId, user_id: userId, reason, ts: Date.now() })
+      }).catch(() => {})
+      return true
+    } catch { return false }
+  }
+
   const LEAD_STATUSES = ['new', 'contacted', 'replied', 'interested', 'not_interested', 'do_not_contact', 'client']
 
-  let body = req.body || {}
+  let body = req.body
   if (typeof body === 'string') { try { body = JSON.parse(body) } catch { return res.status(200).send('OK') } }
   if (!body) return res.status(200).send('OK')
+
+  // ── AUTO-WAKE ENTRY: a continuation ping we scheduled ourselves. It arrives
+  // as a bare JSON body (not a Telegram update), so we synthesize a /continue
+  // message from the saved chat/user ids and let the normal resume logic run.
+  // The 2s delay lets the previous invocation release its per-user lock.
+  const isAutoWake = !!(body.auto_wake && body.user_id && body.chat_id)
+  if (isAutoWake) {
+    await sleep(2000)
+    body = {
+      message: {
+        chat: { id: body.chat_id },
+        from: { id: body.user_id, is_bot: false, first_name: 'Auto-continue' },
+        text: '/continue'
+      }
+    }
+  }
 
   async function answerCallback(callbackQueryId) {
     try {
@@ -435,7 +433,7 @@ module.exports = async (req, res) => {
   function activeFlowFlags(q) {
     return !!(q && (q.awaitingReviewCap || q.awaitingCompanyList || q.awaitingMessages ||
       q.awaitingCustomQuery || q.awaitingLeadCount || q.awaitingLockedFilter ||
-      q.awaitingScoutAgeGate || q.awaitingNewukArgs || q.awaitingNewukRange || q.awaitingNewukSite ||
+      q.awaitingScoutAgeGate ||
       q.awaitingCustomDate || q.awaitingSocialFilter || q.awaitingHuntUrl || q.wizard || q.answeringGift))
   }
 
@@ -1101,14 +1099,12 @@ module.exports = async (req, res) => {
 
   const SOCIAL_HOSTS = {
     facebook: ['facebook.com'], instagram: ['instagram.com'],
-    x: ['x.com', 'twitter.com'], linkedin: ['linkedin.com'],
-    tiktok: ['tiktok.com'], youtube: ['youtube.com'], pinterest: ['pinterest.com', 'pin.it']
+    x: ['x.com', 'twitter.com'], linkedin: ['linkedin.com']
   }
   const SOCIAL_PLACEHOLDERS = new Set([
     'shopify', 'shopifyplus', 'shopifydevelopers', 'yourstore', 'yourbrand',
     'username', 'yourusername', 'example', 'examples', 'test', 'testing',
-    'facebook', 'instagram', 'twitter', 'x', 'linkedin', 'tiktok', 'youtube',
-    'pinterest', 'home', 'login', 'pages', 'groups', 'events', 'watch', 'gaming'
+    'facebook', 'instagram', 'twitter', 'x', 'linkedin', 'home', 'login'
   ])
   function normalizeSocialUrl(platform, raw) {
     try {
@@ -1119,16 +1115,6 @@ module.exports = async (req, res) => {
       if (platform === 'linkedin') {
         if (!['company', 'in'].includes((parts[0] || '').toLowerCase()) || !parts[1]) return null
         if (SOCIAL_PLACEHOLDERS.has(parts[1].toLowerCase())) return null
-      } else if (platform === 'youtube') {
-        // youtube.com/@handle, /c/name, /channel/ID, /user/name
-        const first = (parts[0] || '').toLowerCase()
-        if (first.startsWith('@') && parts[0].length > 1) return `https://youtube.com/${parts[0]}`
-        if (['c', 'channel', 'user'].includes(first) && parts[1]) return `https://youtube.com/${first}/${parts[1]}`
-        return null
-      } else if (platform === 'tiktok') {
-        if (parts.length !== 1 || !parts[0]) return null
-        if (SOCIAL_PLACEHOLDERS.has(parts[0].toLowerCase())) return null
-        if (['discover', 'tag', 'music', 'video', 'embed', 'foryou'].includes(parts[0].toLowerCase())) return null
       } else {
         if (parts.length !== 1 || !/^[a-zA-Z0-9_.-]+$/.test(parts[0])) return null
         if (SOCIAL_PLACEHOLDERS.has(parts[0].toLowerCase())) return null
@@ -1144,9 +1130,6 @@ module.exports = async (req, res) => {
       instagram: /https?:\/\/(?:www\.)?instagram\.com\/[a-zA-Z0-9_.\-]+/gi,
       x:         /https?:\/\/(?:www\.|mobile\.)?(?:twitter|x)\.com\/[a-zA-Z0-9_.\-]+/gi,
       linkedin:  /https?:\/\/(?:www\.)?linkedin\.com\/(?:company|in)\/[a-zA-Z0-9_.\-]+/gi,
-      tiktok:    /https?:\/\/(?:www\.)?tiktok\.com\/@[a-zA-Z0-9_.\-]+/gi,
-      youtube:   /https?:\/\/(?:www\.)?youtube\.com\/(?:@[a-zA-Z0-9_.\-]+|(?:c|channel|user)\/[a-zA-Z0-9_.\-]+)/gi,
-      pinterest: /https?:\/\/(?:www\.)?pinterest\.(?:com|co\.uk|de|fr)\/[a-zA-Z0-9_.\-]+/gi,
     }
     for (const [key, pat] of Object.entries(patterns)) {
       for (const m of text.match(pat) || []) {
@@ -1156,291 +1139,63 @@ module.exports = async (req, res) => {
     }
     return socials
   }
-  // STRICT liveness proof. A link only counts when the platform itself says the
-  // account/page EXISTS: a live 404/410, a redirect to a sign-up/login wall with
-  // no account behind it, or a platform "not found / suspended" page is DEAD and
-  // never counted. Soft blocks (403/429 bot walls) are retried once with a
-  // plain browser UA; only links that survive get kept.
-  const SOCIAL_DEAD_BODIES = new RegExp([
-    'page (?:isn.t|is not) available', "page isn.t available", 'this account doesn.?t exist',
-    'this page (?:could not|couldn.t) be found', 'profile (?:does not|doesn.t) exist',
-    'account (?:has been )?suspended', 'this content isn.t available right now',
-    'hmm\\.\\.\\.this page doesn.t exist', 'sorry, this page isn.t available',
-    'couldn.t find this account', 'this tiktok can.t be displayed', 'user (?:was )?not found',
-    'page not found', 'this shop is currently unavailable', 'the account you are looking for'
-  ].join('|'), 'i')
+  // A live 404, a platform "not found" page, or a redirect back to Shopify is
+  // definite proof of a bad link. Network blocks (403/429/timeouts) are not
+  // treated as proof that a real account is fake; the cleaned link is kept.
+  // v8 Facebook: the plain fetch almost always hits a login wall, so dead FB
+  // pages used to slip through. We now prove death with mbasic (real pages
+  // answer 200 without login; fake ones 404) and the Page Plugin endpoint
+  // (renders real public pages; says "page isn't available" for dead ones).
+  async function validateFacebookUrl(url) {
+    try {
+      const mb = url.replace('//www.facebook.com', '//mbasic.facebook.com').replace('//facebook.com', '//mbasic.facebook.com')
+      const r = await fetch(mb, {
+        redirect: 'follow', signal: AbortSignal.timeout(5000),
+        headers: { 'User-Agent': ROTATING_UAS[2] }
+      })
+      if ([404, 410].includes(r.status)) return false
+      if (r.ok) {
+        const body = (await r.text()).slice(0, 150000).toLowerCase()
+        if (/page (?:isn't|is not) available|this content isn.?t available|content not found|page not found/.test(body)) return false
+        if (!/log ?in|you must log/.test(body) || body.length > 3000) return true
+      }
+    } catch {}
+    try {
+      const plugin = 'https://www.facebook.com/plugins/page.php?href=' + encodeURIComponent(url) + '&tabs=false&small_header=false'
+      const r = await fetch(plugin, {
+        redirect: 'follow', signal: AbortSignal.timeout(5000),
+        headers: { 'User-Agent': ROTATING_UAS[0] }
+      })
+      if (!r.ok) return true   // can't prove death — keep the link (lenient)
+      const body = (await r.text()).slice(0, 150000)
+      if (/page (?:isn't|is not) available|content not found|content isn.?t available|page not found/i.test(body)) return false
+      return true
+    } catch { return true }
+  }
   async function validateSocialUrl(platform, url) {
-    const attempt = async (ua) => {
+    if (platform === 'facebook') return validateFacebookUrl(url)
+    try {
       const r = await fetch(url, {
-        redirect: 'follow', signal: AbortSignal.timeout(8000),
-        headers: { 'User-Agent': ua, 'Accept-Language': 'en-US,en;q=0.9' }
+        redirect: 'follow', signal: AbortSignal.timeout(4500),
+        headers: { 'User-Agent': ROTATING_UAS[Math.floor(Math.random() * ROTATING_UAS.length)] }
       })
       const finalHost = new URL(r.url || url).hostname.toLowerCase().replace(/^(www|m|mobile)\./, '')
-      return { r, finalHost }
-    }
-    const uas = [
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
-      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile Safari/604.1'
-    ]
-    for (let i = 0; i < uas.length; i++) {
-      let r, finalHost
-      try {
-        ({ r, finalHost } = await attempt(uas[i]))
-      } catch (e) {
-        if (i < uas.length - 1) continue
-        break   // unreachable on BOTH attempts — try the Facebook fallback below
-      }
-      if (!SOCIAL_HOSTS[platform].includes(finalHost)) return 'dead'   // bounced off-platform (login wall / removed)
-      if ([404, 410].includes(r.status)) return 'dead'
-      // Soft-block statuses MIGHT be a real page behind a bot wall — retry with
-      // the other UA before deciding.
-      if ([401, 403, 429, 999, 503].includes(r.status) && i < uas.length - 1) continue
-      if ([401, 403, 429, 999].includes(r.status)) return 'live'   // real page, bot-walled
-      if (!r.ok) return 'blocked'
-      const body = (await r.text().catch(() => '')).slice(0, 250000)
-      if (SOCIAL_DEAD_BODIES.test(body)) return 'dead'
-      return 'live'
-    }
-    // Facebook fallback (v8): facebook.com often refuses direct datacenter
-    // fetches even when the PAGE exists — this is what silently killed every
-    // "strict facebook" search before. The public Page plugin endpoint works
-    // without login, so it can still PROVE a page is live. Strictness kept:
-    // only positive proof counts as live; a proven-missing page is dead; an
-    // ambiguous answer stays 'blocked' (re-checkable, never burned).
-    if (platform === 'facebook') {
-      try {
-        const u2 = `https://www.facebook.com/plugins/page.php?href=${encodeURIComponent(url)}&tabs=timeline`
-        const r2 = await fetch(u2, { signal: AbortSignal.timeout(8000), headers: { 'User-Agent': uas[0], 'Accept-Language': 'en-US,en;q=0.9' } })
-        if (r2.ok) {
-          const b2 = (await r2.text().catch(() => '')).slice(0, 300000)
-          if (/content not found|page not found|isn't available|cannot be displayed|error while rendering/i.test(b2)) return 'dead'
-          if (b2.length > 800) return 'live'
-        }
-      } catch { /* stay unproven */ }
-    }
-    return 'blocked'
+      if (!SOCIAL_HOSTS[platform].includes(finalHost)) return false
+      if ([404, 410].includes(r.status)) return false
+      if ([401, 403, 429, 999].includes(r.status)) return true
+      if (!r.ok) return false
+      const body = (await r.text()).slice(0, 250000).toLowerCase()
+      if (/page (?:isn't|is not) available|this account doesn.?t exist|this page (?:could not|couldn't) be found|profile (?:does not|doesn't) exist/.test(body)) return false
+      return true
+    } catch { return true }
   }
-  // Rich social validation (v8): keeps the LIVE links and reports how many
-  // were proven dead vs unverifiable (blocked / login-walled / timeout), so
-  // the hunt can tell "this store has no facebook" apart from "facebook
-  // wouldn't let us check" — and only the PROVEN cases burn seen-memory.
-  async function validateSocialsRich(socials) {
+  async function validateSocials(socials) {
     const entries = Object.entries(socials || {})
-    let dead = 0, blocked = 0
-    const checked = await Promise.all(entries.map(async ([platform, url]) => {
-      let verdict = 'blocked'
-      try { verdict = await validateSocialUrl(platform, url) } catch { verdict = 'blocked' }
-      if (verdict === 'live') return [platform, url, true]
-      if (verdict === 'dead') dead++; else blocked++
-      return [platform, url, false]
-    }))
-    const valid = checked.filter(([, , ok]) => ok)
+    const checked = await Promise.all(entries.map(async ([platform, url]) =>
+      [platform, url, await validateSocialUrl(platform, url)]))
+    return checked.filter(([, , valid]) => valid)
       .reduce((out, [platform, url]) => { out[platform] = url; return out }, {})
-    return { valid, dead, blocked }
   }
-  // ══════════════════════════════════════════════════════════════════
-  //  DEEP PRODUCT CHECK — strict niche verification for EVERY platform
-  //  A store only counts as a niche lead when its LIVE catalog shows
-  //  NICHE_MIN_PRODUCTS+ products that actually match the niche.
-  // ══════════════════════════════════════════════════════════════════
-  const FETCH_UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36',
-                     'Accept': 'text/html,application/json,application/xhtml+xml,*/*;q=0.8',
-                     'Accept-Language': 'en-US,en;q=0.9' }
-  const FETCH_UAS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/604.1 Safari/604.1'
-  ]
-  // ANTI-BLOCK fetch (v8): 3 attempts with UA rotation and growing backoff.
-  // 403/429/503 and challenge pages get retried — a store's WAF reacting to
-  // the first hit is not a real "no". Only after all attempts fail does it
-  // return null, and callers record that as "unverifiable", not as a
-  // proven reject, so it never burns the seen-memory.
-  async function fetchPageText(url, timeoutMs = 8000) {
-    for (let i = 0; i < 3; i++) {
-      try {
-        const r = await fetch(url, { headers: { ...FETCH_UA, 'User-Agent': FETCH_UAS[i % FETCH_UAS.length] }, redirect: 'follow', signal: AbortSignal.timeout(timeoutMs) })
-        if ([403, 429, 503].includes(r.status) && i < 2) { await sleep(i ? 1800 : 700); continue }
-        if (!r.ok) return null
-        const body = await r.text()
-        if (/^Just a moment|Attention Required|cf-challenge|captcha/i.test(body.slice(0, 1200)) && i < 2) { await sleep(1200); continue }
-        return body
-      } catch (e) { if (i < 2) await sleep(i ? 1800 : 700) }
-    }
-    return null
-  }
-  function stripHtml(html) {
-    return String(html || '')
-      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/&[a-z#0-9]+;/gi, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-  }
-  // Shopify exposes its whole catalog publicly: /products.json (paginated at
-  // 250). Title + type + vendor + tags + description all get checked.
-  async function fetchShopifyProducts(base) {
-    const raw = await fetchPageText(`${base}/products.json?limit=250`, 6000)
-    if (!raw) return null
-    try {
-      const data = JSON.parse(raw)
-      if (!Array.isArray(data.products)) return null
-      return data.products.map(p => [
-        p.title || '', p.product_type || '', p.vendor || '',
-        Array.isArray(p.tags) ? p.tags.join(' ') : String(p.tags || ''),
-        stripHtml(p.body_html || '')
-      ].join(' ').slice(0, 600))
-    } catch { return null }
-  }
-  // WooCommerce/WordPress public Store API — no auth needed on standard shops.
-  async function fetchWooProducts(base) {
-    const raw = await fetchPageText(`${base}/wp-json/wc/store/v1/products?per_page=100`, 6000)
-      || await fetchPageText(`${base}/wp-json/wc/store/products?per_page=100`, 6000)
-    if (!raw) return null
-    try {
-      const data = JSON.parse(raw)
-      if (!Array.isArray(data)) return null
-      return data.map(p => [p.name || '', p.categories?.map(c => c.name).join(' ') || '',
-        stripHtml(p.description || ''), stripHtml(p.short_description || '')].join(' ').slice(0, 600))
-    } catch { return null }
-  }
-  // Generic catalog scrape for platforms without a public product API
-  // (Wix, Squarespace, Big Cartel, Webflow, custom sites): read sitemap.xml,
-  // pick product-looking URLs, fetch up to 8 of them in parallel and take
-  // each product page's own title + heading text as the product record.
-  async function fetchGenericProducts(base) {
-    let sitemap = await fetchPageText(`${base}/sitemap.xml`, 5000)
-    if (!sitemap || !/<(urlset|sitemapindex)/i.test(sitemap)) sitemap = await fetchPageText(`${base}/sitemap_index.xml`, 5000)
-    if (!sitemap) return null
-    // sitemap indexes point at child sitemaps (often /product-sitemap.xml…)
-    if (/<sitemapindex/i.test(sitemap)) {
-      const children = [...sitemap.matchAll(/<loc>\s*([^<]+)\s*<\/loc>/gi)].map(m => m[1]).slice(0, 6)
-      const childBodies = await Promise.all(children.map(u => fetchPageText(u, 5000).catch(() => null)))
-      sitemap += '\n' + childBodies.filter(Boolean).join('\n')
-    }
-    const urls = [...new Set([...sitemap.matchAll(/<loc>\s*([^<]+)\s*<\/loc>/gi)].map(m => m[1]))]
-      .filter(u => /\/(product|products|shop|store|collections|item|p)\/|\/product-page\//i.test(u) && !/\.(png|jpe?g|gif|pdf|xml)$/i.test(u))
-      .slice(0, 8)
-    if (!urls.length) return null
-    const pages = await Promise.all(urls.map(u => fetchPageText(u, 5000).catch(() => null)))
-    return pages.filter(Boolean).map(html => {
-      const title = (html.match(/<title[^>]*>([^<]+)<\/title>/i) || [])[1] || ''
-      const h1 = (html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i) || [])[1] || ''
-      const og = (html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i) || [])[1] || ''
-      return [title, stripHtml(h1), og].join(' ').slice(0, 600)
-    }).filter(t => t.trim().length > 3)
-  }
-  // Etsy shop pages embed every listing title in the HTML JSON blob — one
-  // fetch, no API key. Bot-blocked shops (403/challenge) fail soft → null,
-  // and the store is then treated as unverifiable, not as a reject.
-  async function fetchEtsyProducts(url) {
-    const html = await fetchPageText(url, 7000)
-    if (!html) return null
-    const titles = new Set()
-    for (const m of html.matchAll(/"title"\s*:\s*"((?:[^"\\]|\\.){10,140})"/g)) {
-      try { titles.add(JSON.parse('"' + m[1] + '"').trim()) } catch { titles.add(m[1]) }
-      if (titles.size >= 60) break
-    }
-    if (titles.size < 3) {
-      for (const m of html.matchAll(/<h3[^>]*class="[^"]*card-list-item__title[^"]*"[^>]*>([\s\S]*?)<\/h3>/gi)) {
-        titles.add(stripHtml(m[1]).trim()); if (titles.size >= 60) break
-      }
-    }
-    return titles.size ? [...titles] : null
-  }
-  function detectStorePlatform(url, html) {
-    const h = String(html || '')
-    const u = String(url || '').toLowerCase()
-    if (h.includes('myshopify.com') || h.includes('cdn.shopify.com') || u.includes('myshopify.com')) return 'shopify'
-    if (h.includes('woocommerce') || u.includes('wp-content') || u.includes('/wp-json/')) return 'woocommerce'
-    if (h.includes('wixstatic.com') || h.includes('wixsite.com') || u.includes('wixsite.com')) return 'wix'
-    if (h.includes('squarespace.com') || h.includes('static1.squarespace.com') || u.includes('squarespace.com')) return 'squarespace'
-    if (u.includes('bigcartel.com') || h.includes('bigcartel')) return 'bigcartel'
-    if (u.includes('webflow.io') || h.includes('website-files.com') || h.includes('data-wf-page')) return 'webflow'
-    if (u.includes('etsy.com')) return 'etsy'
-    return 'custom'
-  }
-  // Which product sources to try for a platform, in order. First one that
-  // returns records wins (custom stores try everything).
-  function productSourcesFor(platform, url) {
-    const base = url.replace(/\/+$/, '')
-    if (platform === 'etsy') return [['etsy page', () => fetchEtsyProducts(url)]]
-    if (platform === 'shopify') return [['products.json', () => fetchShopifyProducts(base)], ['sitemap', () => fetchGenericProducts(base)]]
-    if (platform === 'woocommerce') return [['woo product API', () => fetchWooProducts(base)], ['sitemap', () => fetchGenericProducts(base)]]
-    if (platform === 'wix') return [['sitemap', () => fetchGenericProducts(base)], ['woo product API', () => fetchWooProducts(base)]]
-    return [['products.json', () => fetchShopifyProducts(base)], ['woo product API', () => fetchWooProducts(base)], ['sitemap', () => fetchGenericProducts(base)]]
-  }
-  // THE strict gate. Returns { platform, checked, total, matches, samples, ok }.
-  // `nicheKey` picks a NICHE_KEYWORDS list ('any' = verify a real catalog with
-  // NICHE_MIN_PRODUCTS+ products, no keyword filter); `customKws` (array) builds
-  // a one-off list from a typed query. A store with NO readable catalog is
-  // "unverifiable" — ok:false and matches:-1 so the scout logs it honestly.
-  async function deepNicheCheck(url, platform, nicheKey, customKws = null) {
-    const regex = customKws?.length
-      ? new RegExp('(?:\\b|\\s)(?:' + customKws.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + 's?').join('|') + ')', 'i')
-      : NICHE_REGEXES[nicheKey]
-    let detected = platform
-    let products = null
-    let usedSource = ''
-    for (const [srcLabel, src] of productSourcesFor(platform, url)) {
-      products = await src().catch(() => null)
-      if (products && products.length) { usedSource = srcLabel; break }
-    }
-    if (!products || !products.length) {
-      // Last shot for "auto": sniff the homepage to pick the right source set.
-      if (platform === 'auto' || platform === 'custom') {
-        const html = await fetchPageText(url, 5000).catch(() => null)
-        detected = detectStorePlatform(url, html || '')
-        if (detected !== platform) return deepNicheCheck(url, detected, nicheKey, customKws)
-      }
-      // Page-content fallback (v8) — ONLY for platforms that have no product
-      // API at all (Etsy/Wix/Big Cartel/...): distinct niche keywords visible
-      // on the page itself count, NICHE_MIN_PRODUCTS+ still required, and the
-      // report labels the source honestly as page-content. API-backed platforms
-      // (Shopify/Woo) are NOT downgraded to a page guess when their API is
-      // blocked — that stays "unverifiable", so the hunt re-checks them on the
-      // next round instead of writing them off (anti-block rule).
-      const hasApiSource = platform === 'shopify' || platform === 'woocommerce'
-      const kwList = customKws?.length ? customKws : (nicheKey && NICHE_KEYWORDS[nicheKey] ? NICHE_KEYWORDS[nicheKey].kw : null)
-      if (!hasApiSource && kwList) {
-        const html = await fetchPageText(url, 6000).catch(() => null)
-        if (html) {
-          const distinct = countNicheSignalsInHtml(html, kwList)
-          return { platform: detected, checked: true, total: null, matches: distinct, samples: [], ok: distinct >= NICHE_MIN_PRODUCTS, source: 'page-content' }
-        }
-      }
-      return { platform: detected, checked: false, total: 0, matches: -1, samples: [], ok: false, source: null }
-    }
-    const samples = []
-    let matches = 0
-    if (!regex) {
-      // "Any products" mode — no keyword filter, but the store must still prove
-      // a real catalog with NICHE_MIN_PRODUCTS+ products.
-      matches = products.length >= NICHE_MIN_PRODUCTS ? products.length : 0
-      if (products[0]) samples.push(String(products[0]).slice(0, 70).trim())
-      return { platform: detected, checked: true, total: products.length, matches, samples, ok: matches > 0, source: usedSource || 'catalog' }
-    }
-    for (const text of products) {
-      if (regex.test(String(text))) {
-        matches++
-        if (samples.length < 3) samples.push(String(text).slice(0, 70).trim())
-      }
-    }
-    return { platform: detected, checked: true, total: products.length, matches, samples, ok: matches >= NICHE_MIN_PRODUCTS, source: usedSource || 'catalog' }
-  }
-  // Fallback niche check for platforms without a product API: count DISTINCT
-  // niche keywords visible on the page (title, meta description, link texts).
-  function countNicheSignalsInHtml(html, keywords) {
-    const texts = []
-    const t = html.match(/<title[^>]*>([^<]*)<\/title>/i); if (t) texts.push(t[1])
-    const md = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)/i); if (md) texts.push(md[1])
-    const anchors = html.match(/<a\b[^>]*>([\s\S]{0,160}?)<\/a>/gi) || []
-    for (const a of anchors.slice(0, 400)) texts.push(a.replace(/<[^>]+>/g, ' '))
-    const hay = texts.join(' \n').toLowerCase()
-    return new Set(keywords.filter(k => hay.includes(k))).size
-  }
-
 
   // Official, free Companies House "advanced search" — the one API endpoint
   // that's genuinely built for this (unlike crt.sh's wildcard search, this
@@ -1448,14 +1203,11 @@ module.exports = async (req, res) => {
   // budget, not something we're working around). Auth is HTTP Basic with
   // the API key as the username and an empty password — that's the
   // spec's own convention, not a workaround.
-  // start_index enables pagination so a website-filtered run can pull MORE
-  // companies until the requested count of verified ones is reached.
-  async function fetchNewUKCompanies(fromDate, toDate, size, startIndex = 0) {
+  async function fetchNewUKCompanies(fromDate, toDate, size) {
     const params = new URLSearchParams({
       incorporated_from: fromDate,
       incorporated_to: toDate,
-      size: String(Math.min(Math.max(size, 1), 100)),
-      start_index: String(Math.max(startIndex, 0)),
+      size: String(Math.min(Math.max(size, 1), 5000)),
     })
     const url = `https://api.company-information.service.gov.uk/advanced-search/companies?${params}`
     const auth = Buffer.from(`${COMPANIES_HOUSE_API_KEY}:`).toString('base64')
@@ -1470,334 +1222,6 @@ module.exports = async (req, res) => {
       console.error('Companies House fetch failed:', e.message)
       return null
     }
-  }
-
-  // ══════════════════════════════════════════════════════════════════
-
-  // ══ UK company website verification — "most possible way ever" ══
-  // Companies House gives no websites, so every company gets a two-stage
-  // hunt: (1) probe the likely domains built from the company name, and
-  // (2) if none of them verify, search the web for the company and probe
-  // what comes back. A site only counts when it PROVES itself: loads with
-  // HTTP 200, is not a parked/for-sale page, is not an aggregator/social
-  // site, and actually mentions the company name. Results are cached per
-  // company number for 30 days so re-runs are instant.
-  const UK_WEB_TLDS = ['co.uk', 'com', 'org.uk', 'uk']
-  const UK_SITE_BLOCKLIST = ['facebook.com', 'instagram.com', 'twitter.com', 'x.com', 'tiktok.com',
-    'linkedin.com', 'youtube.com', 'wikipedia.org', 'yell.com', 'opencorporates.com', 'companycheck.co.uk',
-    'endole.co.uk', 'datocap.com', 'crunchbase.com', 'companieshouse.gov.uk', 'gov.uk', 'finderonomics.co.uk',
-    'bizdb.co.uk', 'companyhouse.de', 'globaldatabase.com', 'duport.co.uk', 'companydirectorcheck.com',
-    'cybo.com', 'rocketreach.co', 'signalhire.com', 'contactout.com', 'zoominfo.com', 'apollo.io']
-  const PARKED_MARKERS = ['domain is for sale', 'buy this domain', 'this domain is parked', 'this domain is for hire',
-    'sedoparking', 'afternic', 'hugedomains', 'future home of a web hosting', 'parkingcrew', 'domain parking',
-    'this website is for sale', 'the domain has been registered', 'do you own this domain']
-  function companyNameWords(name) {
-    return String(name || '').replace(/\b(ltd|limited|llp|plc|inc|lp|co|company|uk)\b\.?/gi, ' ')
-      .replace(/&/g, ' and ').replace(/[^a-zA-Z0-9\s]/g, ' ').toLowerCase()
-      .split(/\s+/).filter(w => w.length >= 2)
-  }
-  function companyDomainCandidates(name) {
-    const words = companyNameWords(name)
-    if (!words.length) return []
-    const cands = new Set()
-    const joined = words.join('')
-    const hyphen = words.join('-')
-    cands.add(joined); cands.add(hyphen)
-    if (words.length >= 3) {
-      const short = words.slice(-3)          // long names usually brand on the last words
-      cands.add(short.join('')); cands.add(short.join('-'))
-    }
-    const out = []
-    for (const c of cands) {
-      if (c.length < 4 || c.length > 63) continue
-      for (const tld of UK_WEB_TLDS) out.push(`${c}.${tld}`)
-    }
-    return out.slice(0, 12)
-  }
-  function nameTokensForMatch(name) {
-    return companyNameWords(name).filter(w => w.length >= 4).slice(0, 5)
-  }
-  async function probeWebsiteCandidate(url, name) {
-    try {
-      const r = await fetch(url, {
-        redirect: 'follow', signal: AbortSignal.timeout(6000),
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36' }
-      })
-      if (r.status !== 200) return { verified: false, reason: `HTTP ${r.status}` }
-      const finalUrl = r.url || url
-      const finalHost = new URL(finalUrl).hostname.toLowerCase()
-      if (UK_SITE_BLOCKLIST.some(d => finalHost === d || finalHost.endsWith('.' + d))) {
-        return { verified: false, reason: 'aggregator/social page' }
-      }
-      const body = (await r.text()).slice(0, 300000)
-      if (body.length < 200) return { verified: false, reason: 'empty page' }
-      const low = body.toLowerCase()
-      if (PARKED_MARKERS.some(m => low.includes(m))) return { verified: false, reason: 'parked/for-sale page' }
-      const tokens = nameTokensForMatch(name)
-      if (tokens.length && !tokens.some(t => low.includes(t))) {
-        return { verified: false, reason: 'site does not mention the company' }
-      }
-      return { verified: true, finalUrl, reason: '' }
-    } catch (e) {
-      return { verified: false, reason: 'unreachable/timeout' }
-    }
-  }
-  async function duckduckgoSiteCandidates(name) {
-    const attempts = [
-      `https://html.duckduckgo.com/html/?q=${encodeURIComponent(`"${name}"`)}`,
-      `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(`"${name}"`)}`,
-    ]
-    for (const u of attempts) {
-      try {
-        const r = await fetch(u, {
-          method: 'POST', headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-          signal: AbortSignal.timeout(8000)
-        })
-        if (!r.ok) continue
-        const html = await r.text()
-        const links = new Set()
-        for (const m of html.matchAll(/uddg=([^"&]+)/g)) {
-          try { links.add(decodeURIComponent(m[1])) } catch { /* skip */ }
-        }
-        for (const m of html.matchAll(/href="(https?:\/\/[^"]+)"/g)) links.add(m[1])
-        const out = []
-        for (const link of links) {
-          try {
-            const u2 = new URL(link)
-            if (!/^https?:$/.test(u2.protocol)) continue
-            const host = u2.hostname.toLowerCase()
-            if (UK_SITE_BLOCKLIST.some(d => host === d || host.endsWith('.' + d))) continue
-            if (/(^|\.)duckduckgo\.com$/.test(host)) continue
-            out.push(`https://${host}`)
-            if (out.length >= 6) break
-          } catch { /* skip */ }
-        }
-        if (out.length) return [...new Set(out)]
-      } catch { /* try the next engine */ }
-    }
-    return []
-  }
-  async function findCompanyWebsite(name) {
-    const candidates = companyDomainCandidates(name)
-    let probed = 0, blocked = 0
-    if (candidates.length) {
-      const probes = await Promise.allSettled(
-        candidates.map(d => probeWebsiteCandidate(`https://${d}`, name)))
-      for (const p of probes) {
-        probed++
-        const res = p.status === 'fulfilled' ? p.value : { verified: false, reason: 'error' }
-        if (res.verified) return { site: res.finalUrl, how: 'domain', note: '' }
-        if (res.reason === 'HTTP 403' || res.reason === 'unreachable/timeout') blocked++
-      }
-    }
-    const searched = await duckduckgoSiteCandidates(name)
-    if (searched.length) {
-      const probes = await Promise.allSettled(
-        searched.map(u => probeWebsiteCandidate(u, name)))
-      for (const p of probes) {
-        const res = p.status === 'fulfilled' ? p.value : { verified: false, reason: 'error' }
-        if (res.verified) return { site: res.finalUrl, how: 'search', note: '' }
-      }
-    }
-    const note = probed && blocked >= probed
-      ? 'domain checks blocked (403/timeouts) — unverified, treated as no site'
-      : searched.length ? 'no site found (search + domain probes)' : 'no site found (domain probes; search unavailable)'
-    return { site: '', how: '', note }
-  }
-  async function getUkWebCache(numbers) {
-    if (!numbers.length) return {}
-    const { result: vals } = await redis('HMGET', 'ukweb', ...numbers)
-    const out = {}
-    if (vals) numbers.forEach((n, i) => {
-      if (!vals[i]) return
-      try {
-        const v = JSON.parse(vals[i])
-        if (v.checkedAt && Date.now() - Date.parse(v.checkedAt) < 30 * 86400000) out[n] = v
-      } catch { /* stale junk — recheck */ }
-    })
-    return out
-  }
-  async function markUkWebCache(entries) {
-    if (!entries.length) return
-    const flat = entries.flatMap(([k, v]) => [k, JSON.stringify(v)])
-    await redis('HSET', 'ukweb', ...flat)
-  }
-  async function enrichUkCompany(it) {
-    const number = it.company_number
-    const cached = (await getUkWebCache([number]))[number]
-    const web = cached || await findCompanyWebsite(it.company_name)
-    if (!cached) await markUkWebCache([[number, { ...web, checkedAt: new Date().toISOString() }]])
-    const addr = it.registered_office_address || {}
-    return {
-      name: it.company_name, number,
-      type: it.company_type || '',
-      incorporated: it.date_of_creation || '',
-      address: [addr.address_line_1, addr.locality, addr.postal_code].filter(Boolean).join(', '),
-      website: web.site || '', websiteHow: web.how || '', websiteNote: web.note || ''
-    }
-  }
-  // London calendar date for "today" — Companies House incorporations are
-  // UK days, not UTC days, and a UTC-day off-by-one was reporting companies
-  // outside the window the user picked.
-  function londonToday() {
-    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London' }).format(new Date())
-  }
-  function londonDateMinusDays(days) {
-    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London' })
-      .format(new Date(Date.now() - days * 86400000))
-  }
-
-  // ── UK hunter: keeps pulling Companies House pages + verifying websites
-  // until the requested number of companies pass the chosen site filter —
-  // the same persistent pattern /scout uses. State lives in userQueue.newukCtx.
-  async function startNewukHunt(chatId, userId, cfg) {
-    const q = await getUserQueue(userId)
-    q.newukCtx = {
-      chatId, rounds: 0,
-      want: cfg.count, delivered: 0, done: false,
-      siteFilter: cfg.siteFilter || 'all',
-      fromDate: cfg.fromDate, toDate: cfg.toDate,
-      label: cfg.label || '',
-      companies: [], results: [],
-      startIndex: 0, exhausted: false, totalHits: null, failedFetch: false,
-    }
-    await saveUserQueue(userId, q)
-    const scopeTxt = cfg.label || (cfg.days === 1 ? 'today' : cfg.days ? `the last ${cfg.days} days` : `${cfg.fromDate} → ${cfg.toDate}`)
-    const filterTxt = cfg.siteFilter === 'with' ? '🔗 only companies WITH a live website'
-      : cfg.siteFilter === 'without' ? '🚫 only companies with NO website found'
-      : '📋 all companies (website status shown)'
-    await send(chatId,
-      `🇬🇧 Hunting UK companies incorporated ${scopeTxt} — ${cfg.count} wanted, ${filterTxt}.\n\n` +
-      `⏱️ Every company gets a real website check (name-matched domains + web search, live-verified). Companies House also loads new incorporations with a delay, so "today" may still be filling in. If the time budget cuts me short, send anything and I'll continue.`)
-    return await runNewukBatch(chatId, userId, q)
-  }
-  async function runNewukBatch(chatId, userId, q) {
-    const ctx = q.newukCtx
-    chatId = chatId || ctx.chatId
-    const deadline = Date.now() + SCOUT_BUDGET_MS
-    const ukScope = isOwner ? '' : `${userId}:`
-    const passesSiteFilter = (c) => ctx.siteFilter === 'with' ? !!c.website
-      : ctx.siteFilter === 'without' ? !c.website : true
-    const st = ctx.stats = ctx.stats || { checked: 0, withSite: 0, noSite: 0, dupes: 0, passed: 0 }
-    let firstRunFailure = false
-
-    while (Date.now() < deadline && !ctx.done) {
-      if (ctx.want && ctx.results.length >= ctx.want) { ctx.done = true; break }
-      if (!ctx.companies.length) {
-        if (ctx.exhausted) break
-        const data = await fetchNewUKCompanies(ctx.fromDate, ctx.toDate, 100, ctx.startIndex)
-        if (!data) {
-          if (ctx.startIndex === 0) firstRunFailure = true
-          break
-        }
-        if (ctx.totalHits == null && typeof data.hits === 'number') ctx.totalHits = data.hits
-        const items = data.items || []
-        if (!items.length) { ctx.exhausted = true; break }
-        // STRICT client-side date filter — never trust the window blindly.
-        const inWindow = items.filter(it => it.date_of_creation &&
-          it.date_of_creation >= ctx.fromDate && it.date_of_creation <= ctx.toDate)
-        const droppedOutside = items.length - inWindow.length
-        if (droppedOutside > 0) await saveFilteredOut(userId,
-          [`${droppedOutside} compan${droppedOutside === 1 ? 'y' : 'ies'} skipped: incorporation date outside ${ctx.fromDate} → ${ctx.toDate}`])
-        const dedupeKeys = inWindow.map(it => `ukco:${ukScope}${it.company_number}`)
-        const seenMap = await getSeenBatch(dedupeKeys)
-        const alreadyHere = new Set(ctx.companies.concat(ctx.results).map(c => c.number))
-        for (let i = 0; i < inWindow.length; i++) {
-          const it = inWindow[i]
-          if (seenMap[dedupeKeys[i]] || alreadyHere.has(it.company_number)) { st.dupes++; continue }
-          ctx.companies.push({
-            company_number: it.company_number, company_name: it.company_name,
-            company_type: it.company_type, date_of_creation: it.date_of_creation,
-            registered_office_address: it.registered_office_address || {}
-          })
-          alreadyHere.add(it.company_number)
-          if (ctx.want && ctx.companies.length >= ctx.want * 3 + 20) break   // enough candidates for one run
-        }
-        ctx.startIndex += items.length
-        if (items.length < 100) ctx.exhausted = true
-        await saveUserQueue(userId, q)
-        continue
-      }
-      const batch = ctx.companies.slice(0, CONCURRENCY)
-      ctx.companies = ctx.companies.slice(CONCURRENCY)
-      const checked = await Promise.all(batch.map(enrichUkCompany))
-      for (const c of checked) {
-        st.checked++
-        if (passesSiteFilter(c)) { ctx.results.push(c); st.passed++ }
-        else {
-          if (c.website) st.withSite++; else st.noSite++
-          await saveFilteredOut(userId, [`${c.name} — ${c.websiteNote || 'filtered by website setting'}`])
-        }
-      }
-      await saveUserQueue(userId, q)
-    }
-
-    if (firstRunFailure) {
-      await send(chatId, `Companies House request failed — check the API key is valid in Vercel, or try again shortly.`)
-      q.newukCtx = null
-      await saveUserQueue(userId, q)
-      return res.status(200).send('OK')
-    }
-
-    if (ctx.want && ctx.results.length >= ctx.want) ctx.done = true
-    if (ctx.exhausted && !ctx.companies.length) ctx.done = true
-
-    // Deliver up to ~20 companies per message (Telegram-safe chunks).
-    const toDeliver = ctx.results.slice(ctx.delivered, ctx.delivered + 20)
-    const filterLabel = ctx.siteFilter === 'with' ? 'with a live website' : ctx.siteFilter === 'without' ? 'with no website' : 'all companies'
-    let reply = `🇬🇧 UK companies — ${ctx.label || (ctx.fromDate === ctx.toDate ? ctx.fromDate : `${ctx.fromDate} → ${ctx.toDate}`)} (${filterLabel})\n`
-    if (ctx.totalHits != null) reply += `📊 ${ctx.totalHits} incorporations in range at Companies House.\n`
-    const breakdown = [
-      st.checked ? `${st.checked} verified` : '',
-      st.withSite ? `${st.withSite} have a site` : '',
-      st.noSite ? `${st.noSite} have none` : '',
-      st.dupes ? `${st.dupes} already delivered` : ''
-    ].filter(Boolean).join(' · ')
-    if (breakdown) reply += `📉 Checks so far: ${breakdown}\n`
-    let leadNum = ctx.delivered
-    for (const c of toDeliver) {
-      leadNum++
-      const siteLine = c.website ? `✅ ${c.website}${c.websiteHow === 'search' ? ' (via web search)' : ''}` : `🚫 no website found`
-      reply += `\n\n${leadNum}. ${c.name}\n    ${siteLine}` +
-        `\n    📅 Incorporated: ${c.incorporated}` +
-        (c.type ? `\n    🏢 ${c.type}` : '') +
-        (c.address ? `\n    📍 ${c.address}` : '') +
-        `\n    🔗 https://find-and-update.company-information.service.gov.uk/company/${c.number}`
-    }
-    if (!toDeliver.length) reply += `\n\n(This pass added nothing new — see note below.)`
-
-    const reached = !!(ctx.want && ctx.results.length >= ctx.want)
-    const sourceExhausted = ctx.exhausted && !ctx.companies.length
-    const budgetOut = !reached && !sourceExhausted
-    if (reached) {
-      ctx.done = true
-      reply += `\n\n✅ ALL DONE — ${ctx.results.length} compan${ctx.results.length === 1 ? 'y' : 'ies'} ${filterLabel}, as requested.`
-      // Mark delivered companies as seen only AFTER they actually went out.
-      const doneSlice = ctx.results.slice(0, ctx.delivered + toDeliver.length)
-      await markSeenBatch(doneSlice.map(c => [`ukco:${ukScope}${c.number}`, { sentAt: new Date().toISOString() }]))
-      reply += `\n\n────────\nNext step 👇 Copy the list above, then tap Find Contacts and paste it.`
-    } else if (sourceExhausted) {
-      ctx.done = true
-      reply += `\n\n✓ Register exhausted for this window — ${ctx.results.length} ${filterLabel} found in total.`
-      const doneSlice = ctx.results.slice(0, ctx.delivered + toDeliver.length)
-      await markSeenBatch(doneSlice.map(c => [`ukco:${ukScope}${c.number}`, { sentAt: new Date().toISOString() }]))
-      reply += `\n\n────────\nNext step 👇 Copy the list above, then tap Find Contacts and paste it.`
-    } else {
-      reply += `\n\n⏳ ${ctx.results.length} of ${ctx.want} so far — I keep checking automatically, you don't need to send anything.`
-    }
-    ctx.delivered += toDeliver.length
-    await saveUserQueue(userId, q)
-    const roundNo = (ctx.rounds || 0)
-    if (budgetOut && roundNo < MAX_AUTO_ROUNDS && ctx.chatId) {
-      fireSelfContinue(userId, 'newuk')     // the next hop is already on its way
-      await sleep(300)
-      await sendKeyboard(chatId, `${reply}\n\n🔁 Round ${roundNo + 1} starts by itself in a few seconds — progress messages keep coming until I've got your ${ctx.want}.`,
-        [[B('✋ Stop this search', 'autostop:newuk')]])
-    } else {
-      if (budgetOut) reply += `\n\n⚠️ The auto-hunt hit its safety cap (${MAX_AUTO_ROUNDS} rounds). Send anything and I'll continue from where I stopped.`
-      await send(chatId, reply)
-    }
-    return res.status(200).send('OK')
   }
 
   // Parses a pasted or fetched company list into [{name, location, company_number}].
@@ -2094,7 +1518,151 @@ module.exports = async (req, res) => {
       `I help ${niche} brands fix exactly that kind of thing. Running a free pilot for a couple of stores this week — want a 30-sec look?`
   }
 
-  async function checkOneStore(url, opts = {}) {
+  // ════════════════════════════════════════════════════════════════
+  //  DEEP NICHE CHECK — product-level verification, per platform.
+  //  A candidate only "proves" its niche when the LIVE catalog matches:
+  //    Shopify      → GET /products.json (titles + tags + product_type)
+  //    Wix          → real product pages (homepage links + sitemap.xml)
+  //    Etsy         → the shop's live listing slugs/titles
+  //    WooCommerce  → public store API /wp-json/wc/store/v1/products
+  //    Custom/other → common catalog endpoints + sitemap product slugs
+  //  Requires NICHE_MATCH_MIN (3) matching PRODUCTS. A matching homepage
+  //  title alone never satisfies this — but if the product source itself is
+  //  blocked (403/429/captcha), the lead is still delivered tagged
+  //  "title-only (blocked)" instead of silently vanishing (that exact
+  //  starvation is what made an earlier strict build return 0 results).
+  // ════════════════════════════════════════════════════════════════
+  async function deepNicheCheck(url, homeHtml, nicheTerms, platform) {
+    const out = { platform: PLATFORMS[platform]?.name || 'Shopify', checked: 0, matches: 0, samples: [], method: '', blocked: false, titleMatched: false }
+    if (!nicheTerms || !nicheTerms.length) return out
+    const base = url.replace(/\/$/, '')
+    const homeTitle = (String(homeHtml || '').match(/<title[^>]*>([^<]+)<\/title>/i) || [])[1] || ''
+    const homeMeta = (String(homeHtml || '').match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']{3,200})/i) || [])[1] || ''
+    out.titleMatched = nicheTerms.some(g => groupMatchesText(g, homeTitle + ' ' + homeMeta))
+    const matchProduct = (text) => {
+      if (!text || out.matches >= 8) return
+      out.checked++
+      if (nicheTerms.some(g => groupMatchesText(g, text))) {
+        out.matches++
+        if (out.samples.length < 3) out.samples.push(String(text).replace(/\s+/g, ' ').trim().slice(0, 60))
+      }
+    }
+
+    const isShopify = platform === 'shopify' || /myshopify\.com|cdn\.shopify\.com/i.test(String(homeHtml || ''))
+    const isWix = platform === 'wix' || /wixstatic\.com|wixsite\.com|parastorage/i.test(String(homeHtml || ''))
+    const isEtsy = platform === 'etsy' || /etsy\.com/i.test(String(url))
+    const isWoo = /woocommerce|wp-content/i.test(String(homeHtml || ''))
+
+    try {
+      if (isShopify) {
+        out.platform = 'Shopify'
+        out.method = '/products.json (live catalog)'
+        const cat = await blockAwareFetch(base + '/products.json?limit=250', { timeout: 7000, json: true })
+        if (cat.blocked && !(cat.json && cat.json.products)) { out.blocked = true; return out }
+        const products = (cat.json && cat.json.products) || []
+        if (!products.length) {
+          // No public catalog: fall back to product-page slugs in the HTML
+          out.method = 'product slugs (catalog closed)'
+          const slugs = [...String(homeHtml || '').matchAll(/\/products\/([a-z0-9-]{4,80})/gi)].map(m => m[1])
+          ;[...new Set(slugs)].slice(0, 12).forEach(s => matchProduct(s.replace(/-/g, ' ')))
+          return out
+        }
+        for (const p of products) {
+          const tags = Array.isArray(p.tags) ? p.tags.join(' ') : String(p.tags || '')
+          matchProduct(`${p.title || ''} ${tags} ${p.product_type || ''}`.trim())
+        }
+        return out
+      }
+
+      if (isWix) {
+        out.platform = 'Wix'
+        out.method = 'live product pages'
+        const hrefs = [...String(homeHtml || '').matchAll(/href=["']([^"']*(?:\/product-page\/|\/product\/)[^"']*)["']/gi)].map(m => m[1])
+        let productUrls = [...new Set(hrefs)].slice(0, 8).map(h => h.startsWith('http') ? h : base + (h.startsWith('/') ? h : '/' + h))
+        if (!productUrls.length) {
+          const sm = await blockAwareFetch(base + '/sitemap.xml', { timeout: 5000 })
+          if (sm.blocked) out.blocked = true
+          if (sm.ok) {
+            const locs = [...sm.html.matchAll(/<loc>\s*([^<]*(?:product-page|\/product\/)[^<]*)<\/loc>/gi)].map(m => m[1])
+            productUrls = [...new Set(locs)].slice(0, 8)
+          }
+        }
+        for (const pu of productUrls.slice(0, 6)) {
+          const pr = await blockAwareFetch(pu, { timeout: 5000 })
+          if (pr.blocked) { out.blocked = true; continue }
+          if (!pr.ok) continue
+          const t = (pr.html.match(/<title[^>]*>([^<]+)<\/title>/i) || [])[1] || ''
+          const og = (pr.html.match(/property=["']og:title["'][^>]*content=["']([^"']{3,120})/i) || [])[1] || ''
+          const jsonName = (pr.html.match(/"productName"\s*:\s*"([^"]{3,90})/i) || [])[1] || ''
+          matchProduct(t.replace(/\s*[|–-]\s*.*$/, '') || og || jsonName)
+        }
+        return out
+      }
+
+      if (isEtsy) {
+        out.platform = 'Etsy'
+        out.method = 'live shop listings'
+        let shopUrl = ''
+        const shopM = String(url).match(/etsy\.com\/shop\/([A-Za-z0-9_-]+)/i) || String(homeHtml || '').match(/etsy\.com\/shop\/([A-Za-z0-9_-]+)/i)
+        if (shopM) shopUrl = 'https://www.etsy.com/shop/' + shopM[1]
+        if (shopUrl) {
+          const r = await blockAwareFetch(shopUrl, { timeout: 7000 })
+          if (r.blocked && !r.ok) { out.blocked = true; return out }
+          if (r.ok) {
+            const slugs = [...r.html.matchAll(/\/listing\/\d+\/([a-z0-9-]{6,90})/gi)].map(m => m[1])
+            const titles = [...r.html.matchAll(/"title"\s*:\s*"([^"]{6,120})"/g)].map(m => m[1])
+            ;[...new Set(slugs)].slice(0, 14).forEach(s => matchProduct(s.replace(/-/g, ' ')))
+            ;[...new Set(titles)].slice(0, 14).forEach(t => matchProduct(t))
+          }
+        } else {
+          // An Etsy listing/search page — its own title counts as one signal
+          matchProduct(homeTitle)
+        }
+        return out
+      }
+
+      if (isWoo) {
+        out.platform = 'WooCommerce'
+        out.method = 'store API (live)'
+        const api = await blockAwareFetch(base + '/wp-json/wc/store/v1/products?per_page=40', { timeout: 7000, json: true })
+        if (api.blocked && !api.json) { out.blocked = true; return out }
+        const items = Array.isArray(api.json) ? api.json : []
+        if (items.length) items.forEach(p => matchProduct(p.name || ''))
+        else {
+          const slugs = [...String(homeHtml || '').matchAll(/\/product\/([a-z0-9-]{4,80})/gi)].map(m => m[1])
+          ;[...new Set(slugs)].slice(0, 12).forEach(s => matchProduct(s.replace(/-/g, ' ')))
+        }
+        return out
+      }
+
+      // Custom/other builder — try the common catalog endpoints, then slugs
+      out.platform = out.platform === 'More platforms' ? 'Custom store' : out.platform
+      out.method = 'catalog endpoints + product slugs'
+      const probes = [
+        [base + '/products.json', true], [base + '/products.json?limit=250', true],
+        [base + '/wp-json/wc/store/v1/products?per_page=30', true],
+      ]
+      for (const [probeUrl, asJson] of probes) {
+        const pr = await blockAwareFetch(probeUrl, { timeout: 6000, json: asJson })
+        if (pr.blocked) { out.blocked = true; continue }
+        if (!pr.ok) continue
+        if (asJson && Array.isArray(pr.json)) { pr.json.forEach(p => matchProduct(p.title || p.name || '')) }
+        else if (asJson && pr.json && Array.isArray(pr.json.products)) { pr.json.products.forEach(p => matchProduct(`${p.title || ''} ${Array.isArray(p.tags) ? p.tags.join(' ') : ''}`)) }
+        if (out.matches >= NICHE_MATCH_MIN) return out
+      }
+      if (out.matches < NICHE_MATCH_MIN) {
+        const slugs = [...String(homeHtml || '').matchAll(/\/(?:products?|collections\/[^"']*)\/([a-z0-9-]{6,80})/gi)].map(m => m[1])
+          .filter(s => !/^(all|best-sellers?|new-arrivals?|sale|featured)$/i.test(s))
+        ;[...new Set(slugs)].slice(0, 14).forEach(s => matchProduct(s.replace(/-/g, ' ')))
+      }
+      return out
+    } catch (e) {
+      out.blocked = true
+      return out
+    }
+  }
+
+  async function checkOneStore(url, checkCtx = {}) {
     const result = {
       url, store_name: '', email: 'no email', email_is_generic: false,
       contact_page: '', store_type: '', socials: {}, status: 'dead',
@@ -2102,56 +1670,40 @@ module.exports = async (req, res) => {
       isPasswordProtected: false
     }
     try {
-      // ANTI-BLOCK homepage fetch (v8): 8s timeout, one retry with a rotated
-      // UA on soft-block/5xx responses and on network errors. A store that
-      // fails twice really is unreachable — one refused request is not.
-      let r = null
-      for (let attempt = 0; attempt < 2 && !r; attempt++) {
-        try {
-          const controller = new AbortController()
-          const t = setTimeout(() => controller.abort(), 8000)
-          r = await fetch(url, {
-            headers: { 'User-Agent': FETCH_UAS[attempt % FETCH_UAS.length] },
-            signal: controller.signal, redirect: 'follow',
-          })
-          clearTimeout(t)
-          if ([429, 502, 503].includes(r.status) && attempt === 0) { await sleep(900); r = null; continue }
-          if (![200, 401, 403].includes(r.status)) return result
-        } catch (e) {
-          if (attempt === 0) { await sleep(900); continue }
-          return result    // unreachable twice → proven dead
-        }
+      const fr = await blockAwareFetch(url, { timeout: 6000 })
+      if (fr.blocked && !fr.ok) {
+        // Rate-limited / captcha'd / timed out — NOT proof the store is dead.
+        // Mark it 'blocked' so the queue retries it instead of burning it.
+        result.status = 'blocked'
+        result.blocked = true
+        return result
       }
+      if (![200, 401, 403].includes(fr.status)) return result
       result.status = 'OK'
       result.sslValid = url.startsWith('https://')
       const speedPromise = getSpeedIndexSeconds(url)
       const agePromise = getStoreAgeDays(url)
-      const html = await r.text()
+      const html = fr.html || ''
 
       if (html.includes('myshopify.com') || html.includes('cdn.shopify.com')) result.store_type = 'Shopify'
       else if (html.includes('woocommerce')) result.store_type = 'WooCommerce'
       else if (html.includes('wp-content')) result.store_type = 'WordPress'
       else if (html.includes('wixsite.com') || html.includes('wixstatic.com')) result.store_type = 'Wix'
       else if (html.includes('squarespace.com')) result.store_type = 'Squarespace'
-      else if (html.includes('etsy.com')) result.store_type = 'Etsy shop'
-      else if (html.includes('website-files.com') || html.includes('data-wf-page')) result.store_type = 'Webflow'
       else result.store_type = 'Custom/Other'
 
       const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i)
       if (titleMatch) result.store_name = titleMatch[1].split(/[–|—]/)[0].trim().slice(0, 60)
 
-      const finalUrl = r.url || url
+      const finalUrl = fr.finalUrl || url
       result.isPasswordProtected = (
-        r.status === 401 || finalUrl.includes('/password') ||
+        fr.status === 401 || finalUrl.includes('/password') ||
         html.includes('shopify-section-password') ||
         /this (store|shop) (will be back soon|is currently password protected)/i.test(html) ||
         /enter (using )?password/i.test(html) || /opening soon/i.test(html)
       )
 
-      const vsHome = await validateSocialsRich(extractSocials(html))
-      result.socials = vsHome.valid
-      result.socialsDead = vsHome.dead
-      result.socialsBlocked = vsHome.blocked
+      result.socials = await validateSocials(extractSocials(html))
       const homeEmails = cleanEmails(html)
 
       if (homeEmails.length) {
@@ -2172,10 +1724,7 @@ module.exports = async (req, res) => {
         }))
         for (const fallback of fallbackResults) {
           if (!fallback.socials) continue
-          const vsFb = await validateSocialsRich(fallback.socials)
-          result.socials = { ...result.socials, ...vsFb.valid }
-          result.socialsDead = (result.socialsDead || 0) + vsFb.dead
-          result.socialsBlocked = (result.socialsBlocked || 0) + vsFb.blocked
+          result.socials = { ...result.socials, ...await validateSocials(fallback.socials) }
         }
         const withEmail = fallbackResults.find(r => r.emails.length > 0)
         if (withEmail) {
@@ -2190,19 +1739,12 @@ module.exports = async (req, res) => {
 
       result.loadSeconds = await speedPromise
       result.ageDays = await agePromise
-    } catch (e) {}
 
-    // ── STRICT NICHE VERIFICATION (all platforms, all niches) ──
-    // The store lives AND its live catalog shows NICHE_MIN_PRODUCTS+ matching
-    // products — otherwise it's dropped and logged, never counted toward the
-    // requested total. A catalog we couldn't READ (blocked/unreadable) is
-    // "unverifiable" — ok:false but checked:false — which the hunt records
-    // as a re-checkable miss, NOT a proven reject.
-    if (result.status === 'OK' && (opts.nicheKey || opts.customKws)) {
-      result.niche = await deepNicheCheck(url, opts.platform || 'auto', opts.nicheKey || null, opts.customKws || null)
-      result.nicheOk = !!result.niche.ok
-      result.store_type = result.niche.platform === 'custom' ? result.store_type : result.niche.platform
-    }
+      // v8: product-level niche verification (3+ live-catalog matches)
+      if (checkCtx.nicheTerms && checkCtx.nicheTerms.length) {
+        result.niche = await deepNicheCheck(url, html, checkCtx.nicheTerms, checkCtx.platform || 'shopify')
+      }
+    } catch (e) {}
 
     const { score, reasons } = scoreLead(result)
     result.score = score
@@ -2210,13 +1752,12 @@ module.exports = async (req, res) => {
     return result
   }
 
-  async function processBatch(urls, opts = {}) {
+  async function processBatch(urls, checkCtx = null) {
     const results = []
     for (let i = 0; i < urls.length; i += CONCURRENCY) {
       const chunk = urls.slice(i, i + CONCURRENCY)
-      const chunkResults = await Promise.all(chunk.map(url => checkOneStore(url, opts)))
+      const chunkResults = await Promise.all(chunk.map(url => checkOneStore(url, checkCtx || {})))
       results.push(...chunkResults)
-      if (i + CONCURRENCY < urls.length) await sleep(250)   // gentle pacing — hammering sites in tight loops triggers WAF blocks
     }
     return results
   }
@@ -2828,7 +2369,7 @@ module.exports = async (req, res) => {
       }
     }
     if (!out.formUrl && !out.emails.length && /<form[\s>]/i.test(html)) out.formUrl = url
-    out.socials = (await validateSocialsRich(out.socials)).valid
+    out.socials = await validateSocials(out.socials)
     return out
   }
 
@@ -2861,6 +2402,7 @@ module.exports = async (req, res) => {
   async function startAiHunt(chatId, userId, srcKey, want) {
     const src = AI_HUNT_SOURCES[srcKey]
     if (!src) { await send(chatId, 'Unknown builder — pick one from the 🤖 AI-Built Sites menu.'); return res.status(200).send('OK') }
+    await redis('DEL', `wake:runs:${userId}`)   // fresh hunt → fresh auto-continue budget
     // Fresh hunt → a deep-search OFFER that was never tapped dies here, so an
     // old button (e.g. a 47-site queue from yesterday's hunt) can't eat the
     // pings meant for this hunt. A deep search the user explicitly started
@@ -3103,6 +2645,13 @@ module.exports = async (req, res) => {
     }
     if (keyboard.length) await sendKeyboard(chatId, replyText, keyboard)
     else await send(chatId, replyText)
+
+    // v8 AUTO-CONTINUE for hunts: budget ran out with candidates still to
+    // check — wake ourselves instead of waiting for a user ping.
+    if (!h.done) {
+      const woke = await scheduleAutoWake(chatId, userId, 'hunt')
+      if (woke) await send(chatId, `🔁 Auto-continue: I'm digging further on my own — progress messages keep coming, no reply needed.`)
+    }
     return res.status(200).send('OK')
   }
 
@@ -3559,7 +3108,8 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       await saveUserQueue(userId, userQueue)
       await send(chatId, `✅ Deep search complete — ${total} full dossier${total === 1 ? '' : 's'} delivered, each with its paste-ready rebuild blueprint + pitch. Copy any blueprint into Lovable/v0 and pitch the owner.${userQueue.aiHunt && !userQueue.aiHunt.done ? '\n\n⛏ Your hunt was paused for this — send anything and it keeps digging.' : ''}`)
     } else {
-      await send(chatId, `⏳ Deep intel ${userQueue.deepIdx}/${total} delivered — time budget hit. Send anything to continue where it stopped.`)
+      await send(chatId, `⏳ Deep intel ${userQueue.deepIdx}/${total} delivered — budget hit. 🔁 Auto-continuing on my own...`)
+      await scheduleAutoWake(chatId, userId, 'deep')
     }
     return res.status(200).send('OK')
   }
@@ -3597,19 +3147,25 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     return null
   }
 
-  // Does a checked store pass the user's reachability + freshness + niche filters?
-  function isUsableLead(r, includeLocked, freshDays, requiredSocial = null) {
+  // Does a checked store pass the user's reachability + freshness filters?
+  // v8: requireNiche — niche searches demand NICHE_MATCH_MIN matching products
+  // from the live catalog. If the product source itself was blocked (403/429),
+  // a title-matching lead still passes but ships tagged "title-only".
+  function isUsableLead(r, includeLocked, freshDays, requiredSocial = null, requireNiche = false) {
     if (r.status !== 'OK') return false
     if (r.isPasswordProtected && !includeLocked) return false
     if (!(r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length)) return false
-    if (r.nicheOk === false) return false
     if (requiredSocial && !r.socials?.[requiredSocial]) return false
+    if (requireNiche && r.niche) {
+      const proven = r.niche.matches >= NICHE_MATCH_MIN
+      const blockedTitleOnly = r.niche.blocked && r.niche.titleMatched
+      if (!proven && !blockedTitleOnly) return false
+    }
     // Freshness: provably-over-the-limit is dropped; an unknown age can't be
     // proven old, so it stays (it just won't carry a 🎂 tag).
     if (freshDays && typeof r.ageDays === 'number' && r.ageDays > freshDays) return false
     return true
   }
-
 
   // Pull the next page of urlscan candidates into userQueue.pending.
   // Returns true when more candidates were queued; false when the source is
@@ -3626,22 +3182,15 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     const pageUrls = []
     for (const item of items) {
       const domain = item.page?.domain
-      const url = item.page?.url || item.task?.url
-      // Shopify/BigCartel/Webflow stores live at the domain ROOT — the bare
-      // domain is the right base. But Etsy shops (www.etsy.com/shop/x) and
-      // Wix sites (sub.wixsite.com/mysite) live at a PATH: using the bare
-      // domain there would land on a 404/portal, so the full scanned URL wins.
-      const pathHosted = domain && /(wixsite\.com|etsy\.com)$/i.test(domain)
-      if (pathHosted && url) pageUrls.push(url)
-      else if (domain) pageUrls.push(`https://${domain}`)
-      else if (url) pageUrls.push(url)
+      const url = domain ? `https://${domain}` : (item.page?.url || item.task?.url)
+      if (url) pageUrls.push(url)
     }
     const extraBlacklistSet = await getExtraBlacklistSet()
     const { cleaned } = partitionLeads(pageUrls, extraBlacklistSet)
     const seenMap = await getSeenBatch(cleaned.map(normalizeForDedupe))
     const alreadyQueued = new Set(userQueue.pending)
     for (const u of cleaned) {
-      if (!seenSkips(seenMap[normalizeForDedupe(u)]) && !alreadyQueued.has(u)) {
+      if (!seenMap[normalizeForDedupe(u)] && !alreadyQueued.has(u)) {
         userQueue.pending.push(u)
         alreadyQueued.add(u)
       }
@@ -3652,7 +3201,6 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     if (items.length < 100) ctx.exhausted = true
     return true
   }
-
 
   // Window length in days for the /scout age gate — from a custom range
   // (inclusive) or one of the month-picker presets. null = no computable window.
@@ -3668,27 +3216,31 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     return null
   }
 
-  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked, month = null, freshDays = null, dateRange = null, requiredSocial = null, ageGate = false, platform = null, nicheKey = null, customKws = null) {
+  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked, month = null, freshDays = null, dateRange = null, requiredSocial = null, ageGate = false, platform = 'shopify') {
     const scope = dateRange ? dateRangeLabel(dateRange) : ymLabel(month)
     const ageNote = ageGate && freshDays ? ` · 🎂 store age ≤${freshDays}d ✅ enforced` : ''
-    const nicheNote = nicheKey ? ` · 🧪 ${nicheLabel(nicheKey)} products ${NICHE_MIN_PRODUCTS}+ verified` : (customKws?.length ? ` · 🧪 products verified (${customKws.slice(0, 5).join(', ')})` : '')
-    const platNote = platform && platform !== 'auto' ? ` · ${STORE_PLATFORMS[platform] ? STORE_PLATFORMS[platform].label : platform}` : ''
-    await send(chatId, `🔍 Hunting for ${wantCount} leads — "${label}" (${scope}${freshDays ? `, ≤${freshDays}d old` : ''}${ageNote}${nicheNote}${platNote}${requiredSocial ? `, must have ${requiredSocial === 'x' ? 'X' : requiredSocial[0].toUpperCase() + requiredSocial.slice(1)}` : ''})...\n\n` +
-      `⏱️ This can take several minutes: I keep pulling stores and checking each one live — catalog products, age, email, socials — ` +
-      `until I have ${wantCount} that pass every filter. If a run's time budget cuts me short, send anything and I'll pick up exactly where I stopped.`)
+    const plat = PLATFORMS[platform] || PLATFORMS.shopify
+    const platNote = platform && platform !== 'shopify' ? ` · ${plat.emoji} ${plat.name}` : ''
+    const nicheTerms = extractNicheTerms(query)
+    const requireNiche = nicheTerms.length > 0
+    await redis('DEL', `wake:runs:${userId}`)   // fresh hunt → fresh auto-continue budget
+    await send(chatId, `🔍 Hunting for ${wantCount} leads — "${label}" (${scope}${platNote}${freshDays ? `, ≤${freshDays}d old` : ''}${ageNote}${requiredSocial ? `, must have ${requiredSocial === 'x' ? 'X' : requiredSocial[0].toUpperCase() + requiredSocial.slice(1)}` : ''})...\n\n` +
+      (requireNiche
+        ? `🧪 Product-level check ON: every store must prove its niche with ${NICHE_MATCH_MIN}+ matching products from its LIVE catalog — page titles alone don't count.\n`
+        : '') +
+      `🔁 Auto-continue ON: I keep going on my own until ${wantCount} pass or the source runs dry — no need to ping me.\n\n` +
+      `⏱️ This can take several minutes: I keep pulling stores and checking each one live — age, email, socials, page speed — until I have ${wantCount} that pass your filters.`)
     const userQueue = {
-      chatId, rounds: 0, stats: null,
       pending: [], results: [], delivered: 0, done: false,
       awaitingMessages: false, messages: [], awaitingCustomQuery: false,
       label: label || '', includeLocked: !!includeLocked,
       wantCount, freshDays, requiredSocial, ageGate: !!ageGate,
-      platform: platform || null, nicheKey: nicheKey || null, customKws: customKws || null,
+      platform, nicheTerms, requireNiche,
       searchCtx: { query: applyScoutDateFilter(query, month, dateRange), searchAfter: null, exhausted: false, total: null }
     }
     await saveUserQueue(userId, userQueue)
     return await runBatch(chatId, userId, userQueue)
   }
-
 
   async function startBatchJob(chatId, userId, rawLinks, sourceLabel, poolSet, scanTimes, includeLocked, wantCount = 0, freshDays = null) {
     if (!rawLinks.length) {
@@ -3697,14 +3249,13 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     }
     const dedupeKeys = rawLinks.map(normalizeForDedupe)
     const seenMap = await getSeenBatch(dedupeKeys)
-    const newLinks = rawLinks.filter((u, i) => !seenSkips(seenMap[dedupeKeys[i]]))
+    const newLinks = rawLinks.filter((u, i) => !seenMap[dedupeKeys[i]])
     const alreadySeen = rawLinks.length - newLinks.length
     if (!newLinks.length) {
       await send(chatId, `✓ ${rawLinks.length} from ${sourceLabel} — all already checked. Nothing new.`)
       return res.status(200).send('OK')
     }
     const userQueue = {
-      chatId, rounds: 0, stats: null,
       pending: newLinks, results: [], delivered: 0, done: false,
       awaitingMessages: false, messages: [], awaitingCustomQuery: false,
       label: sourceLabel || '', includeLocked: !!includeLocked,
@@ -3716,30 +3267,24 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     return await runBatch(chatId, userId, userQueue)
   }
 
-
-  // PERSISTENT HUNTER (v8): keeps checking batches until `wantCount` leads
-  // PASS the filters, the source is exhausted, or this invocation's time
-  // budget runs out — and when the budget runs out it now CONTINUES BY
-  // ITSELF: a signed self-request spins up a fresh invocation that picks
-  // the run up exactly where it stopped. No more "send anything to keep
-  // hunting" (a ✋ Stop button sits on every progress message). Every
-  // progress message also carries an honest rejection ledger, so a run
-  // like "checked 336, 0 found" always shows exactly WHY nothing passed.
+  // PERSISTENT HUNTER: keeps checking batches until `wantCount` leads PASS the
+  // filters, the source is exhausted, or the run's time budget (~40s, one Vercel
+  // invocation) runs out. v8: on timeout it now WAKES ITSELF (auto-continue)
+  // instead of asking the user to ping it — the hunt just keeps going, with
+  // progress messages along the way. Blocked (403/429/captcha) candidates are
+  // re-queued and retried on the next round instead of being burned as dead.
   async function runBatch(chatId, userId, userQueue) {
-    const deadline = Date.now() + SCOUT_BUDGET_MS
+    const deadline = Date.now() + 40000
     const want = userQueue.wantCount || 0
     const freshDays = userQueue.freshDays || null
     const includeLocked = !!userQueue.includeLocked
     const requiredSocial = userQueue.requiredSocial || null
-    const checkOpts = {
-      platform: userQueue.platform || 'auto',
-      nicheKey: userQueue.nicheKey || null,
-      customKws: userQueue.customKws || null
-    }
-    const st = userQueue.stats = userQueue.stats || { checked: 0, dead: 0, locked: 0, noContact: 0, nicheFail: 0, nicheUnverifiable: 0, socialMissing: 0, socialBlocked: 0, tooOld: 0, passed: 0 }
+    const requireNiche = !!userQueue.requireNiche
+    const checkCtx = { nicheTerms: userQueue.nicheTerms || null, platform: userQueue.platform || 'shopify' }
+    let didWork = false
 
     while (Date.now() < deadline) {
-      const usable = userQueue.results.filter(r => isUsableLead(r, includeLocked, freshDays, requiredSocial))
+      const usable = userQueue.results.filter(r => isUsableLead(r, includeLocked, freshDays, requiredSocial, requireNiche))
       if (want && usable.length >= want) break
       if (!userQueue.pending.length) {
         if (!(await pullNextCandidates(userQueue))) break
@@ -3748,77 +3293,56 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       }
       const batch = userQueue.pending.slice(0, BATCH_SIZE)
       userQueue.pending = userQueue.pending.slice(BATCH_SIZE)
-      const results = await processBatch(batch, checkOpts)
-      userQueue.results.push(...results)
-      // Honest per-store classification — the FIRST gate a store fails is the
-      // bucket it lands in (the same order isUsableLead checks), so the
-      // ledger always matches the real pass/fail logic.
-      for (const r of results) {
-        st.checked++
-        if (r.status !== 'OK') { st.dead++; continue }
-        if (r.isPasswordProtected && !includeLocked) { st.locked++; continue }
-        if (!(r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length)) { st.noContact++; continue }
-        if (r.nicheOk === false) { if (r.niche && r.niche.checked) st.nicheFail++; else st.nicheUnverifiable++; continue }
-        if (requiredSocial && !r.socials?.[requiredSocial]) {
-          if ((r.socialsBlocked || 0) > 0 && !r.socialsDead) st.socialBlocked++; else st.socialMissing++
-          continue
-        }
-        if (freshDays && typeof r.ageDays === 'number' && r.ageDays > freshDays) { st.tooOld++; continue }
-        st.passed++
-      }
+      const results = await processBatch(batch, checkCtx)
+      didWork = true
+      // v8: blocked candidates are retried (up to 3 rounds) instead of being
+      // marked seen as dead — a 429 is not proof a store is bad.
+      const blockedUrls = results.filter(r => r.status === 'blocked').map(r => r.url)
+      const keep = results.filter(r => r.status !== 'blocked')
+      userQueue.results.push(...keep)
       // With the age gate on, record every provably-too-old store so /others
-      // can show exactly what was dropped and why — same for niche and socials.
-      const droppedOld = results.filter(r => freshDays && typeof r.ageDays === 'number' && r.ageDays > freshDays)
+      // can show exactly what was dropped and why.
+      const droppedOld = keep.filter(r => freshDays && typeof r.ageDays === 'number' && r.ageDays > freshDays)
         .map(r => `${r.url} — store too old (${r.ageDays}d, window ${freshDays}d)`)
-      const droppedNiche = results.filter(r => r.status === 'OK' && r.nicheOk === false)
-        .map(r => `${r.url} — product check failed (${r.niche?.checked ? `${r.niche.matches}/${r.niche.total} products match` : 'no readable catalog'}${r.niche?.samples?.length ? ', e.g. ' + r.niche.samples[0].slice(0, 40) : ''})`)
-      const droppedSocial = results.filter(r => r.status === 'OK' && requiredSocial && !r.socials?.[requiredSocial] && r.nicheOk !== false)
-        .map(r => `${r.url} — no live ${requiredSocial} link (skipped: strict ${requiredSocial} mode)`)
-      const droppedAll = [...droppedOld, ...droppedNiche, ...droppedSocial]
-      if (droppedAll.length) await saveFilteredOut(userId, droppedAll)
-      // Seen-memory: only PROVEN rejects block a re-check. Unverifiable
-      // stores (catalog unreadable, social link behind a bot wall) stay
-      // re-checkable so one blocked run can't burn the whole pool.
-      await markSeenBatch(results.map(r => [normalizeForDedupe(r.url), {
-        status: r.status,
-        nicheOk: r.niche ? (r.niche.checked ? (r.nicheOk === true) : null) : null,
-        socialOk: requiredSocial ? (r.socials?.[requiredSocial] ? true : ((r.socialsBlocked || 0) > 0 && !r.socialsDead) ? null : false) : null,
-        checkedAt: new Date().toISOString()
-      }]))
+      if (droppedOld.length) await saveFilteredOut(userId, droppedOld)
+      await markSeenBatch(keep.map(r => [normalizeForDedupe(r.url), { status: r.status, email: r.email, checkedAt: new Date().toISOString() }]))
+      if (blockedUrls.length && (userQueue.blockedRounds || 0) < 3) {
+        userQueue.blockedRounds = (userQueue.blockedRounds || 0) + 1
+        userQueue.pending.push(...blockedUrls)
+        await send(chatId, `🛡 ${blockedUrls.length} site${blockedUrls.length === 1 ? '' : 's'} rate-limited me — re-queued for retry instead of dropped.`)
+      }
       await saveUserQueue(userId, userQueue)
     }
 
-    const usableAll = userQueue.results.filter(r => isUsableLead(r, includeLocked, freshDays, requiredSocial))
+    const usableAll = userQueue.results.filter(r => isUsableLead(r, includeLocked, freshDays, requiredSocial, requireNiche))
     const fresh = usableAll.slice(userQueue.delivered || 0).sort((a, b) => (b.score || 0) - (a.score || 0))
     const prevDelivered = (userQueue.delivered || 0)
     userQueue.delivered = usableAll.length
 
     const sourceExhausted = !userQueue.pending.length && (!userQueue.searchCtx || userQueue.searchCtx.exhausted)
     const reached = !!(want && usableAll.length >= want)
-    const budgetOut = !reached && !sourceExhausted
     userQueue.done = !!(reached || sourceExhausted)
 
-    const breakdown = [
-      st.dead ? `${st.dead} dead/unreachable` : '',
-      st.locked ? `${st.locked} password-locked` : '',
-      st.noContact ? `${st.noContact} no email/contact` : '',
-      st.nicheFail ? `${st.nicheFail} under ${NICHE_MIN_PRODUCTS} niche products` : '',
-      st.nicheUnverifiable ? `${st.nicheUnverifiable} catalog unreadable (blocked?)` : '',
-      st.socialMissing ? `${st.socialMissing} no ${requiredSocial || 'social'} link` : '',
-      st.socialBlocked ? `${st.socialBlocked} ${requiredSocial || 'social'} link unverifiable (blocked)` : '',
-      st.tooOld ? `${st.tooOld} too old` : ''
-    ].filter(Boolean).join(' · ')
+    // Transparency: where every checked candidate went (the "checked 336,
+    // saw 0" mystery gets an exact breakdown now).
+    const deadC = userQueue.results.filter(r => r.status === 'dead').length
+    const blockedC = userQueue.results.filter(r => r.status === 'blocked').length
+    const noContactC = userQueue.results.filter(r => r.status === 'OK' && !(r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length)).length
+    const nicheMissC = requireNiche ? userQueue.results.filter(r => r.status === 'OK' && r.niche && r.niche.matches < NICHE_MATCH_MIN && !(r.niche.blocked && r.niche.titleMatched)).length : 0
+    const socialMissC = requiredSocial ? userQueue.results.filter(r => r.status === 'OK' && !r.socials?.[requiredSocial]).length : 0
+    const breakdown = []
+    if (deadC) breakdown.push(`${deadC} dead`)
+    if (blockedC) breakdown.push(`${blockedC} blocked (retrying)`)
+    if (noContactC) breakdown.push(`${noContactC} no contact info`)
+    if (nicheMissC) breakdown.push(`${nicheMissC} niche-miss (<${NICHE_MATCH_MIN} products)`)
+    if (socialMissC) breakdown.push(`${socialMissC} missing ${requiredSocial === 'x' ? 'X' : requiredSocial}`)
+    const breakdownLine = breakdown.length ? ` — dropped: ${breakdown.join(', ')}` : ''
 
     let header
-    if (reached) header = `✅ ALL DONE — ${usableAll.length} leads as requested${freshDays ? ` (≤${freshDays}d old)` : ''}, checked ${st.checked} stores to find them.`
-    else if (sourceExhausted) header = `✓ Source finished — ${usableAll.length} usable of ${st.checked} checked.`
-    else header = `⏳ ${usableAll.length} of ${want} so far (checked ${st.checked}) — I keep hunting automatically, you don't need to send anything.`
-    if (breakdown) header += `\n📉 Rejections so far: ${breakdown}`
+    if (reached) header = `✅ ALL DONE — ${usableAll.length} leads as requested${freshDays ? ` (≤${freshDays}d old)` : ''}, checked ${userQueue.results.length} stores to find them.`
+    else if (sourceExhausted) header = `✓ Source finished — ${usableAll.length} usable of ${userQueue.results.length} checked.${breakdownLine}`
+    else header = `⏳ ${usableAll.length} of ${want} so far (checked ${userQueue.results.length}${breakdownLine}) — AUTO-CONTINUING, no need to reply.`
     if (userQueue.ageGate && freshDays) header += `\n🎂 Store age ≤ ${freshDays}d enforced — older stores dropped (see /others).`
-    if (userQueue.nicheKey && userQueue.nicheKey !== 'any') header += `\n🧪 ${nicheLabel(userQueue.nicheKey)}: every store's LIVE catalog showed ${NICHE_MIN_PRODUCTS}+ matching products — title-only matches never counted. Failures logged (see /others).`
-    else if (userQueue.nicheKey === 'any') header += `\n🧪 Product-verified: every store proved a live catalog with ${NICHE_MIN_PRODUCTS}+ real products.`
-    else if (userQueue.customKws?.length) header += `\n🧪 Product-verified search: ${userQueue.customKws.slice(0, 6).join(', ')} — every store had ${NICHE_MIN_PRODUCTS}+ matching products in its live catalog.`
-    if (requiredSocial) header += `\n📱 Strict ${requiredSocial === 'x' ? 'X' : requiredSocial}: every lead has a live, verified ${requiredSocial} page — dead or wrong-platform links were dropped and logged (see /others).`
     if (userQueue.searchCtx && userQueue.searchCtx.total != null && !sourceExhausted) header += `\n📊 ${userQueue.searchCtx.total} total matches in this window.`
 
     let reply = header
@@ -3826,38 +3350,38 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     for (const r of fresh) {
       leadNum++
       const nameLine = r.store_name ? `${r.store_name}\n    🔗 ${r.url}` : `🔗 ${r.url}`
-      const socialEntries = Object.entries(r.socials || {})
-      // The platform the user demanded comes first with a ✅ so it's obvious
-      // at a glance the lead meets the strict filter.
-      socialEntries.sort(([a], [b]) => (a === requiredSocial ? -1 : b === requiredSocial ? 1 : 0))
-      const socialsList = socialEntries.map(([k, v]) => `${k === requiredSocial ? '✅ ' : ''}${k}: ${v}`).join('\n              ')
+      // Strict social search: when the user demanded ONE platform, the lead
+      // line shows that platform's link first and only it.
+      const socialsForLine = requiredSocial
+        ? (r.socials?.[requiredSocial] ? { [requiredSocial]: r.socials[requiredSocial] } : {})
+        : (r.socials || {})
+      const socialsList = Object.entries(socialsForLine).map(([k, v]) => `${k === 'x' ? 'X' : k[0].toUpperCase() + k.slice(1)}: ${v}`).join('\n              ')
       const socialsNote = socialsList ? `\n    💬 social: ${socialsList}` : ''
-      const nicheNote = (r.niche && r.niche.checked && r.niche.matches >= 0)
-        ? `\n    🧪 products: ${r.niche.matches}${r.niche.total ? `/${r.niche.total}` : ''} match${r.niche.source ? ` (${r.niche.source})` : ''}${r.niche.samples?.length ? ` — e.g. "${r.niche.samples[0].slice(0, 50)}"` : ''}`
-        : ''
       const contactNote = r.contact_page ? `\n    🌐 contact page: ${r.contact_page}` : ''
       const genericNote = r.email_is_generic ? ' (generic)' : ''
       const emailNote = r.email !== 'no email' ? `\n    📧 ${r.email}${genericNote}` : ''
       const hotTag = r.score >= 70 ? ' 🔥' : ''
       const scoreNote = `\n    📊 score: ${r.score}${hotTag}` + (r.scoreReasons?.length ? ` (${r.scoreReasons.join(', ')})` : '')
       const ageNote = (typeof r.ageDays === 'number') ? `\n    🎂 age: ${r.ageDays}d${r.ageDays <= 30 ? ' 🔥' : ''}` : (userQueue.ageGate ? '\n    🎂 age unknown — no source could prove it' : '')
+      const nicheNote = r.niche && r.niche.checked
+        ? `\n    🛍 niche proof: ${r.niche.matches}/${r.niche.checked} products matched via ${r.niche.method}` +
+          (r.niche.samples?.length ? ` — e.g. "${r.niche.samples[0]}"` : '') +
+          (r.niche.matches >= NICHE_MATCH_MIN ? '' : (r.niche.blocked ? ' ⚠️ title-only (product source blocked)' : ' ⚠️ below 3-product bar'))
+        : ''
       const hook = auditHookLine(r)
       const hookNote = hook ? `\n    💡 ${hook}` : ''
       reply += `\n\n${leadNum}. ${nameLine}${scoreNote}${ageNote}${nicheNote}${hookNote}${socialsNote}${contactNote}${emailNote}`
     }
     if (!fresh.length && !userQueue.done) reply += `\n\n(The last batch didn't add any leads that pass your filters — still hunting.)`
     if (userQueue.done) reply += `\n\n────────\nSend anything to move to the message-writing step.`
-
     await saveUserQueue(userId, userQueue)
-    const roundNo = (userQueue.rounds || 0)
-    if (budgetOut && roundNo < MAX_AUTO_ROUNDS && userQueue.chatId) {
-      fireSelfContinue(userId, 'scout')     // the next hop is already on its way
-      await sleep(300)
-      await sendKeyboard(chatId, `${reply}\n\n🔁 Round ${roundNo + 1} starts by itself in a few seconds — progress messages keep coming until I've got your ${want}.`,
-        [[B('✋ Stop this search', 'autostop:scout')]])
-    } else {
-      if (budgetOut) reply += `\n\n⚠️ The auto-hunt hit its safety cap (${MAX_AUTO_ROUNDS} rounds). Send anything and I'll continue from where I stopped.`
-      await send(chatId, reply)
+    await send(chatId, reply)
+
+    // v8 AUTO-CONTINUE: budget ran out with work still queued — wake ourselves
+    // instead of waiting for a user ping. Bounded by the wake:runs cap.
+    if (!userQueue.done) {
+      const woke = await scheduleAutoWake(chatId, userId, 'scout')
+      if (!woke) await send(chatId, `⏳ Time budget hit — send anything and I'll pick up exactly where I stopped.`)
     }
     return res.status(200).send('OK')
   }
@@ -3885,7 +3409,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
   // Everything that spends the owner's Google account / GitHub minutes / shared
   // lead database stays owner-only (see PUBLIC_CMDS).
   const PUBLIC_ACCESS = process.env.PUBLIC_ACCESS === 'true'
-  const PUBLIC_CMDS = ['/start', '/menu', '/help', '/cancel', '/newuk', '/access']
+  const PUBLIC_CMDS = ['/start', '/menu', '/help', '/cancel', '/newuk', '/access', '/continue']
   const actorId = String(body.callback_query?.from?.id || body.message?.from?.id || '')
   await trackUser(actorId)
   const isOwner = !ADMIN_ID || actorId === ADMIN_ID
@@ -3917,13 +3441,15 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         return {
           text:
             `<b>🇬🇧 New UK Companies</b>\n\n` +
-            `<b>What it does:</b> pulls brand-new companies straight from the official UK company register — then live-verifies each company's website. Free and 100% real.\n\n` +
+            `<b>What it does:</b> pulls brand-new companies straight from the official UK company register. Free and 100% real.\n\n` +
             `<b>Why it's useful:</b> a company this new has no suppliers, website or marketing yet — the perfect moment to pitch it.\n\n` +
-            `<b>Pick how far back to look</b> — then choose 🔗 with / 🚫 without a website:`,
+            `<b>Pick how far back to look</b> (more days = bigger list):\n\n` +
+            `🌐 <b>With website</b> / 🕸 <b>No website yet</b> — I check every company for a live site (domain guesses + real fetches). With-website results get the full verification: builder, email, socials, speed, age.`,
           kb: [
             [B('📅 Today · 20', 'run:/newuk 1 20'), B('📅 3 days · 50', 'run:/newuk 3 50')],
             [B('📅 7 days · 100', 'run:/newuk 7 100'), B('📅 30 days · 100', 'run:/newuk 30 100')],
-            [B('✏️ Custom days & count', 'newukcustom'), B('📅 Custom date range', 'newukrange')],
+            [B('🌐 Today · 20 · with website', 'run:/newuk 1 20 website'), B('🕸 Today · 20 · no website', 'run:/newuk 1 20 nowebsite')],
+            [B('🌐 7 days · 50 · with website', 'run:/newuk 7 50 website')],
             [go('🕵️ Next step: find their contacts', 'menu:findco')],
             nav()
           ]
@@ -3966,10 +3492,30 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
             `Find online stores built on Shopify, check they're live, and grab their contact email.\n\n` +
             `🔍 <b>Search</b> — look for stores by niche (skincare, jewelry, pets…)\n` +
             `🌱 <b>Watch</b> — get a message the moment a brand-new store appears\n` +
-            `📄 <b>Have your own list?</b> Just send me a .txt file of links and I'll check them all.`,
+            `📄 <b>Have your own list?</b> Just send me a .txt file of links and I'll check them all.\n\n` +
+            `💡 Want Wix and Etsy too? Use 🏬 Online Stores on the main menu.`,
           kb: [
             [go('🔍 Search stores', 'run:/scout')],
             [go('🌱 Watch for new stores', 'run:/fresh 30'), go('🛑 Stop watching', 'run:/freshoff')],
+            [B('🏬 All platforms (Wix, Etsy…)', 'menu:onlinestores')],
+            nav()
+          ]
+        }
+      case 'onlinestores':
+        return {
+          text:
+            `<b>🏬 Online Stores</b>\n\n` +
+            `Pick a platform — the SAME deep pipeline then verifies every candidate at <b>product level</b> against its live catalog (never just the page title):\n` +
+            `🛍️ <b>Shopify</b> — live /products.json check · 3+ niche-matching products required\n` +
+            `🧩 <b>Wix</b> — real product pages found & matched · 3+ required\n` +
+            `🧵 <b>Etsy</b> — live shop listings matched · 3+ required\n` +
+            `➕ <b>More</b> — WooCommerce store API, custom builders\n\n` +
+            `Social filter stays strict everywhere: pick Facebook → Facebook-only links, exact count, dead pages proven dead.\n\n` +
+            `🔁 Every search auto-continues until your count is filled.`,
+          kb: [
+            [B('🛍️ Shopify', 'plat:shopify'), B('🧩 Wix', 'plat:wix')],
+            [B('🧵 Etsy', 'plat:etsy'), B('➕ More platforms', 'plat:more')],
+            [B('🌐 All platforms mixed', 'plat:all')],
             nav()
           ]
         }
@@ -4052,13 +3598,11 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
           text:
             `<b>📜 All commands</b>\n(You can also just tap the buttons — no typing needed.)\n\n` +
             `/start — main menu\n` +
-            `/newuk [days] [count] [with|nosite|all] — new UK companies, website-verified\n` +
-            `      · one number ≤30 = days back, >30 = how many you want\n` +
-            `      · /newuk range — pick your own exact from–to date window\n` +
-            `      · with/nosite/all — only companies with / without a live website\n` +
+            `/newuk [days] [count] [website|nowebsite] — new UK companies\n` +
             `/findco — find contacts for a pasted company list\n` +
             `/find &lt;city&gt; &lt;niche&gt; [count] — local businesses\n` +
-            `/scout — Shopify · Wix · Etsy · Webflow store search\n` +
+            `/scout — search online stores (Shopify / Wix / Etsy — pick in 🏬 Online Stores)\n` +
+            `/continue — resume an unfinished search yourself (normally automatic)\n` +
             `/fresh [age_days] [count] — watch for new Shopify stores\n` +
             `/hunt &lt;lovable|framer|durable|wix|all&gt; [count] — find AI-built websites (🏢 business-only toggle on every hunt screen)\n` +
             `/check &lt;url&gt; — deep-check one site (builder, contacts, weaknesses)\n` +
@@ -4091,11 +3635,12 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
             `<b>What do you want to do?</b>`),
           kb: [
             [go('🗺️ Local Businesses', 'menu:local'), go('🕵️ Find Contacts', 'menu:findco')],
-            [B('🇬🇧 New UK Companies', 'menu:uk'), go('🛍️ Shopify Stores', 'menu:shopify')],
+            [B('🇬🇧 New UK Companies', 'menu:uk'), B('🏬 Online Stores', 'menu:onlinestores')],
             [go('🤖 AI-Built Sites', 'menu:aihunter'), go('📂 My Leads', 'menu:leads')],
             [B('🎁 Gifts', 'menu:gifts'), B('🧰 Tools', 'menu:tools')],
             [B('❓ How it works', 'menu:help')],
-            owner ? [B('🛠 Admin', 'menu:admin')] : [B('💳 Get Access', 'run:/access')]
+            owner ? [B('🛠 Admin', 'menu:admin')] : [B('💳 Get Access', 'run:/access')],
+            [B('🆕 v8 — Online Stores · Auto-continue · Anti-block', 'menu:help')]
           ]
         }
       }
@@ -4759,44 +4304,6 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
   //  CALLBACK BUTTONS
   // ══════════════════════════════════════════════
 
-  // ════════════════════════════════════════════════════════════════════
-  //  AUTO-CONTINUE HOP (v8) — the bot calls ITSELF to keep hunting
-  //  without the user sending anything. Each hop is a fresh Vercel
-  //  invocation with its own time budget; it picks the saved run up from
-  //  Redis, checks the next batch, and kicks the next hop when its budget
-  //  runs out again — until the requested count is reached, the source is
-  //  exhausted, the user taps ✋ Stop, or the safety cap hits.
-  // ════════════════════════════════════════════════════════════════════
-  if (req.method === 'GET') {
-    try {
-      const u = new URL(req.url || '', `http://${REQ_HOST || 'localhost'}`)
-      const contUser = u.searchParams.get('cont')
-      const mode = u.searchParams.get('mode') === 'newuk' ? 'newuk' : 'scout'
-      if (contUser && u.searchParams.get('sig') === contSig(contUser)) {
-        let locked = false
-        try { locked = await acquireLock(contUser) } catch { locked = false }
-        if (locked) {
-          try {
-            const q = await getUserQueue(contUser)
-            if (mode === 'newuk' && q.newukCtx && !q.newukCtx.done && (q.newukCtx.rounds || 0) < MAX_AUTO_ROUNDS && q.newukCtx.chatId) {
-              q.newukCtx.rounds = (q.newukCtx.rounds || 0) + 1
-              await saveUserQueue(contUser, q)
-              return await runNewukBatch(q.newukCtx.chatId, contUser, q)
-            }
-            const scoutAlive = !q.done && (q.rounds || 0) < MAX_AUTO_ROUNDS && q.chatId &&
-              ((q.pending || []).length > 0 || (q.searchCtx && !q.searchCtx.exhausted))
-            if (mode !== 'newuk' && scoutAlive) {
-              q.rounds = (q.rounds || 0) + 1
-              await saveUserQueue(contUser, q)
-              return await runBatch(q.chatId, contUser, q)
-            }
-          } finally { await releaseLock(contUser).catch(() => {}) }
-        }
-      }
-    } catch (e) { console.error('auto-continue hop failed:', e && e.message) }
-    return res.status(200).send('OK')
-  }
-
   if (body.callback_query) {
     const cbChatId = body.callback_query.message.chat.id
     const cbUserId = String(body.callback_query.from?.id || '')
@@ -4836,11 +4343,10 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         q.awaitingSocialFilter = true
         await saveUserQueue(cbUserId, q)
         await send(cbChatId,
-          `📱 Social-media filter\n\nType ALL to show every usable store, or type ONE platform that every result must have: LinkedIn, Facebook, Instagram, X, TikTok, YouTube, or Pinterest.\n\n` +
-          `STRICT, on every platform: only LIVE, verified links count — dead pages, "account not found", login-walled ghosts and links pointing at the wrong platform are dropped and never count toward your requested total. If a store lacks a valid link for your chosen platform, it is skipped.`)
+          `📱 Social-media filter\n\nType ALL to show every usable store, or type ONE platform that every result must have: LinkedIn, Facebook, Instagram, or X.\n\n` +
+          `If a store lacks a valid link for your chosen platform, it is skipped and does not count toward your requested total.`)
         return res.status(200).send('OK')
       }
-
 
       if (data === 'scout_custom') {
         await send(cbChatId, 'Send your custom search query now.')
@@ -4901,148 +4407,37 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         return res.status(200).send('OK')
       }
 
-      // ── 🇬🇧 UK companies: custom count + website-filter buttons ──
-      if (data === 'newukcustom') {
-        const q = await getUserQueue(cbUserId)
-        q.awaitingNewukArgs = true
-        await saveUserQueue(cbUserId, q)
-        await send(cbChatId, `📅 Send: DAYS COUNT\n\ne.g.  7 50  = companies incorporated in the last 7 days, 50 results.\n(Days 1–365, count 1–100)`)
+      // ── 🏬 Online Stores platform picker (Shopify / Wix / Etsy / More) ──
+      if (data.startsWith('plat:')) {
+        const key = data.slice('plat:'.length)
+        const p = PLATFORMS[key]
+        if (!p) return res.status(200).send('OK')
+        await setScoutPlatform(cbUserId, key)
+        await sendKeyboard(cbChatId,
+          `${p.emoji} <b>${p.name}</b> selected.\n\n${p.desc}\n\n` +
+          `Every niche search now runs the deep product-level check for ${p.name} — a lead only counts with ${NICHE_MATCH_MIN}+ matching products from the live catalog.\n\n` +
+          `Tap Search to start (you'll pick a niche, a date window and a count next):`, [
+          [{ text: `🔍 Search ${p.name} stores`, callback_data: 'run:/scout' }],
+          [{ text: '🏬 Choose a different platform', callback_data: 'menu:onlinestores' }],
+          [{ text: '🏠 Main menu', callback_data: 'menu:main' }]
+        ])
         return res.status(200).send('OK')
-      }
-      if (data === 'newukrange') {
-        const q = await getUserQueue(cbUserId)
-        q.awaitingNewukRange = true
-        await saveUserQueue(cbUserId, q)
-        await send(cbChatId, `📅 Send ONE message with: FROM TO COUNT\n\ne.g.  2026-10-01 2026-10-15 50\n(dates YYYY-MM-DD, max span 1 year, count ≤ 100)`)
-        return res.status(200).send('OK')
-      }
-      if (data.startsWith('newuksite:')) {
-        const site = data.slice('newuksite:'.length)
-        const q = await getUserQueue(cbUserId)
-        if (!q.pendingNewuk) {
-          await send(cbChatId, 'That UK search expired — send /newuk to start again.')
-          return res.status(200).send('OK')
-        }
-        q.pendingNewuk.siteFilter = ['with', 'without', 'all'].includes(site) ? site : 'all'
-        q.awaitingNewukSite = false
-        const cfg = q.pendingNewuk
-        q.pendingNewuk = null
-        await saveUserQueue(cbUserId, q)
-        return await startNewukHunt(cbChatId, cbUserId, cfg)
       }
 
       if (data.startsWith('scout_')) {
         const key = data.replace('scout_', '')
         const search = SAVED_SEARCHES[key]
         if (!search) return res.status(200).send('OK')
+        const platform = await getScoutPlatform(cbUserId)
+        const query = buildPlatformQuery(search.query, platform)
+        const platPrefix = (platform && platform !== 'shopify' && PLATFORMS[platform]) ? `${PLATFORMS[platform].emoji} ${PLATFORMS[platform].name} · ` : ''
         const q = await getUserQueue(cbUserId)
-        // Niche presets now ship their own strict product check — the urlscan
-        // query is the FULL store pool and the live-catalog verification does
-        // the niche filtering, so stores like "Aurora Boutique" selling serums
-        // with no niche word in the title are found too.
-        q.pendingSearch = { query: search.query, label: search.label, nicheKey: search.niche || null, platform: 'shopify' }
+        q.pendingSearch = { query, label: platPrefix + search.label, platform }
         q.awaitingScoutMonth = true
         await saveUserQueue(cbUserId, q)
-        await sendKeyboard(cbChatId, `"${search.label}" — which month and year should I pull from?\n\nPick a window — the search index only reaches back 30 days, so older months aren't searchable.${search.niche ? `\n\n🧪 Every store I bring back will have ${NICHE_MIN_PRODUCTS}+ matching products verified in its live catalog.` : ''}`, monthPickerKeyboard())
+        await sendKeyboard(cbChatId, `${platPrefix}${search.label}" — which month and year should I pull from?\n\nPick a window — the search index only reaches back 30 days, so older months aren't searchable.`, monthPickerKeyboard())
         return res.status(200).send('OK')
       }
-
-      // ── 🛍 Online stores — platform picker ──
-      if (data === 'scoutplatforms') {
-        await sendKeyboard(cbChatId,
-          `🛍 Online stores — pick the platform\n\nEvery platform runs the same strict pipeline: live catalog → product-level niche check → ${NICHE_MIN_PRODUCTS}+ matching products or the store doesn't count.`, platformPickerKeyboard())
-        return res.status(200).send('OK')
-      }
-      if (data === 'scoutplatback') {
-        const keyboard = Object.entries(SAVED_SEARCHES).map(([key, s]) =>
-          [{ text: s.label, callback_data: `scout_${key}` }])
-        keyboard.push([{ text: '🛍 Online stores — pick platform', callback_data: 'scoutplatforms' }])
-        keyboard.push([{ text: '✏️ Custom search term', callback_data: 'scout_custom' }])
-        await sendKeyboard(cbChatId, 'Which search do you want to run?', keyboard)
-        return res.status(200).send('OK')
-      }
-      if (data.startsWith('scoutplat:')) {
-        const plat = data.slice('scoutplat:'.length)
-        if (plat === 'woocommerce') {
-          await send(cbChatId,
-            `🔌 WooCommerce stores live on their own domains (not one big wixsite.com-style host), so the search index can't list them the way it lists Shopify.\n\nSame strict product check, two ways to run it:\n` +
-            `1️⃣ Send me links (one per line, or a .txt file) of the stores you already know — I verify each one's live catalog (WP product API + sitemap) and keep only ${NICHE_MIN_PRODUCTS}+ matching products.\n` +
-            `2️⃣ Or tap 🧩 Any store platform and I'll hunt across Shopify/Wix/Squarespace/Big Cartel/Webflow — Woo sites get verified too whenever they show up.`)
-          return res.status(200).send('OK')
-        }
-        const plat_def = STORE_PLATFORMS[plat]
-        if (!plat_def) return res.status(200).send('OK')
-        const q = await getUserQueue(cbUserId)
-        q.pendingSearch = { query: plat_def.query, label: plat_def.label, platform: plat, nicheKey: null, needNiche: true }
-        q.awaitingScoutMonth = true
-        await saveUserQueue(cbUserId, q)
-        await sendKeyboard(cbChatId, `"${plat_def.label}" — which window should I pull from? (search index only reaches back 30 days)`, monthPickerKeyboard())
-        return res.status(200).send('OK')
-      }
-
-      // ── 🧪 Product-check niche picker (platform runs) ──
-      if (data.startsWith('scoutniche:')) {
-        const niche = data.slice('scoutniche:'.length)
-        const q = await getUserQueue(cbUserId)
-        if (!q.pendingSearch) {
-          await send(cbChatId, 'That search expired — send /scout to start again.')
-          return res.status(200).send('OK')
-        }
-        q.pendingSearch.nicheKey = niche === 'any' ? 'any' : niche
-        q.pendingSearch.needNiche = false
-        q.awaitingNichePick = false
-        q.awaitingLockedFilter = true
-        await saveUserQueue(cbUserId, q)
-        await sendKeyboard(cbChatId,
-          (niche === 'any'
-            ? `🛍 Any products — every store still gets strictly verified: live catalog with ${NICHE_MIN_PRODUCTS}+ real products, no unreadable/empty "stores".`
-            : `🧪 Strict product check: only stores whose LIVE catalog shows ${NICHE_MIN_PRODUCTS}+ ${nicheLabel(niche).replace(/^[^\s]+\s/, '')} products will be returned — no title-only matches.`) +
-          `\n\n🔐 Include password-protected / "coming soon" stores?`, [
-          [{ text: '✅ Yes, show them', callback_data: 'lockedyes' }],
-          [{ text: '🚫 No, skip them', callback_data: 'lockedno' }]
-        ])
-        return res.status(200).send('OK')
-      }
-
-      // ── 🇬🇧 UK website preference + custom count ──
-      if (data.startsWith('ukweb:')) {
-        const pref = data.slice('ukweb:'.length)
-        await redis('SET', `uk:webpref:${cbUserId}`, pref)
-        UK_WEB_PREF_CACHE = pref
-        await showScreen(cbChatId, body.callback_query?.message?.message_id, 'uk', isOwner, hasAccess)
-        await send(cbChatId, pref === 'with'
-          ? `🌐 WITH WEBSITE locked in — every /newuk run now verifies each company through the full pipeline (name-derived domains → DuckDuckGo → live HTTP → content match). Companies with no proven site are dropped and logged.`
-          : pref === 'without'
-            ? `📵 NO WEBSITE locked in — every /newuk run verifies absence the same strict way. Companies WITH a live site are dropped and logged.`
-            : `🎲 ANY — website checks are skipped, you get every date-matched company (fastest).`)
-        return res.status(200).send('OK')
-      }
-      if (data === 'ukcustom') {
-        const q = await getUserQueue(cbUserId)
-        q.awaitingUkDays = true
-        q.awaitingUkCount = false
-        await saveUserQueue(cbUserId, q)
-        await send(cbChatId, `🇬🇧 Custom UK search\n\nStep 1 of 2 — how many DAYS back? (1–30)\ne.g. send 5`)
-        return res.status(200).send('OK')
-      }
-
-
-      // ── ✋ Stop button on the auto-hunt progress messages (v8) ──
-      if (data.startsWith('autostop:')) {
-        const mode = data.slice('autostop:'.length)
-        const q = await getUserQueue(cbUserId)
-        if (mode === 'newuk' && q.newukCtx) {
-          q.newukCtx.done = true
-          await saveUserQueue(cbUserId, q)
-          await send(cbChatId, `✋ Stopped — the UK hunt won't continue by itself. Your results so far are safe; send /newuk again anytime.`)
-        } else {
-          q.done = true
-          await saveUserQueue(cbUserId, q)
-          await send(cbChatId, `✋ Stopped — the hunt won't continue by itself. Your results so far are safe; send anything later to pick up where I stopped.`)
-        }
-        return res.status(200).send('OK')
-      }
-
 
       if (data.startsWith('scoutmonth:')) {
         const month = data.slice('scoutmonth:'.length)
@@ -5239,8 +4634,6 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     midFlowQueue.awaitingCompanyList || midFlowQueue.awaitingReviewCap ||
     midFlowQueue.awaitingMessages || midFlowQueue.awaitingCustomQuery ||
     midFlowQueue.awaitingLeadCount || midFlowQueue.awaitingLockedFilter ||
-    midFlowQueue.awaitingNewukArgs || midFlowQueue.awaitingNewukRange || midFlowQueue.awaitingNewukSite ||
-    (midFlowQueue.newukCtx && !midFlowQueue.newukCtx.done) ||
     midFlowQueue.awaitingScoutMonth || midFlowQueue.awaitingFreshFilter || midFlowQueue.awaitingScoutAgeGate ||
     midFlowQueue.awaitingCustomDate || midFlowQueue.awaitingSocialFilter ||
     midFlowQueue.awaitingHuntUrl || (midFlowQueue.deepQ && midFlowQueue.deepQ.started) ||
@@ -5597,15 +4990,15 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
   if (/^\/cancel(@\w+)?$/.test(text)) {
     const q = await getUserQueue(userId)
     q.awaitingMessages = false; q.awaitingReviewCap = false; q.awaitingCompanyList = false
-    q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false; q.awaitingScoutMonth = false; q.awaitingFreshFilter = false; q.awaitingScoutAgeGate = false; q.awaitingNichePick = false
-    q.awaitingNewukArgs = false; q.awaitingNewukRange = false; q.awaitingNewukSite = false; q.pendingNewuk = null; q.newukCtx = null
+    q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false; q.awaitingScoutMonth = false; q.awaitingFreshFilter = false; q.awaitingScoutAgeGate = false
     q.awaitingCustomDate = false; q.awaitingSocialFilter = false; q.customDate = null; q.pendingSearch = null
     q.awaitingHuntUrl = false; q.aiHunt = null
     q.awaitingPayContact = false; q.awaitingPayPrice = false; q.awaitingTrialSize = false
     q.answeringGift = null; q.giftDraft = null; q.awaitingStartText = false; q.awaitingBroadcast = false
     q.pendingFindJob = null; q.pending = []; q.results = []; q.messages = []
     await saveUserQueue(userId, q)
-    await send(chatId, '🧹 Cleared. The bot is no longer waiting for anything — old scout results and pending batches were dropped.')
+    await redis('DEL', `wake:runs:${userId}`)   // /cancel also stops the auto-continue loop
+    await send(chatId, '🧹 Cleared. The bot is no longer waiting for anything — old scout results and pending batches were dropped. Auto-continue stopped too.')
     return res.status(200).send('OK')
   }
 
@@ -5663,13 +5056,16 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     return res.status(200).send('OK')
   }
 
-  // ── /newuk [days] [count] [with|nosite|all] — UK companies (Companies House) ──
-  // Runs straight from Vercel on the free official API. The owner ALWAYS gets
-  // exactly the count they asked for — /newuk never spends a search credit,
-  // so the free-tier result caps no longer shrink it. (Non-owner tiers still
-  // get capped, with a visible message.) One number only? ≤30 = days back,
-  // >30 = result count. A strict London-calendar date window is enforced
-  // client-side, and every company can be website-verified before reporting.
+  // ── /newuk [days] [count] [website|nowebsite] — newly incorporated UK companies ──
+  // Official free Companies House API, no daemon needed — runs straight from Vercel.
+  // v8 fixes:
+  //   • default count is now 100 (was 20 → looked like "10 leads only" once the
+  //     free cap sliced it; owner runs are never capped)
+  //   • STRICT date-range match: every returned company is re-checked client-side
+  //     against [from .. to] — Companies House sometimes leaks out-of-range rows
+  //   • 🌐 website / 🕸 no-website mode: every company gets a live website hunt
+  //     (name-based domain guesses, real HTTP checks); with-website hits get the
+  //     full verification dossier (builder, email, socials, speed, age)
   if (text.startsWith('/newuk')) {
     if (!COMPANIES_HOUSE_API_KEY) {
       await send(chatId,
@@ -5679,53 +5075,175 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         `Add it to Vercel as COMPANIES_HOUSE_API_KEY, then redeploy.`)
       return res.status(200).send('OK')
     }
-    const parts = text.trim().split(/\s+/).slice(1)
-    if (parts[0] === 'range' || parts[0] === 'custom') {
-      const q = await getUserQueue(userId)
-      q.awaitingNewukRange = true
-      await saveUserQueue(userId, q)
-      await send(chatId, `📅 Send ONE message with: FROM TO COUNT\n` +
-        `e.g.  2026-10-01 2026-10-15 50\n` +
-        `(dates YYYY-MM-DD, max span 1 year, count ≤ 100)`)
-      return res.status(200).send('OK')
+    const parts = text.split(/\s+/).slice(1)
+    // Website filter flag: "website"/"web" → must have a site; "nowebsite"/"noweb" → must NOT have one
+    let webMode = 'all'
+    const flagIdx = parts.findIndex(p => /^(website|withwebsite|with_website|web|nowebsite|no_website|noweb|nosite|nosites)$/i.test(p))
+    if (flagIdx >= 0) {
+      webMode = /^no/i.test(parts[flagIdx]) ? 'no' : 'yes'
+      parts.splice(flagIdx, 1)
     }
-    let days = 1, count = 20, siteFlag = null
-    const nums = parts.filter(p => /^\d+$/.test(p)).map(p => parseInt(p, 10))
-    const flag = parts.map(p => p.toLowerCase()).find(p => ['with', 'nosite', 'no', 'without', 'all'].includes(p))
-    if (flag) siteFlag = (flag === 'nosite' || flag === 'no' || flag === 'without') ? 'without' : (flag === 'with' ? 'with' : 'all')
-    if (nums.length === 1) {
-      if (nums[0] > 30) count = nums[0]        // one big number = result count
-      else days = nums[0]                       // one small number = days back
-    } else if (nums.length >= 2) {
-      days = nums[0]; count = nums[1]
-    }
-    days = Math.min(Math.max(days, 1), 365)
-    count = Math.min(Math.max(count, 1), 100)
+    const days = Math.min(Math.max(parseInt(parts[0]) || 1, 1), 30)
+    const requestedCount = Math.min(Math.max(parseInt(parts[1]) || 100, 1), 100)
+    // /newuk is always free to run (free government API, costs the owner nothing) and
+    // never spends a search credit — but the RESULT SIZE still follows the same free-vs-
+    // paid shape as everything else, so a free account can't pull the full 100 at once.
     const newukTier = isOwner ? 'owner' : await tierOf(userId)
     const newukCap = (newukTier === 'paid' || newukTier === 'owner' || newukTier === 'byoc')
       ? null : (newukTier === 'onetime' ? FREE_RESULT_CAP : DAILY_RESULT_CAP)
-    const cappedCount = newukCap ? Math.min(count, newukCap) : count
-    if (newukCap && count > cappedCount) {
-      await send(chatId, `🎟️ Free accounts see up to ${newukCap} at a time, so showing ${cappedCount} of the ${count} you asked for. Get a pass (/access) for the full list.`)
+    const count = newukCap ? Math.min(requestedCount, newukCap) : requestedCount
+    if (newukCap && requestedCount > count) {
+      await send(chatId, `🎟️ You're on the free tier — capped at ${newukCap} at a time, so showing ${count} of the ${requestedCount} you asked for. Get a pass (/access) for the full list.`)
     }
 
-    // "Last N days" INCLUDES today: /newuk 1 = today only (the old code
-    // started from yesterday, so results never matched the picked window).
-    const toDate = londonToday()
-    const fromDate = londonDateMinusDays(days - 1)
-    const cfg = { days, count: cappedCount, fromDate, toDate, siteFilter: siteFlag, label: days === 1 ? 'today' : `the last ${days} day${days === 1 ? '' : 's'}` }
-    if (siteFlag) return await startNewukHunt(chatId, userId, cfg)
+    const today = new Date()
+    const fromDate = new Date(today)
+    fromDate.setDate(fromDate.getDate() - days)
+    const fmt = d => d.toISOString().slice(0, 10)
+    const fromIso = fmt(fromDate)
+    const toIso = fmt(today)
 
-    const q = await getUserQueue(userId)
-    q.pendingNewuk = cfg
-    q.awaitingNewukSite = true
-    await saveUserQueue(userId, q)
-    await sendKeyboard(chatId,
-      `🇬🇧 ${cfg.label} — up to ${cfg.count} companies.\n\nWhich website filter should I apply? Every company gets a live website check either way.`, [
-      [{ text: '🔗 Only WITH a website', callback_data: 'newuksite:with' }],
-      [{ text: '🚫 Only WITHOUT a website', callback_data: 'newuksite:without' }],
-      [{ text: '📋 All companies', callback_data: 'newuksite:all' }]
-    ])
+    await send(chatId, `🇬🇧 Pulling UK companies incorporated ${fromIso} → ${toIso}${webMode === 'yes' ? ' · 🌐 with-website mode' : webMode === 'no' ? ' · 🕸 no-website mode' : ''}...`)
+    const data = await fetchNewUKCompanies(fromIso, toIso, Math.min(count * 3, 200))
+    if (!data) {
+      await send(chatId, `Companies House request failed — check the API key is valid in Vercel, or try again shortly.`)
+      return res.status(200).send('OK')
+    }
+
+    const allItems = (data.items || []).slice(0, Math.min(count * 3, 200))
+    if (!allItems.length) {
+      await send(chatId, `No UK companies found for that window (${data.hits || 0} total hits before capping).`)
+      return res.status(200).send('OK')
+    }
+
+    // v8 STRICT date-range enforcement — the register sometimes returns
+    // companies incorporated OUTSIDE the requested window; drop them here so
+    // results always match the dates you asked for.
+    const items = allItems.filter(it => {
+      const d = it.date_of_creation
+      return typeof d === 'string' && d.length >= 10 && d >= fromIso && d <= toIso
+    })
+    const droppedDates = allItems.length - items.length
+    if (!items.length) {
+      await send(chatId, `All ${allItems.length} rows came back outside ${fromIso} → ${toIso} (register lag) — nothing strictly in your date range yet. Try again later today.`)
+      return res.status(200).send('OK')
+    }
+
+    // Dedup against previously-sent companies, same "seen" hash the /scout flow uses
+    const ukScope = isOwner ? '' : `${userId}:`   // public users get their own 'already seen' list
+    const dedupeKeys = items.map(it => `ukco:${ukScope}${it.company_number}`)
+    const seenMap = await getSeenBatch(dedupeKeys)
+    let fresh = items.filter((it, i) => !seenMap[dedupeKeys[i]])
+    if (fresh.length) {
+      await markSeenBatch(fresh.map(it => [`ukco:${ukScope}${it.company_number}`, { sentAt: new Date().toISOString() }]))
+    }
+
+    if (!fresh.length) {
+      await send(chatId, `✓ ${items.length} in range — all already sent to you before. Nothing new.`)
+      return res.status(200).send('OK')
+    }
+
+    // ── 🌐/🕸 Website hunt + verification (v8) ──
+    // Domain guesses from the company name, then REAL fetches. A guess counts
+    // as a live site when it answers 200 (or is bot-blocked but alive: 401/403/429).
+    // In with-website mode every hit then gets the full storefront dossier.
+    let siteResults = null
+    if (webMode !== 'all' && fresh.length) {
+      const webCap = Math.min(fresh.length, 24)
+      await send(chatId, webMode === 'yes'
+        ? `🌐 Website hunt on ${webCap} brand-new companies (domain guesses + live fetches) — hits get the full verification. A minute or two...`
+        : `🕸 No-website mode: hunting each company's site so I can drop anyone who already has one. A minute or two...`)
+      const checkCompanySite = async (it) => {
+        const slug = String(it.company_name || '')
+          .toLowerCase()
+          .replace(/\b(ltd|limited|llp|plc|llc|inc|company|co|uk|the)\b/g, ' ')
+          .replace(/&/g, 'and').replace(/[^a-z0-9]+/g, '')
+          .slice(0, 28)
+        if (!slug || slug.length < 3) return { it, url: '', status: 'none' }
+        const guesses = [`https://${slug}.co.uk`, `https://${slug}.com`, `https://${slug}.uk`]
+        for (const g of guesses) {
+          const fr = await blockAwareFetch(g, { timeout: 4000 })
+          if (fr.ok) return { it, url: g, status: 'live', html: fr.html }
+          if (fr.blocked && [401, 403, 429, 503].includes(fr.status)) return { it, url: g, status: 'live-blocked' }
+          if (fr.status === 200) return { it, url: g, status: 'live' }
+        }
+        return { it, url: '', status: 'none' }
+      }
+      siteResults = []
+      const webList = fresh.slice(0, webCap)
+      for (let i = 0; i < webList.length; i += 8) {
+        siteResults.push(...await Promise.all(webList.slice(i, i + 8).map(checkCompanySite)))
+      }
+      const withSite = siteResults.filter(s => s.status !== 'none')
+      const withoutSite = siteResults.filter(s => s.status === 'none')
+      await send(chatId, webMode === 'yes'
+        ? `🌐 Site hunt done: ${withSite.length}/${siteResults.length} companies have a live website${webCap < fresh.length ? ` (checked the newest ${webCap} of ${fresh.length})` : ''}.`
+        : `🕸 Done: ${withoutSite.length}/${siteResults.length} companies have NO website found${webCap < fresh.length ? ` (checked the newest ${webCap} of ${fresh.length})` : ''}.`)
+      fresh = (webMode === 'yes' ? withSite : withoutSite).map(s => s.it)
+      if (!fresh.length) {
+        await send(chatId, webMode === 'yes'
+          ? `No website found for any of the newest ${webCap} companies in this window — try a wider date range, or run /newuk without the website filter.`
+          : `Every checked company already has a website — that's a great sign the market moves fast. Run /newuk 1 100 (plain mode) for the full list.`)
+        return res.status(200).send('OK')
+      }
+    }
+
+    // ── Build the report ──
+    const reportCap = Math.min(fresh.length, count)
+    const listed = fresh.slice(0, reportCap)
+    let reply = `🇬🇧 ${fresh.length} new UK compan${fresh.length === 1 ? 'y' : 'ies'}${webMode === 'yes' ? ' with a live website' : webMode === 'no' ? ' without a website' : ''}` +
+      ` (${items.length} strictly in range${droppedDates ? `, ${droppedDates} out-of-range rows dropped` : ''}, ${data.hits || 0} total hits):` +
+      (webMode === 'yes' ? `\n🌐 Every site below is LIVE-VERIFIED (real fetch, not a guess on paper).` : '')
+    const dossierList = []
+    for (let i = 0; i < listed.length; i++) {
+      const it = listed[i]
+      const addr = it.registered_office_address || {}
+      const addrLine = [addr.address_line_1, addr.locality, addr.postal_code].filter(Boolean).join(', ')
+      const siteLine = siteResults ? (() => {
+        const s = siteResults.find(x => x.it === it || x.it.company_number === it.company_number)
+        return s && s.url ? `\n    🌐 ${s.url}${s.status === 'live-blocked' ? ' (alive, bot-protected)' : ''}` : ''
+      })() : ''
+      reply += `\n\n${i + 1}. ${it.company_name}` +
+        `\n    📅 Incorporated: ${it.date_of_creation}` +
+        `\n    🏢 ${it.company_type || 'unknown type'}` +
+        (addrLine ? `\n    📍 ${addrLine}` : '') +
+        siteLine +
+        `\n    🔗 https://find-and-update.company-information.service.gov.uk/company/${it.company_number}`
+      if (siteResults) {
+        const s = siteResults.find(x => x.it === it || x.it.company_number === it.company_number)
+        if (s && s.url) dossierList.push({ num: i + 1, name: it.company_name, url: s.url, inc: it.date_of_creation })
+      }
+    }
+    if (fresh.length > reportCap) reply += `\n\n(+${fresh.length - reportCap} more in range — run again with a bigger count to see them.)`
+    await send(chatId, reply)
+
+    // ── HIGH-STRENGTH verification for brand-new companies WITH a website ──
+    // The strongest check in the bot: full storefront dossier on each site.
+    if (webMode === 'yes' && dossierList.length) {
+      await send(chatId, `🔬 High-strength verification: running the full storefront dossier (builder, email, socials, speed, age) on ${Math.min(dossierList.length, 10)} live site${dossierList.length === 1 ? '' : 's'}...`)
+      const toVerify = dossierList.slice(0, 10)
+      const dossiers = await Promise.all(toVerify.map(v => checkOneStore(v.url)))
+      for (let i = 0; i < toVerify.length; i++) {
+        const v = toVerify[i]
+        const d = dossiers[i]
+        if (d.status !== 'OK') continue
+        const socialsList = Object.entries(d.socials || {}).map(([k, link]) => `${k}: ${link}`).join(' · ')
+        const ageTxt = typeof d.ageDays === 'number' ? `${d.ageDays}d` : 'unknown'
+        const loadTxt = typeof d.loadSeconds === 'number' ? `${d.loadSeconds.toFixed(1)}s` : '—'
+        await send(chatId,
+          `✅ VERIFIED #${v.num} — ${v.name}\n` +
+          `    🌐 ${v.url}\n` +
+          `    🏗 builder: ${d.store_type || 'unknown'}${d.isPasswordProtected ? ' · 🔒 password page (pre-launch!)' : ''}\n` +
+          `    📧 ${d.email}${d.email_is_generic ? ' (generic)' : ''}\n` +
+          `    💬 ${socialsList || 'no socials found'}\n` +
+          `    ⚡ load: ${loadTxt} · 🎂 site age: ${ageTxt}\n` +
+          `    📊 score: ${d.score}${d.score >= 70 ? ' 🔥' : ''}${d.scoreReasons?.length ? ` (${d.scoreReasons.join(', ')})` : ''}\n` +
+          `    📅 company incorporated: ${v.inc}`)
+      }
+    }
+
+    await tgCall('sendMessage', { chat_id: chatId, text: 'Next step 👇  Copy the list above, then tap Find Contacts and paste it.',
+      reply_markup: { inline_keyboard: [[isOwner ? B('🕵️ Find Contacts', 'menu:findco') : B('🔒 Find Contacts', 'locked')], [B('🏠 Main menu', 'menu:main')]] } })
     return res.status(200).send('OK')
   }
 
@@ -5966,7 +5484,6 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     const keyboard = Object.entries(SAVED_SEARCHES).map(([key, s]) =>
       [{ text: s.label, callback_data: `scout_${key}` }]
     )
-    keyboard.push([{ text: '🛍 Online stores — pick platform', callback_data: 'scoutplatforms' }])
     keyboard.push([{ text: '✏️ Custom search term', callback_data: 'scout_custom' }])
     await sendKeyboard(chatId, 'Which search do you want to run?', keyboard)
     return res.status(200).send('OK')
@@ -6043,29 +5560,18 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
 
   const locked = await acquireLock(userId)
   if (!locked) {
-    await send(chatId, '⏳ Still working on your last request — one sec.')
+    if (isAutoWake) {
+      // The previous round is still running — nudge ourselves again instead
+      // of messaging the user; the wake:runs cap keeps this bounded.
+      await scheduleAutoWake(chatId, userId, 'busy')
+    } else {
+      await send(chatId, '⏳ Still working on your last request — one sec.')
+    }
     return res.status(200).send('OK')
   }
 
   try {
     const userQueue = await getUserQueue(userId)
-
-    // ── v8: any message resumes an unfinished auto-hunt ──
-    // Belt to the self-continue chain: if a hop got lost (cold start, freeze,
-    // network blip), ONE tap of anything brings the run back with zero setup.
-    if (!userQueue.done && userQueue.chatId && (userQueue.results?.length || userQueue.pending?.length) &&
-        (userQueue.pending?.length || (userQueue.searchCtx && !userQueue.searchCtx.exhausted)) &&
-        !activeFlowFlags(userQueue) && !userQueue.awaitingScoutMonth && !userQueue.awaitingFreshFilter &&
-        !userQueue.awaitingNichePick && !userQueue.newukCtx && !userQueue.deepQ?.started &&
-        !userQueue.awaitingStartText && !userQueue.awaitingBroadcast && !userQueue.pendingNewuk &&
-        !userQueue.awaitingNewukArgs && !userQueue.awaitingNewukRange && !userQueue.awaitingNewukSite &&
-        !userQueue.awaitingPayContact && !userQueue.awaitingPayPrice && !userQueue.awaitingTrialSize &&
-        !(text || '').startsWith('/') && !doc) {
-      await saveUserQueue(userId, userQueue)
-      await send(chatId, `▶️ Picking the hunt back up where I stopped (round ${(userQueue.rounds || 0) + 1}) — you don't need to keep pinging me, I auto-continue from here.`)
-      return await runBatch(chatId, userId, userQueue)
-    }
-
 
     // ── Answering a gift quiz question ──
     if (userQueue.answeringGift && text) {
@@ -6156,18 +5662,15 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
 
     // ── Awaiting custom search query ──
     if (userQueue.awaitingCustomQuery) {
+      const platform = await getScoutPlatform(userId)
+      const platPrefix = (platform && platform !== 'shopify' && PLATFORMS[platform]) ? `${PLATFORMS[platform].emoji} ${PLATFORMS[platform].name} · ` : ''
       userQueue.awaitingCustomQuery = false
-      // A typed query gets the same strict product check when it names a niche
-      // (page.title:(skincare OR beauty) → skincare keywords) — otherwise it
-      // stays a plain search. Either way the platform is auto-detected.
-      const derivedNiche = nicheFromQuery(text)
-      userQueue.pendingSearch = { query: text, label: 'Custom search', platform: 'auto', nicheKey: derivedNiche }
+      userQueue.pendingSearch = { query: buildPlatformQuery(text, platform), label: platPrefix + 'Custom search', platform }
       userQueue.awaitingScoutMonth = true
       await saveUserQueue(userId, userQueue)
-      await sendKeyboard(chatId, `Custom search: "${text.slice(0, 80)}" — which month and year should I pull from?${derivedNiche ? `\n\n🧪 Niche detected (${nicheLabel(derivedNiche)}) — every store will need ${NICHE_MIN_PRODUCTS}+ matching products in its live catalog.` : ''}`, monthPickerKeyboard())
+      await sendKeyboard(chatId, `${platPrefix}Custom search: "${text.slice(0, 80)}" — which month and year should I pull from?`, monthPickerKeyboard())
       return res.status(200).send('OK')
     }
-
 
     // ── Custom Scout date: year → month → day → optional backward range ──
     if (userQueue.awaitingCustomDate && userQueue.customDate) {
@@ -6243,73 +5746,6 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     }
 
     // ── Awaiting lead count ──
-    // ── 🇬🇧 UK: awaiting "DAYS COUNT" for a custom UK run ──
-    if (userQueue.awaitingNewukArgs) {
-      const nums = text.trim().split(/[^0-9]+/).filter(Boolean).map(p => parseInt(p, 10))
-      if (nums.length < 2) {
-        await send(chatId, `Send two numbers: DAYS COUNT — e.g.  7 50`)
-        return res.status(200).send('OK')
-      }
-      userQueue.awaitingNewukArgs = false
-      const days = Math.min(Math.max(nums[0], 1), 365)
-      const count = Math.min(Math.max(nums[1], 1), 100)
-      userQueue.pendingNewuk = { days, count, fromDate: londonDateMinusDays(days - 1), toDate: londonToday(), siteFilter: null, label: `the last ${days} day${days === 1 ? '' : 's'}` }
-      userQueue.awaitingNewukSite = true
-      await saveUserQueue(userId, userQueue)
-      await sendKeyboard(chatId, `🇬🇧 ${userQueue.pendingNewuk.label} — up to ${count} companies. Which website filter?`, [
-        [{ text: '🔗 Only WITH a website', callback_data: 'newuksite:with' }],
-        [{ text: '🚫 Only WITHOUT a website', callback_data: 'newuksite:without' }],
-        [{ text: '📋 All companies', callback_data: 'newuksite:all' }]
-      ])
-      return res.status(200).send('OK')
-    }
-
-    // ── 🇬🇧 UK: awaiting "FROM TO COUNT" for a custom date range ──
-    if (userQueue.awaitingNewukRange) {
-      const m = text.match(/(\d{4}-\d{2}-\d{2})\D+(\d{4}-\d{2}-\d{2})\D*(\d*)/)
-      if (!m) {
-        await send(chatId, `Send: FROM TO COUNT — e.g.  2026-10-01 2026-10-15 50 (dates YYYY-MM-DD)`)
-        return res.status(200).send('OK')
-      }
-      const from = m[1], to = m[2]
-      const span = (Date.parse(to) - Date.parse(from)) / 86400000
-      if (!(span >= 0) || span > 366) {
-        await send(chatId, `That range doesn't work (from must be ≤ to, max span 1 year). Try again.`)
-        return res.status(200).send('OK')
-      }
-      const count = Math.min(Math.max(parseInt(m[3]) || 20, 1), 100)
-      userQueue.awaitingNewukRange = false
-      userQueue.pendingNewuk = { days: null, count, fromDate: from, toDate: to, siteFilter: null, label: `${from} → ${to}` }
-      userQueue.awaitingNewukSite = true
-      await saveUserQueue(userId, userQueue)
-      await sendKeyboard(chatId, `🇬🇧 ${from} → ${to} — up to ${count} companies. Which website filter?`, [
-        [{ text: '🔗 Only WITH a website', callback_data: 'newuksite:with' }],
-        [{ text: '🚫 Only WITHOUT a website', callback_data: 'newuksite:without' }],
-        [{ text: '📋 All companies', callback_data: 'newuksite:all' }]
-      ])
-      return res.status(200).send('OK')
-    }
-
-    // ── 🇬🇧 UK: awaiting the website-filter pick (typed fallback for the buttons) ──
-    if (userQueue.awaitingNewukSite && !text.startsWith('/')) {
-      const map = { with: 'with', 'with website': 'with', website: 'with', without: 'without', nosite: 'without', no: 'without', all: 'all' }
-      const site = map[text.trim().toLowerCase()]
-      if (!site) {
-        await send(chatId, `Type WITH, NOSITE, or ALL — or tap a button above.`)
-        return res.status(200).send('OK')
-      }
-      userQueue.awaitingNewukSite = false
-      const cfg = userQueue.pendingNewuk || null
-      userQueue.pendingNewuk = null
-      await saveUserQueue(userId, userQueue)
-      if (!cfg) {
-        await send(chatId, 'That UK search expired — send /newuk to start again.')
-        return res.status(200).send('OK')
-      }
-      cfg.siteFilter = site
-      return await startNewukHunt(chatId, userId, cfg)
-    }
-
     if (userQueue.awaitingLeadCount) {
       const n = parseInt(text.replace(/[^0-9]/g, ''), 10)
       if (!n || n < 1) { await send(chatId, `Reply with just a number, e.g. 30.`); return res.status(200).send('OK') }
@@ -6323,17 +5759,6 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       }
       userQueue.awaitingLeadCount = false
       userQueue.pendingSearch.wantCount = wantCount
-      // Platform searches (and any search without a pinned niche) ask the
-      // 🧪 product-check question next — the strict catalog verification is
-      // always ON for platform runs, the question only picks WHICH niche.
-      const sN = userQueue.pendingSearch
-      if (sN.needNiche && !sN.isDirectList) {
-        userQueue.awaitingNichePick = true
-        await saveUserQueue(userId, userQueue)
-        await sendKeyboard(chatId,
-          `✅ Got it — ${wantCount} leads.\n\n🧪 Which niche must their products match?\n\nI open each store's LIVE catalog and count products that genuinely match — title, tags, type, description. Only stores with ${NICHE_MIN_PRODUCTS}+ matching products count toward your ${wantCount}.`, nichePickerKeyboard())
-        return res.status(200).send('OK')
-      }
       // If the user already pinned a date window (Last 7/14/30 days, This month,
       // or a custom day/range), that window IS the freshness rule — the urlscan
       // date:[from TO to] filter in the query enforces it strictly. Asking
@@ -6374,18 +5799,13 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
 
     // ── Final Scout filter: show all, or require one real social platform ──
     if (userQueue.awaitingSocialFilter) {
-      const aliases = {
-        linkedin: 'linkedin', facebook: 'facebook', fb: 'facebook',
-        instagram: 'instagram', ig: 'instagram', x: 'x', twitter: 'x',
-        tiktok: 'tiktok', youtube: 'youtube', yt: 'youtube', pinterest: 'pinterest', pin: 'pinterest'
-      }
+      const aliases = { linkedin: 'linkedin', facebook: 'facebook', instagram: 'instagram', ig: 'instagram', x: 'x', twitter: 'x' }
       const choice = text.trim().toLowerCase()
       const requiredSocial = aliases[choice] || null
       if (choice !== 'all' && !requiredSocial) {
-        await send(chatId, 'Type ALL, LinkedIn, Facebook, Instagram, X, TikTok, YouTube, or Pinterest. A chosen platform is required on every returned store.')
+        await send(chatId, 'Type ALL, LinkedIn, Facebook, Instagram, or X. A chosen platform is required on every returned store.')
         return res.status(200).send('OK')
       }
-
       const search = userQueue.pendingSearch
       userQueue.awaitingSocialFilter = false
       userQueue.pendingSearch = null
@@ -6405,11 +5825,8 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       const gateDays = search.ageGate ? scoutWindowDays(search.dateRange, search.month) : null
       const scoutFresh = search.ageGate ? gateDays : (search.freshDays || null)
       return await startScoutJob(chatId, userId, search.query, search.label, search.wantCount,
-        !!search.includeLocked, search.month, scoutFresh, search.dateRange || null, requiredSocial, !!search.ageGate,
-        search.platform || 'auto', search.nicheKey || null, null)
+        !!search.includeLocked, search.month, scoutFresh, search.dateRange || null, requiredSocial, !!search.ageGate, search.platform || await getScoutPlatform(userId))
     }
-
-
 
     // ── Awaiting a URL for the AI Site Hunter deep check ──
     if (userQueue.awaitingHuntUrl) {
@@ -6513,11 +5930,6 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     // ── Continue an AI Site Hunter run cut short by the time budget ──
     if (userQueue.aiHunt && !userQueue.aiHunt.done) {
       return await runAiHuntBatch(chatId, userId, userQueue)
-    }
-
-    // ── Continue a UK hunt cut short by the time budget ──
-    if (userQueue.newukCtx && !userQueue.newukCtx.done) {
-      return await runNewukBatch(chatId, userId, userQueue)
     }
 
     // ── Continue hunting: user pinged while a scout is still short of its target ──
