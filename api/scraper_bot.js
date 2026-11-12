@@ -6,7 +6,24 @@
 //     question); new AI Site Hunter module (/hunt + /check + 🤖 buttons) that
 //     finds AI-builder sites (Lovable/Framer/v0/Bolt...) via crt.sh CT logs,
 //     fingerprints them, scores AI copy, and pulls owner contacts.
-// v8 (this build):
+// v9 (this build):
+//   • 🧪 Niche searches are PRODUCT-LEVEL end to end: the urlscan pool is no
+//     longer title-filtered (a store called "Glow Labs" whose title never says
+//     "jewelry" was invisible to discovery) — every candidate is qualified
+//     against its LIVE catalog with category product keywords (jewelry →
+//     earrings, necklace, bracelet, ring, pendant…; beauty → serum, cleanser,
+//     lipstick…). This fixes "source finished — 0 usable of 22".
+//   • 🌍 COUNTRY filter for online-store searches: detected from the currency
+//     printed on the page (£/€/₦/R$/KSh…), phone prefixes, page language and
+//     address keywords. Picked in the flow, or shared via /country.
+//   • 🔁 AUTO-CONTINUE that actually fires: the self-webhook is now AWAITED
+//     before the response is sent (Vercel froze the fire-and-forget fetch, so
+//     hunts silently stalled until you typed something). Works for /scout AND
+//     /hunt AND deep search — nothing to do with GitHub Actions.
+//   • 📱 STRICT SOCIAL fallback: when you demand Facebook/Instagram, the bot
+//     now also crawls the store's contact/about pages for that link before
+//     dropping the lead (footer-only socials no longer zero out a run).
+// v8:
 //   • 🏬 ONLINE STORES menu with a platform picker: Shopify / Wix / Etsy /
 //     More (WooCommerce, Squarespace, custom builders) — one deep pipeline.
 //   • PRODUCT-LEVEL niche verification (3+ matching products from the LIVE
@@ -49,15 +66,68 @@ module.exports = async (req, res) => {
   const BATCH_SIZE  = 8
   const CONCURRENCY = 4
 
+  // v9: niche searches run against the WHOLE platform pool — title-filtered
+  // discovery missed stores whose name never mentions the niche. Qualification
+  // is 100% product level: each candidate's LIVE catalog must contain
+  // NICHE_MATCH_MIN+ products matching the niche's category keywords.
   const SAVED_SEARCHES = {
-    '1': { label: 'All Shopify stores (newest first)', query: 'page.domain:myshopify.com' },
-    '2': { label: 'Skincare/beauty niche',            query: 'page.domain:myshopify.com AND page.title:(skincare OR beauty OR cosmetics)' },
-    '3': { label: 'Jewelry niche',                     query: 'page.domain:myshopify.com AND page.title:(jewelry OR jewellery)' },
-    '4': { label: 'Pet products niche',                query: 'page.domain:myshopify.com AND page.title:(pet OR pets OR dog OR cat)' },
-    '5': { label: 'Fashion/clothing niche',             query: 'page.domain:myshopify.com AND page.title:(fashion OR clothing OR apparel)' },
-    '6': { label: 'Toys & games niche',                 query: 'page.domain:myshopify.com AND page.title:(toys OR games OR puzzle)' },
-    '7': { label: 'Home & decor niche',                 query: 'page.domain:myshopify.com AND page.title:(home OR decor OR furniture OR candle)' },
-    '8': { label: 'Electronics/gadgets niche',          query: 'page.domain:myshopify.com AND page.title:(electronics OR gadgets OR tech)' },
+    '1': { label: 'All Shopify stores (newest first)', query: 'page.domain:myshopify.com', niche: null },
+    '2': { label: 'Skincare/beauty niche',            query: 'page.domain:myshopify.com', niche: 'beauty' },
+    '3': { label: 'Jewelry niche',                     query: 'page.domain:myshopify.com', niche: 'jewelry' },
+    '4': { label: 'Pet products niche',                query: 'page.domain:myshopify.com', niche: 'pet' },
+    '5': { label: 'Fashion/clothing niche',             query: 'page.domain:myshopify.com', niche: 'fashion' },
+    '6': { label: 'Toys & games niche',                 query: 'page.domain:myshopify.com', niche: 'toys' },
+    '7': { label: 'Home & decor niche',                 query: 'page.domain:myshopify.com', niche: 'home' },
+    '8': { label: 'Electronics/gadgets niche',          query: 'page.domain:myshopify.com', niche: 'electronics' },
+  }
+  // Base niche words per category (matched against catalog titles/tags/types).
+  const NICHE_TERMS = {
+    jewelry: ['jewelry', 'jewellery', 'jewel'],
+    beauty: ['skincare', 'beauty', 'cosmetics', 'skin care'],
+    pet: ['pet', 'pets', 'dog', 'cat'],
+    fashion: ['fashion', 'clothing', 'apparel'],
+    toys: ['toys', 'games', 'toy', 'game', 'puzzle'],
+    home: ['home', 'decor', 'furniture', 'candle'],
+    electronics: ['electronics', 'gadgets', 'tech'],
+  }
+  // v9 PRODUCT-level identification: what the niche actually sells. A jewelry
+  // store's products are "Gold Hoop Earrings" / "Pendant Necklace" — they may
+  // never use the word "jewelry" anywhere, so word-matching alone starved
+  // every niche run ("0 usable of 22"). 3+ matching PRODUCTS still required.
+  const NICHE_PRODUCT_TERMS = {
+    jewelry: ['earring', 'earrings', 'necklace', 'bracelet', 'ring', 'rings', 'pendant', 'anklet', 'stud', 'studs',
+      'hoop', 'hoops', 'charm', 'charms', 'bangle', 'brooch', 'pearl', 'gemstone', 'gold', 'silver', '14k', '18k',
+      'karat', 'carat', 'choker', 'locket', 'cuff', 'tennis', 'jewel'],
+    beauty: ['serum', 'moisturizer', 'moisturiser', 'cleanser', 'toner', 'mask', 'cream', 'lotion', 'sunscreen',
+      'spf', 'retinol', 'hyaluronic', 'acne', 'foundation', 'lipstick', 'mascara', 'blush', 'concealer',
+      'eyeshadow', 'gloss', 'highlighter', 'palette', 'facial', 'beauty'],
+    pet: ['collar', 'leash', 'harness', 'bowl', 'feeder', 'treat', 'treats', 'chew', 'kennel', 'puppy', 'kitten',
+      'paw', 'dog', 'cat', 'pet', 'toy', 'toys'],
+    fashion: ['dress', 'shirt', 'hoodie', 'skirt', 'pants', 'jeans', 'jacket', 'tee', 't-shirt', 'sweater',
+      'knitwear', 'leggings', 'loungewear', 'streetwear', 'corset', 'cargo', 'blouse', 'cardigan'],
+    toys: ['plush', 'puzzle', 'figurine', 'doll', 'blocks', 'fidget', 'squishy', 'dinosaur', 'unicorn', 'slime',
+      'toy', 'toys', 'game', 'games'],
+    home: ['candle', 'candles', 'vase', 'pillow', 'blanket', 'throw', 'mug', 'lamp', 'planter', 'diffuser',
+      'coaster', 'mirror', 'rug', 'ornament', 'tray', 'basket', 'doormat', 'wall art', 'decor'],
+    electronics: ['charger', 'cable', 'headphone', 'earbuds', 'speaker', 'phone case', 'stand', 'holder',
+      'smartwatch', 'usb', 'adapter', 'power bank', 'screen protector', 'keyboard', 'mouse', 'webcam', 'gadget'],
+  }
+  // Category product keywords that apply to a given set of niche term groups
+  // (triggered when any group word overlaps the category's base words).
+  function nicheExtraTerms(nicheTerms) {
+    const flat = (nicheTerms || []).flat().map(w => w.toLowerCase())
+    const extra = []
+    for (const [key, terms] of Object.entries(NICHE_PRODUCT_TERMS)) {
+      const triggers = NICHE_TERMS[key] || []
+      if (flat.some(w => triggers.some(t => t.includes(w) || w.includes(t)))) extra.push(...terms)
+    }
+    return [...new Set(extra)]
+  }
+  function nicheTextMatches(text, nicheTerms, extraTerms) {
+    const t = String(text || '').toLowerCase()
+    if (!t) return false
+    if ((nicheTerms || []).some(g => groupMatchesText(g, text))) return true
+    return (extraTerms || []).some(w => t.includes(w))
   }
 
   // ── /scout month picker — limits the search to one calendar month using
@@ -171,7 +241,13 @@ module.exports = async (req, res) => {
   function buildPlatformQuery(query, platform) {
     const p = PLATFORMS[platform] || PLATFORMS.shopify
     if (!query || !query.includes('page.domain:myshopify.com')) return query
-    if (!p.domain) return query.replace(/page\.domain:myshopify\.com\s+AND\s+/g, '')
+    if (!p.domain) {
+      // 'More platforms' = any builder. With the v9 broad niche pools the
+      // query can be EXACTLY the domain clause — stripping it would leave an
+      // empty urlscan query, so fall back to store-ish URL paths.
+      const stripped = query.replace(/page\.domain:myshopify\.com\s+AND\s+/g, '').trim()
+      return stripped || 'page.url:(/product OR /products OR /cart OR /checkout)'
+    }
     return query.replace(/page\.domain:myshopify\.com/g, p.domain)
   }
 
@@ -218,6 +294,73 @@ module.exports = async (req, res) => {
   const NICHE_MATCH_MIN = 3
 
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
+
+  // ── STORE COUNTRY DETECTION (v9) — the currency a storefront prints is the
+  // strongest signal it carries: £ prices → UK, ₦ → Nigeria, € → Europe…,
+  // backed up by phone prefixes, country keywords in addresses/shipping text,
+  // and the page's declared language. Returns {code,label,why} or null (no
+  // proof — callers KEEP the lead, just untagged, so a run can never be
+  // starved to zero by pages that print nothing).
+  const STORE_COUNTRY_LABELS = {
+    US: '🇺🇸 US', UK: '🇬🇧 UK', EU: '🇪🇺 Europe', NG: '🇳🇬 Nigeria', GH: '🇬🇭 Ghana', KE: '🇰🇪 Kenya',
+    ZA: '🇿🇦 South Africa', IN: '🇮🇳 India', PH: '🇵🇭 Philippines', BR: '🇧🇷 Brazil', CA: '🇨🇦 Canada',
+    AU: '🇦🇺 Australia', DE: '🇩🇪 Germany', FR: '🇫🇷 France', IT: '🇮🇹 Italy', ES: '🇪🇸 Spain', NL: '🇳🇱 Netherlands'
+  }
+  function detectStoreCountry(html, text) {
+    const t = String(text || '').slice(0, 30000)
+    const h = String(html || '')
+    // 1) printed phone prefixes (hardest to fake accidentally)
+    const phoneHits = [[/\+\s?44[\s(]/, 'UK'], [/\+\s?234[\s(]/, 'NG'], [/\+\s?233[\s(]/, 'GH'],
+      [/\+\s?254[\s(]/, 'KE'], [/\+\s?27[\s(]/, 'ZA'], [/\+\s?91[\s(]/, 'IN'], [/\+\s?63[\s(]/, 'PH'],
+      [/\+\s?55[\s(]/, 'BR'], [/\+\s?49[\s(]/, 'DE'], [/\+\s?33[\s(]/, 'FR'], [/\+\s?39[\s(]/, 'IT'],
+      [/\+\s?34[\s(]/, 'ES'], [/\+\s?31[\s(]/, 'NL'], [/\+\s?61[\s(]/, 'AU'], [/\+\s?1[\s(]/, 'US']]
+    for (const [rx, code] of phoneHits) if (rx.test(t)) return { code, label: STORE_COUNTRY_LABELS[code], why: 'phone prefix' }
+    // 2) explicit currency codes / symbols other than the ambiguous $
+    if (/£|GBP/i.test(t)) return { code: 'UK', label: STORE_COUNTRY_LABELS.UK, why: '£ / GBP prices' }
+    if (/₦/i.test(t)) return { code: 'NG', label: STORE_COUNTRY_LABELS.NG, why: '₦ naira prices' }
+    if (/€|EUR/i.test(t)) return { code: 'EU', label: STORE_COUNTRY_LABELS.EU, why: '€ / EUR prices' }
+    if (/₹/i.test(t)) return { code: 'IN', label: STORE_COUNTRY_LABELS.IN, why: '₹ rupee prices' }
+    if (/₱/i.test(t)) return { code: 'PH', label: STORE_COUNTRY_LABELS.PH, why: '₱ peso prices' }
+    if (/R\$\s?\d/.test(t)) return { code: 'BR', label: STORE_COUNTRY_LABELS.BR, why: 'R$ prices' }
+    if (/KSh/i.test(t)) return { code: 'KE', label: STORE_COUNTRY_LABELS.KE, why: 'KSh prices' }
+    if (/\bZAR\b/i.test(t)) return { code: 'ZA', label: STORE_COUNTRY_LABELS.ZA, why: 'ZAR prices' }
+    if (/A\$\s?\d|AUD/i.test(t)) return { code: 'AU', label: STORE_COUNTRY_LABELS.AU, why: 'A$ / AUD prices' }
+    if (/C\$\s?\d|CAD/i.test(t)) return { code: 'CA', label: STORE_COUNTRY_LABELS.CA, why: 'C$ / CAD prices' }
+    // 3) country keywords in addresses / shipping text
+    const kw = [[/united kingdom|england|scotland|wales/i, 'UK'], [/united states|\bUSA\b/i, 'US'],
+      [/nigeria|lagos|abuja/i, 'NG'], [/ghana|accra/i, 'GH'], [/kenya|nairobi/i, 'KE'],
+      [/south africa|cape town|johannesburg/i, 'ZA'], [/\bindia\b/i, 'IN'], [/philippines|manila/i, 'PH'],
+      [/brazil|brasil/i, 'BR'], [/canada|toronto|vancouver/i, 'CA'], [/australia|sydney|melbourne/i, 'AU'],
+      [/germany|deutschland/i, 'DE'], [/\bfrance\b/i, 'FR'], [/\bitaly\b|italia/i, 'IT'],
+      [/spain|españ/i, 'ES'], [/netherlands|nederland|holland/i, 'NL']]
+    for (const [rx, code] of kw) if (rx.test(t)) return { code, label: STORE_COUNTRY_LABELS[code], why: 'address / shipping text' }
+    // 4) page language (weakest — only fires when everything else is silent)
+    const lang = (h.match(/<html[^>]*?\slang=["']([a-z]{2})/i) || [])[1]
+    const langMap = { de: 'DE', fr: 'FR', es: 'ES', it: 'IT', nl: 'NL', pt: 'BR' }
+    if (lang && langMap[lang.toLowerCase()]) {
+      const code = langMap[lang.toLowerCase()]
+      return { code, label: STORE_COUNTRY_LABELS[code], why: `page language "${lang}"` }
+    }
+    // 5) bare $ prices — weak (US/CA/AU all use it), used only as a hint
+    if (/\$\s?\d/.test(t)) return { code: 'US', label: STORE_COUNTRY_LABELS.US, why: '$ prices (ambiguous: also CA/AU)' }
+    return null
+  }
+  // Per-user country filter for online-store searches (same idea as the hunt
+  // filter, separate key so the two flows don't fight each other).
+  async function getScoutCountry(userId) {
+    try {
+      const { result } = await redis('GET', `scout:country:${userId}`)
+      const c = String(result || '').toLowerCase()
+      return STORE_COUNTRY_LABELS[c.toUpperCase()] ? c : 'any'
+    } catch { return 'any' }
+  }
+  async function setScoutCountry(userId, code) {
+    const c = String(code || '').toLowerCase()
+    try {
+      if (c === 'any' || !STORE_COUNTRY_LABELS[c.toUpperCase()]) await redis('DEL', `scout:country:${userId}`)
+      else await redis('SET', `scout:country:${userId}`, c, 'EX', 2592000)
+    } catch {}
+  }
 
   // ── ANTI-BLOCK fetch: rotating UAs, one retry with backoff, and explicit
   // detection of 403/429/503 + captcha/challenge pages. Used for every
@@ -283,18 +426,24 @@ module.exports = async (req, res) => {
     try {
       const { result: runs } = await redis('GET', `wake:runs:${userId}`)
       const n = parseInt(runs || '0', 10) || 0
-      if (n >= 15) return false
-      await redis('SET', `wake:runs:${userId}`, String(n + 1), 'EX', 900)
+      if (n >= 40) return false
+      await redis('SET', `wake:runs:${userId}`, String(n + 1), 'EX', 1800)
       const proto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim()
       const host = req.headers['x-forwarded-host'] || req.headers.host || ''
       const path = String(req.url || '/api/scraper_bot.js').split('?')[0]
       const selfUrl = process.env.SCRAPER_SELF_URL || (host ? `${proto}://${host}${path}` : '')
       if (!selfUrl) return false
-      fetch(selfUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-bot-wake': '1' },
-        body: JSON.stringify({ auto_wake: true, chat_id: chatId, user_id: userId, reason, ts: Date.now() })
-      }).catch(() => {})
+      // AWAIT the self-call before this invocation responds — Vercel freezes
+      // fire-and-forget fetches the moment the response is sent, which is why
+      // auto-continue silently died and you had to type to continue.
+      try {
+        await fetch(selfUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-bot-wake': '1' },
+          body: JSON.stringify({ auto_wake: true, chat_id: chatId, user_id: userId, reason, ts: Date.now() }),
+          signal: AbortSignal.timeout(9000)
+        })
+      } catch { return false }
       return true
     } catch { return false }
   }
@@ -434,7 +583,7 @@ module.exports = async (req, res) => {
     return !!(q && (q.awaitingReviewCap || q.awaitingCompanyList || q.awaitingMessages ||
       q.awaitingCustomQuery || q.awaitingLeadCount || q.awaitingLockedFilter ||
       q.awaitingScoutAgeGate ||
-      q.awaitingCustomDate || q.awaitingSocialFilter || q.awaitingHuntUrl || q.wizard || q.answeringGift))
+      q.awaitingCustomDate || q.awaitingSocialFilter || q.awaitingScoutCountry || q.awaitingHuntUrl || q.wizard || q.answeringGift))
   }
 
   async function saveFilteredOut(userId, list) {
@@ -1538,11 +1687,14 @@ module.exports = async (req, res) => {
     const base = url.replace(/\/$/, '')
     const homeTitle = (String(homeHtml || '').match(/<title[^>]*>([^<]+)<\/title>/i) || [])[1] || ''
     const homeMeta = (String(homeHtml || '').match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']{3,200})/i) || [])[1] || ''
-    out.titleMatched = nicheTerms.some(g => groupMatchesText(g, homeTitle + ' ' + homeMeta))
+    // v9: category product keywords (earrings, necklace, serum…) on top of
+    // the raw niche words — products are how a store proves what it sells.
+    const extraTerms = nicheExtraTerms(nicheTerms)
+    out.titleMatched = nicheTextMatches(homeTitle + ' ' + homeMeta, nicheTerms, extraTerms)
     const matchProduct = (text) => {
       if (!text || out.matches >= 8) return
       out.checked++
-      if (nicheTerms.some(g => groupMatchesText(g, text))) {
+      if (nicheTextMatches(text, nicheTerms, extraTerms)) {
         out.matches++
         if (out.samples.length < 3) out.samples.push(String(text).replace(/\s+/g, ' ').trim().slice(0, 60))
       }
@@ -1666,7 +1818,7 @@ module.exports = async (req, res) => {
     const result = {
       url, store_name: '', email: 'no email', email_is_generic: false,
       contact_page: '', store_type: '', socials: {}, status: 'dead',
-      sslValid: null, loadSeconds: null, ageDays: null, score: 0, scoreReasons: [],
+      sslValid: null, loadSeconds: null, ageDays: null, country: null, score: 0, scoreReasons: [],
       isPasswordProtected: false
     }
     try {
@@ -1711,7 +1863,12 @@ module.exports = async (req, res) => {
         result.email = chosen
         result.email_is_generic = isGenericEmail(chosen)
         if (result.email_is_generic) result.contact_page = url.replace(/\/$/, '') + '/pages/contact'
-      } else {
+      }
+      // v9: when the user DEMANDS one social platform (e.g. Facebook-only),
+      // don't give up because the homepage footer didn't show it — the
+      // contact/about pages often carry the link. This was a main cause of
+      // "0 usable of 22" on strict-social runs.
+      if (!homeEmails.length || (checkCtx.requiredSocial && !result.socials[checkCtx.requiredSocial])) {
         const base = url.replace(/\/$/, '')
         const fallbackPages = [base + '/pages/contact', base + '/pages/contact-us', base + '/pages/about', base + '/policies/privacy-policy']
         const fallbackResults = await Promise.all(fallbackPages.map(async (pageUrl) => {
@@ -1726,17 +1883,20 @@ module.exports = async (req, res) => {
           if (!fallback.socials) continue
           result.socials = { ...result.socials, ...await validateSocials(fallback.socials) }
         }
-        const withEmail = fallbackResults.find(r => r.emails.length > 0)
-        if (withEmail) {
-          result.email = bestEmail(withEmail.emails)
-          result.email_is_generic = isGenericEmail(result.email)
-          result.email_source = withEmail.pageUrl
-        } else {
-          const anyContactPage = fallbackResults.find(r => r.exists && r.pageUrl.includes('contact'))
-          if (anyContactPage) result.contact_page = anyContactPage.pageUrl
+        if (!homeEmails.length) {
+          const withEmail = fallbackResults.find(r => r.emails.length > 0)
+          if (withEmail) {
+            result.email = bestEmail(withEmail.emails)
+            result.email_is_generic = isGenericEmail(result.email)
+            result.email_source = withEmail.pageUrl
+          } else {
+            const anyContactPage = fallbackResults.find(r => r.exists && r.pageUrl.includes('contact'))
+            if (anyContactPage) result.contact_page = anyContactPage.pageUrl
+          }
         }
       }
 
+      result.country = detectStoreCountry(html, htmlToVisibleText(html).slice(0, 30000))
       result.loadSeconds = await speedPromise
       result.ageDays = await agePromise
 
@@ -3151,11 +3311,12 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
   // v8: requireNiche — niche searches demand NICHE_MATCH_MIN matching products
   // from the live catalog. If the product source itself was blocked (403/429),
   // a title-matching lead still passes but ships tagged "title-only".
-  function isUsableLead(r, includeLocked, freshDays, requiredSocial = null, requireNiche = false) {
+  function isUsableLead(r, includeLocked, freshDays, requiredSocial = null, requireNiche = false, countryMissFn = null) {
     if (r.status !== 'OK') return false
     if (r.isPasswordProtected && !includeLocked) return false
     if (!(r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length)) return false
     if (requiredSocial && !r.socials?.[requiredSocial]) return false
+    if (countryMissFn && countryMissFn(r)) return false
     if (requireNiche && r.niche) {
       const proven = r.niche.matches >= NICHE_MATCH_MIN
       const blockedTitleOnly = r.niche.blocked && r.niche.titleMatched
@@ -3216,15 +3377,49 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     return null
   }
 
-  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked, month = null, freshDays = null, dateRange = null, requiredSocial = null, ageGate = false, platform = 'shopify') {
+  // Shared launcher: takes the pending search after the LAST filter question
+  // (social → country) and actually starts the hunt. Used by the country
+  // buttons, typed country answers, and any future last-step filters.
+  async function launchScoutFromPending(chatId, userId, countryCode) {
+    const userQueue = await getUserQueue(userId)
+    const search = userQueue.pendingSearch
+    userQueue.awaitingScoutCountry = false
+    userQueue.pendingSearch = null
+    await saveUserQueue(userId, userQueue)
+    if (!search) {
+      await send(chatId, 'That search expired — send /scout to start again.')
+      return res.status(200).send('OK')
+    }
+    if (countryCode) await setScoutCountry(userId, countryCode)
+    const scoutCountry = await getScoutCountry(userId)
+    if (!isOwner) {
+      const scoutTier = await tierOf(userId)
+      if (!(await spendFreeCredit(chatId, scoutTier, userId))) return res.status(200).send('OK')
+    }
+    // Age gate ON → the chosen window doubles as the store-age limit:
+    // a 5-day range means only stores whose first-ever certificate falls
+    // inside those 5 days get reported. Age gate OFF → the freshness
+    // preset from the 🌱 question ("Any time" searches) applies as before.
+    const gateDays = search.ageGate ? scoutWindowDays(search.dateRange, search.month) : null
+    const scoutFresh = search.ageGate ? gateDays : (search.freshDays || null)
+    return await startScoutJob(chatId, userId, search.query, search.label, search.wantCount,
+      !!search.includeLocked, search.month, scoutFresh, search.dateRange || null,
+      search.requiredSocial || null, !!search.ageGate, search.platform || await getScoutPlatform(userId),
+      scoutCountry, search.nicheTerms || null)
+  }
+
+  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked, month = null, freshDays = null, dateRange = null, requiredSocial = null, ageGate = false, platform = 'shopify', scoutCountry = null, nicheTerms = null) {
     const scope = dateRange ? dateRangeLabel(dateRange) : ymLabel(month)
     const ageNote = ageGate && freshDays ? ` · 🎂 store age ≤${freshDays}d ✅ enforced` : ''
     const plat = PLATFORMS[platform] || PLATFORMS.shopify
     const platNote = platform && platform !== 'shopify' ? ` · ${plat.emoji} ${plat.name}` : ''
-    const nicheTerms = extractNicheTerms(query)
+    // v9: niche terms come from the chosen niche preset (product-level catalog
+    // matching), NOT parsed out of a title-filtered urlscan query.
+    nicheTerms = (nicheTerms && nicheTerms.length) ? nicheTerms : extractNicheTerms(query)
     const requireNiche = nicheTerms.length > 0
     await redis('DEL', `wake:runs:${userId}`)   // fresh hunt → fresh auto-continue budget
-    await send(chatId, `🔍 Hunting for ${wantCount} leads — "${label}" (${scope}${platNote}${freshDays ? `, ≤${freshDays}d old` : ''}${ageNote}${requiredSocial ? `, must have ${requiredSocial === 'x' ? 'X' : requiredSocial[0].toUpperCase() + requiredSocial.slice(1)}` : ''})...\n\n` +
+    const countryNote = scoutCountry ? `, 🌍 ${STORE_COUNTRY_LABELS[scoutCountry.toUpperCase()] || scoutCountry}` : ''
+    await send(chatId, `🔍 Hunting for ${wantCount} leads — "${label}" (${scope}${platNote}${freshDays ? `, ≤${freshDays}d old` : ''}${ageNote}${requiredSocial ? `, must have ${requiredSocial === 'x' ? 'X' : requiredSocial[0].toUpperCase() + requiredSocial.slice(1)}` : ''}${countryNote})...\n\n` +
       (requireNiche
         ? `🧪 Product-level check ON: every store must prove its niche with ${NICHE_MATCH_MIN}+ matching products from its LIVE catalog — page titles alone don't count.\n`
         : '') +
@@ -3235,7 +3430,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       awaitingMessages: false, messages: [], awaitingCustomQuery: false,
       label: label || '', includeLocked: !!includeLocked,
       wantCount, freshDays, requiredSocial, ageGate: !!ageGate,
-      platform, nicheTerms, requireNiche,
+      platform, nicheTerms, requireNiche, scoutCountry,
       searchCtx: { query: applyScoutDateFilter(query, month, dateRange), searchAfter: null, exhausted: false, total: null }
     }
     await saveUserQueue(userId, userQueue)
@@ -3280,11 +3475,17 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     const includeLocked = !!userQueue.includeLocked
     const requiredSocial = userQueue.requiredSocial || null
     const requireNiche = !!userQueue.requireNiche
-    const checkCtx = { nicheTerms: userQueue.nicheTerms || null, platform: userQueue.platform || 'shopify' }
+    // v9 country filter — LENIENT: only a PROVABLY different country drops a
+    // store; a page that prints no currency/phones passes untagged, so the
+    // run can never be starved to zero by silent pages.
+    const scoutCountry = (userQueue.scoutCountry && STORE_COUNTRY_LABELS[userQueue.scoutCountry.toUpperCase()])
+      ? userQueue.scoutCountry.toUpperCase() : null
+    const provenCountryMiss = r => scoutCountry && r.country && r.country.code !== scoutCountry
+    const checkCtx = { nicheTerms: userQueue.nicheTerms || null, platform: userQueue.platform || 'shopify', requiredSocial }
     let didWork = false
 
     while (Date.now() < deadline) {
-      const usable = userQueue.results.filter(r => isUsableLead(r, includeLocked, freshDays, requiredSocial, requireNiche))
+      const usable = userQueue.results.filter(r => isUsableLead(r, includeLocked, freshDays, requiredSocial, requireNiche, provenCountryMiss))
       if (want && usable.length >= want) break
       if (!userQueue.pending.length) {
         if (!(await pullNextCandidates(userQueue))) break
@@ -3314,7 +3515,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       await saveUserQueue(userId, userQueue)
     }
 
-    const usableAll = userQueue.results.filter(r => isUsableLead(r, includeLocked, freshDays, requiredSocial, requireNiche))
+    const usableAll = userQueue.results.filter(r => isUsableLead(r, includeLocked, freshDays, requiredSocial, requireNiche, provenCountryMiss))
     const fresh = usableAll.slice(userQueue.delivered || 0).sort((a, b) => (b.score || 0) - (a.score || 0))
     const prevDelivered = (userQueue.delivered || 0)
     userQueue.delivered = usableAll.length
@@ -3330,12 +3531,14 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     const noContactC = userQueue.results.filter(r => r.status === 'OK' && !(r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length)).length
     const nicheMissC = requireNiche ? userQueue.results.filter(r => r.status === 'OK' && r.niche && r.niche.matches < NICHE_MATCH_MIN && !(r.niche.blocked && r.niche.titleMatched)).length : 0
     const socialMissC = requiredSocial ? userQueue.results.filter(r => r.status === 'OK' && !r.socials?.[requiredSocial]).length : 0
+    const countryMissC = scoutCountry ? userQueue.results.filter(r => r.status === 'OK' && r.country && r.country.code !== scoutCountry).length : 0
     const breakdown = []
     if (deadC) breakdown.push(`${deadC} dead`)
     if (blockedC) breakdown.push(`${blockedC} blocked (retrying)`)
     if (noContactC) breakdown.push(`${noContactC} no contact info`)
     if (nicheMissC) breakdown.push(`${nicheMissC} niche-miss (<${NICHE_MATCH_MIN} products)`)
     if (socialMissC) breakdown.push(`${socialMissC} missing ${requiredSocial === 'x' ? 'X' : requiredSocial}`)
+    if (countryMissC) breakdown.push(`${countryMissC} wrong country (≠ ${STORE_COUNTRY_LABELS[scoutCountry] || scoutCountry})`)
     const breakdownLine = breakdown.length ? ` — dropped: ${breakdown.join(', ')}` : ''
 
     let header
@@ -3343,6 +3546,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     else if (sourceExhausted) header = `✓ Source finished — ${usableAll.length} usable of ${userQueue.results.length} checked.${breakdownLine}`
     else header = `⏳ ${usableAll.length} of ${want} so far (checked ${userQueue.results.length}${breakdownLine}) — AUTO-CONTINUING, no need to reply.`
     if (userQueue.ageGate && freshDays) header += `\n🎂 Store age ≤ ${freshDays}d enforced — older stores dropped (see /others).`
+    if (scoutCountry) header += `\n🌍 Country filter: ${STORE_COUNTRY_LABELS[scoutCountry]} — provably-different stores dropped; unprovable ones kept. Change with /country.`
     if (userQueue.searchCtx && userQueue.searchCtx.total != null && !sourceExhausted) header += `\n📊 ${userQueue.searchCtx.total} total matches in this window.`
 
     let reply = header
@@ -3363,6 +3567,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       const hotTag = r.score >= 70 ? ' 🔥' : ''
       const scoreNote = `\n    📊 score: ${r.score}${hotTag}` + (r.scoreReasons?.length ? ` (${r.scoreReasons.join(', ')})` : '')
       const ageNote = (typeof r.ageDays === 'number') ? `\n    🎂 age: ${r.ageDays}d${r.ageDays <= 30 ? ' 🔥' : ''}` : (userQueue.ageGate ? '\n    🎂 age unknown — no source could prove it' : '')
+      const countryNote = r.country ? `\n    🌍 ${r.country.label} — ${r.country.why}` : ''
       const nicheNote = r.niche && r.niche.checked
         ? `\n    🛍 niche proof: ${r.niche.matches}/${r.niche.checked} products matched via ${r.niche.method}` +
           (r.niche.samples?.length ? ` — e.g. "${r.niche.samples[0]}"` : '') +
@@ -3370,7 +3575,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         : ''
       const hook = auditHookLine(r)
       const hookNote = hook ? `\n    💡 ${hook}` : ''
-      reply += `\n\n${leadNum}. ${nameLine}${scoreNote}${ageNote}${nicheNote}${hookNote}${socialsNote}${contactNote}${emailNote}`
+      reply += `\n\n${leadNum}. ${nameLine}${scoreNote}${ageNote}${countryNote}${nicheNote}${hookNote}${socialsNote}${contactNote}${emailNote}`
     }
     if (!fresh.length && !userQueue.done) reply += `\n\n(The last batch didn't add any leads that pass your filters — still hunting.)`
     if (userQueue.done) reply += `\n\n────────\nSend anything to move to the message-writing step.`
@@ -4407,6 +4612,16 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         return res.status(200).send('OK')
       }
 
+      if (data.startsWith('scoutcountry:')) {
+        const code = data.slice('scoutcountry:'.length)
+        const q0 = await getUserQueue(cbUserId)
+        if (!q0.pendingSearch || !q0.awaitingScoutCountry) {
+          await send(cbChatId, 'That search expired — send /scout to start again.')
+          return res.status(200).send('OK')
+        }
+        return await launchScoutFromPending(cbChatId, cbUserId, code === 'any' ? 'any' : code.toUpperCase())
+      }
+
       // ── 🏬 Online Stores platform picker (Shopify / Wix / Etsy / More) ──
       if (data.startsWith('plat:')) {
         const key = data.slice('plat:'.length)
@@ -4432,7 +4647,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         const query = buildPlatformQuery(search.query, platform)
         const platPrefix = (platform && platform !== 'shopify' && PLATFORMS[platform]) ? `${PLATFORMS[platform].emoji} ${PLATFORMS[platform].name} · ` : ''
         const q = await getUserQueue(cbUserId)
-        q.pendingSearch = { query, label: platPrefix + search.label, platform }
+        q.pendingSearch = { query, label: platPrefix + search.label, platform, nicheTerms: search.niche ? [NICHE_TERMS[search.niche]] : null }
         q.awaitingScoutMonth = true
         await saveUserQueue(cbUserId, q)
         await sendKeyboard(cbChatId, `${platPrefix}${search.label}" — which month and year should I pull from?\n\nPick a window — the search index only reaches back 30 days, so older months aren't searchable.`, monthPickerKeyboard())
@@ -4636,6 +4851,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     midFlowQueue.awaitingLeadCount || midFlowQueue.awaitingLockedFilter ||
     midFlowQueue.awaitingScoutMonth || midFlowQueue.awaitingFreshFilter || midFlowQueue.awaitingScoutAgeGate ||
     midFlowQueue.awaitingCustomDate || midFlowQueue.awaitingSocialFilter ||
+    midFlowQueue.awaitingScoutCountry ||
     midFlowQueue.awaitingHuntUrl || (midFlowQueue.deepQ && midFlowQueue.deepQ.started) ||
     midFlowQueue.wizard || midFlowQueue.answeringGift
   ))
@@ -4991,7 +5207,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     const q = await getUserQueue(userId)
     q.awaitingMessages = false; q.awaitingReviewCap = false; q.awaitingCompanyList = false
     q.awaitingCustomQuery = false; q.awaitingLeadCount = false; q.awaitingLockedFilter = false; q.awaitingScoutMonth = false; q.awaitingFreshFilter = false; q.awaitingScoutAgeGate = false
-    q.awaitingCustomDate = false; q.awaitingSocialFilter = false; q.customDate = null; q.pendingSearch = null
+    q.awaitingCustomDate = false; q.awaitingSocialFilter = false; q.awaitingScoutCountry = false; q.customDate = null; q.pendingSearch = null
     q.awaitingHuntUrl = false; q.aiHunt = null
     q.awaitingPayContact = false; q.awaitingPayPrice = false; q.awaitingTrialSize = false
     q.answeringGift = null; q.giftDraft = null; q.awaitingStartText = false; q.awaitingBroadcast = false
@@ -5542,15 +5758,18 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     }
     if (arg === 'any') {
       await redis('SET', `hunt:country:${userId}`, 'any', 'EX', 43200)
-      await send(chatId, `🌍 Country filter removed — hunts scan every country again.`)
+      await setScoutCountry(userId, 'any')
+      await send(chatId, `🌍 Country filter removed — AI hunts AND online-store searches scan every country again.`)
       return res.status(200).send('OK')
     }
-    if (!COUNTRY_LABELS[arg.toUpperCase()]) {
+    if (!COUNTRY_LABELS[arg.toUpperCase()] && !STORE_COUNTRY_LABELS[arg.toUpperCase()]) {
       await send(chatId, `❓ Unknown country code "${arg.toUpperCase()}". Use a 2-letter code like /country NG, /country US, /country UK — or /country any to remove the filter.`)
       return res.status(200).send('OK')
     }
     await redis('SET', `hunt:country:${userId}`, arg.toLowerCase(), 'EX', 43200)
-    await send(chatId, `🌍 Country filter set: ${COUNTRY_LABELS[arg.toUpperCase()]} (auto-expires after 12h).\nFrom now on AI hunts only deliver sites that look ${COUNTRY_LABELS[arg.toUpperCase()].replace(/^\S+\s/, '')} — matched by domain ending, phone numbers and page content.`)
+    await setScoutCountry(userId, arg)
+    const cLbl = COUNTRY_LABELS[arg.toUpperCase()] || STORE_COUNTRY_LABELS[arg.toUpperCase()]
+    await send(chatId, `🌍 Country filter set: ${cLbl} (auto-expires after 12h).\nFrom now on AI hunts AND 🏬 online-store searches only deliver sites that look ${cLbl.replace(/^\S+\s/, '')} — matched by domain ending, phone numbers, page content and store currency (₦, £, €, R$…).`)
     return res.status(200).send('OK')
   }
 
@@ -5665,7 +5884,15 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       const platform = await getScoutPlatform(userId)
       const platPrefix = (platform && platform !== 'shopify' && PLATFORMS[platform]) ? `${PLATFORMS[platform].emoji} ${PLATFORMS[platform].name} · ` : ''
       userQueue.awaitingCustomQuery = false
-      userQueue.pendingSearch = { query: buildPlatformQuery(text, platform), label: platPrefix + 'Custom search', platform }
+      // v9: custom niche = broad platform pool + your word matched against the
+      // live product catalog (title filtering missed most real stores).
+      const customTerm = text.trim().slice(0, 40).toLowerCase()
+      userQueue.pendingSearch = {
+        query: buildPlatformQuery('page.domain:myshopify.com', platform),
+        label: `${platPrefix}Custom: "${customTerm}"`,
+        platform,
+        nicheTerms: [[customTerm]],
+      }
       userQueue.awaitingScoutMonth = true
       await saveUserQueue(userId, userQueue)
       await sendKeyboard(chatId, `${platPrefix}Custom search: "${text.slice(0, 80)}" — which month and year should I pull from?`, monthPickerKeyboard())
@@ -5807,25 +6034,31 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         return res.status(200).send('OK')
       }
       const search = userQueue.pendingSearch
+      search.requiredSocial = requiredSocial
       userQueue.awaitingSocialFilter = false
-      userQueue.pendingSearch = null
+      userQueue.awaitingScoutCountry = true
       await saveUserQueue(userId, userQueue)
-      if (!search) {
-        await send(chatId, 'That search expired — send /scout to start again.')
+      await sendKeyboard(chatId,
+        `✅ Social filter set: ${requiredSocial ? (requiredSocial === 'x' ? 'X' : requiredSocial[0].toUpperCase() + requiredSocial.slice(1)) + ' — required on every store' : 'any social'}` +
+        `\n\n🌍 Last filter — which country should the stores sell to?\nI read it off the page: prices (£/€/₦…), phone prefixes, language, addresses. Stores I can't place are KEPT, not dropped.`, [
+        [{ text: '🌍 Any country', callback_data: 'scoutcountry:any' }],
+        [{ text: '🇺🇸 US', callback_data: 'scoutcountry:us' }, { text: '🇬🇧 UK', callback_data: 'scoutcountry:uk' }, { text: '🇳🇬 NG', callback_data: 'scoutcountry:ng' }],
+        [{ text: '🇨🇦 CA', callback_data: 'scoutcountry:ca' }, { text: '🇦🇺 AU', callback_data: 'scoutcountry:au' }, { text: '🇮🇳 IN', callback_data: 'scoutcountry:in' }],
+        [{ text: '🇬🇭 GH', callback_data: 'scoutcountry:gh' }, { text: '🇰🇪 KE', callback_data: 'scoutcountry:ke' }, { text: '🇿🇦 ZA', callback_data: 'scoutcountry:za' }],
+        [{ text: '🇩🇪 DE', callback_data: 'scoutcountry:de' }, { text: '🇫🇷 FR', callback_data: 'scoutcountry:fr' }, { text: '🇧🇷 BR', callback_data: 'scoutcountry:br' }],
+        [{ text: '🇪🇺 Europe (€)', callback_data: 'scoutcountry:eu' }, { text: '🇵🇭 PH', callback_data: 'scoutcountry:ph' }, { text: '✍️ Other (/country XX)', callback_data: 'countryhint' }]
+      ])
+      return res.status(200).send('OK')
+    }
+
+    // ── Country answer for a store search (typed instead of tapped) ──
+    if (userQueue.awaitingScoutCountry) {
+      const code = text.trim().toLowerCase().replace(/[^a-z]/g, '').slice(0, 2)
+      if (code !== 'any' && !STORE_COUNTRY_LABELS[code.toUpperCase()]) {
+        await send(chatId, 'Type a country code like US, UK, NG, GH, KE, ZA, IN, DE — or tap the 🌍 Any country button above.')
         return res.status(200).send('OK')
       }
-      if (!isOwner) {
-        const scoutTier = await tierOf(userId)
-        if (!(await spendFreeCredit(chatId, scoutTier, userId))) return res.status(200).send('OK')
-      }
-      // Age gate ON → the chosen window doubles as the store-age limit:
-      // a 5-day range means only stores whose first-ever certificate falls
-      // inside those 5 days get reported. Age gate OFF → the freshness
-      // preset from the 🌱 question ("Any time" searches) applies as before.
-      const gateDays = search.ageGate ? scoutWindowDays(search.dateRange, search.month) : null
-      const scoutFresh = search.ageGate ? gateDays : (search.freshDays || null)
-      return await startScoutJob(chatId, userId, search.query, search.label, search.wantCount,
-        !!search.includeLocked, search.month, scoutFresh, search.dateRange || null, requiredSocial, !!search.ageGate, search.platform || await getScoutPlatform(userId))
+      return await launchScoutFromPending(chatId, userId, code.toUpperCase())
     }
 
     // ── Awaiting a URL for the AI Site Hunter deep check ──
