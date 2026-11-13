@@ -6,6 +6,20 @@
 //     question); new AI Site Hunter module (/hunt + /check + 🤖 buttons) that
 //     finds AI-builder sites (Lovable/Framer/v0/Bolt...) via crt.sh CT logs,
 //     fingerprints them, scores AI copy, and pulls owner contacts.
+// v10 (this build):
+//   • 📱 STRICT-SOCIAL STARVATION FIX: the social-link extractor only matched
+//     "https?://" URLs, so stores linking Facebook/Instagram protocol-relative
+//     ("//facebook.com/x") or bare ("facebook.com/x") — extremely common in
+//     Shopify/Wix themes — were read as "no social" and dropped. That's why a
+//     USA + Facebook-required + last-14-days run checked 366 stores and
+//     delivered ~1. The extractor now catches all three forms (+ fb.com/fb.me
+//     short links, web.facebook.com), normalizes them, then live-validates.
+//   • ⚠️ NEAR-MISS TOP-UP: when a run ends SHORT of the requested count purely
+//     because the required-social filter starved it, the wrap-up also delivers
+//     the stores that passed EVERY OTHER filter (status/live, not locked,
+//     country, freshness, niche) but lack the demanded social — clearly tagged
+//     — plus one-tap buttons that rerun the SAME search with one filter
+//     loosened (any social / any country / any age). No more "1 of 366".
 // v9 (this build):
 //   • 🧪 Niche searches are PRODUCT-LEVEL end to end: the urlscan pool is no
 //     longer title-filtered (a store called "Glow Labs" whose title never says
@@ -1255,10 +1269,19 @@ module.exports = async (req, res) => {
     'username', 'yourusername', 'example', 'examples', 'test', 'testing',
     'facebook', 'instagram', 'twitter', 'x', 'linkedin', 'home', 'login'
   ])
+  // v10: stores very often link their socials protocol-relative ("//facebook.com/x")
+  // or even bare ("facebook.com/x") — the old code required http(s):// and
+  // silently missed those, which is the main reason strict-social hunts
+  // starved to ~1 lead in hundreds of checks. Normalize every form here.
   function normalizeSocialUrl(platform, raw) {
     try {
-      const u = new URL(raw.replace(/[\\"'<>]+$/g, ''))
-      const host = u.hostname.toLowerCase().replace(/^(www|m|mobile)\./, '')
+      let cleaned = String(raw || '').replace(/[\\"'<>]+$/g, '').trim()
+      if (cleaned.startsWith('//')) cleaned = 'https:' + cleaned
+      else if (!/^https?:\/\//i.test(cleaned)) cleaned = 'https://' + cleaned.replace(/^\.+/, '')
+      // fb.com / fb.me short links are Facebook pages — normalize to facebook.com
+      if (platform === 'facebook') cleaned = cleaned.replace(/^https:\/\/(?:www\.)?(?:fb\.com|fb\.me)\//i, 'https://www.facebook.com/')
+      const u = new URL(cleaned)
+      const host = u.hostname.toLowerCase().replace(/^(www|m|mobile|web|mbasic)\./, '')
       if (!SOCIAL_HOSTS[platform].includes(host)) return null
       const parts = u.pathname.split('/').filter(Boolean)
       if (platform === 'linkedin') {
@@ -1267,7 +1290,7 @@ module.exports = async (req, res) => {
       } else {
         if (parts.length !== 1 || !/^[a-zA-Z0-9_.-]+$/.test(parts[0])) return null
         if (SOCIAL_PLACEHOLDERS.has(parts[0].toLowerCase())) return null
-        if (['sharer', 'share', 'intent', 'hashtag', 'explore', 'p', 'reel', 'stories'].includes(parts[0].toLowerCase())) return null
+        if (['sharer', 'sharer.php', 'share', 'share.php', 'intent', 'hashtag', 'explore', 'p', 'reel', 'reels', 'stories', 'plugins', 'plugin', 'like.php', 'flx', 'watch'].includes(parts[0].toLowerCase())) return null
       }
       return `https://${host}/${parts.join('/')}`
     } catch { return null }
@@ -1275,10 +1298,10 @@ module.exports = async (req, res) => {
   function extractSocials(text) {
     const socials = {}
     const patterns = {
-      facebook:  /https?:\/\/(?:www\.|m\.)?facebook\.com\/[a-zA-Z0-9_.\-]+/gi,
-      instagram: /https?:\/\/(?:www\.)?instagram\.com\/[a-zA-Z0-9_.\-]+/gi,
-      x:         /https?:\/\/(?:www\.|mobile\.)?(?:twitter|x)\.com\/[a-zA-Z0-9_.\-]+/gi,
-      linkedin:  /https?:\/\/(?:www\.)?linkedin\.com\/(?:company|in)\/[a-zA-Z0-9_.\-]+/gi,
+      facebook:  /(?:https?:)?\/\/(?:www\.|m\.|web\.)?facebook\.com\/[a-zA-Z0-9_.\-]+|(?<![\w\/@.])facebook\.com\/[a-zA-Z0-9_.\-]+|(?:https?:)?\/\/(?:www\.)?(?:fb\.com|fb\.me)\/[a-zA-Z0-9_.\-]+/gi,
+      instagram: /(?:https?:)?\/\/(?:www\.)?instagram\.com\/[a-zA-Z0-9_.\-]+|(?<![\w\/@.])instagram\.com\/[a-zA-Z0-9_.\-]+/gi,
+      x:         /(?:https?:)?\/\/(?:www\.|mobile\.)?(?:twitter|x)\.com\/[a-zA-Z0-9_.\-]+/gi,
+      linkedin:  /(?:https?:)?\/\/(?:www\.)?linkedin\.com\/(?:company|in)\/[a-zA-Z0-9_.\-]+/gi,
     }
     for (const [key, pat] of Object.entries(patterns)) {
       for (const m of text.match(pat) || []) {
@@ -1870,7 +1893,7 @@ module.exports = async (req, res) => {
       // "0 usable of 22" on strict-social runs.
       if (!homeEmails.length || (checkCtx.requiredSocial && !result.socials[checkCtx.requiredSocial])) {
         const base = url.replace(/\/$/, '')
-        const fallbackPages = [base + '/pages/contact', base + '/pages/contact-us', base + '/pages/about', base + '/policies/privacy-policy']
+        const fallbackPages = [base + '/pages/contact', base + '/pages/contact-us', base + '/pages/about', base + '/pages/about-us', base + '/pages/faq', base + '/policies/privacy-policy', base + '/contact', base + '/about']
         const fallbackResults = await Promise.all(fallbackPages.map(async (pageUrl) => {
           try {
             const r = await fetch(pageUrl, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(3500) })
@@ -3402,10 +3425,23 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     // preset from the 🌱 question ("Any time" searches) applies as before.
     const gateDays = search.ageGate ? scoutWindowDays(search.dateRange, search.month) : null
     const scoutFresh = search.ageGate ? gateDays : (search.freshDays || null)
-    return await startScoutJob(chatId, userId, search.query, search.label, search.wantCount,
+    const out = await startScoutJob(chatId, userId, search.query, search.label, search.wantCount,
       !!search.includeLocked, search.month, scoutFresh, search.dateRange || null,
       search.requiredSocial || null, !!search.ageGate, search.platform || await getScoutPlatform(userId),
       scoutCountry, search.nicheTerms || null)
+    // v10: remember the exact search so a wrap-up that fell short can offer
+    // one-tap filter relaxation (scoutrelax:*) without re-asking everything.
+    const q2 = await getUserQueue(userId)
+    q2.lastSearch = {
+      query: search.query, label: search.label, wantCount: search.wantCount,
+      includeLocked: !!search.includeLocked, month: search.month || null,
+      dateRange: search.dateRange || null, freshDays: scoutFresh,
+      requiredSocial: search.requiredSocial || null, ageGate: !!search.ageGate,
+      platform: search.platform || 'shopify', scoutCountry,
+      nicheTerms: search.nicheTerms || null
+    }
+    await saveUserQueue(userId, q2)
+    return out
   }
 
   async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked, month = null, freshDays = null, dateRange = null, requiredSocial = null, ageGate = false, platform = 'shopify', scoutCountry = null, nicheTerms = null) {
@@ -3422,6 +3458,9 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     await send(chatId, `🔍 Hunting for ${wantCount} leads — "${label}" (${scope}${platNote}${freshDays ? `, ≤${freshDays}d old` : ''}${ageNote}${requiredSocial ? `, must have ${requiredSocial === 'x' ? 'X' : requiredSocial[0].toUpperCase() + requiredSocial.slice(1)}` : ''}${countryNote})...\n\n` +
       (requireNiche
         ? `🧪 Product-level check ON: every store must prove its niche with ${NICHE_MATCH_MIN}+ matching products from its LIVE catalog — page titles alone don't count.\n`
+        : '') +
+      (requiredSocial
+        ? `📱 Strict ${requiredSocial} filter ON: every delivered store must have a LIVE, working ${requiredSocial} page link (dead/404 links don't count). Combined with a country + freshness filter this is the strictest possible search — if the source runs dry before your count, I'll add clearly-tagged near-misses and one-tap buttons to loosen ONE filter.\n`
         : '') +
       `🔁 Auto-continue ON: I keep going on my own until ${wantCount} pass or the source runs dry — no need to ping me.\n\n` +
       `⏱️ This can take several minutes: I keep pulling stores and checking each one live — age, email, socials, page speed — until I have ${wantCount} that pass your filters.`)
@@ -3579,8 +3618,52 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     }
     if (!fresh.length && !userQueue.done) reply += `\n\n(The last batch didn't add any leads that pass your filters — still hunting.)`
     if (userQueue.done) reply += `\n\n────────\nSend anything to move to the message-writing step.`
+
+    // ── SOCIAL NEAR-MISS TOP-UP (v10) ──
+    // Strict-social + country + freshness can genuinely starve a run (a brand-new
+    // US store with a PROVABLE live Facebook page is rare). Instead of ending
+    // with 1 lead of 366 checked, ALSO deliver the stores that passed EVERY
+    // OTHER filter but lack the demanded social — clearly tagged — and attach
+    // one-tap buttons that rerun the same search with ONE filter loosened.
+    let topUp = []
+    const gaveUpShort = !!(userQueue.done && want && usableAll.length < want)
+    if (gaveUpShort && requiredSocial) {
+      const chosenUrls = new Set(usableAll.map(r => r.url))
+      topUp = userQueue.results.filter(r =>
+        r.status === 'OK' &&
+        !(r.isPasswordProtected && !includeLocked) &&
+        (r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length) &&
+        !r.socials?.[requiredSocial] &&
+        !(scoutCountry && r.country && r.country.code !== scoutCountry) &&
+        !(freshDays && typeof r.ageDays === 'number' && r.ageDays > freshDays) &&
+        !(requireNiche && r.niche && r.niche.matches < NICHE_MATCH_MIN && !(r.niche.blocked && r.niche.titleMatched)) &&
+        !chosenUrls.has(r.url)
+      ).slice(0, Math.max(want - usableAll.length, 5))
+    }
+    if (topUp.length) {
+      reply += `\n\n⚠️ NEAR-MISSES — these pass ALL your filters except ${requiredSocial} (no working ${requiredSocial} link found on the site). Included so the run isn't empty — verify by hand before pitching:`
+      for (const r of topUp) {
+        leadNum++
+        const nmLine = r.store_name ? `${r.store_name}\n    🔗 ${r.url}` : `🔗 ${r.url}`
+        const nmEmail = r.email !== 'no email' ? `\n    📧 ${r.email}${r.email_is_generic ? ' (generic)' : ''}` : ''
+        const nmSocials = Object.keys(r.socials || {})
+        const nmSocial = nmSocials.length ? `\n    💬 has ${nmSocials.join(', ')} — but no ${requiredSocial}` : `\n    💬 no social links found at all`
+        const nmAge = (typeof r.ageDays === 'number') ? `\n    🎂 age: ${r.ageDays}d` : ''
+        const nmCountry = r.country ? `\n    🌍 ${r.country.label}` : ''
+        reply += `\n\n${leadNum}. ${nmLine}${nmAge}${nmCountry}${nmSocial}${nmEmail}`
+      }
+      reply += `\n\n👇 Or rerun the SAME search with one filter loosened:`
+    }
     await saveUserQueue(userId, userQueue)
-    await send(chatId, reply)
+
+    const relaxKb = []
+    if (gaveUpShort) {
+      if (requiredSocial) relaxKb.push([B(`💬 Any social — drop the "${requiredSocial}" requirement`, `scoutrelax:social`)])
+      if (scoutCountry) relaxKb.push([B(`🌍 Any country — drop ${STORE_COUNTRY_LABELS[scoutCountry] || scoutCountry}`, `scoutrelax:country`)])
+      if (freshDays) relaxKb.push([B('🗓 Any store age — drop the freshness limit', `scoutrelax:age`)])
+    }
+    if (relaxKb.length) await sendKeyboard(chatId, reply, relaxKb)
+    else await send(chatId, reply)
 
     // v8 AUTO-CONTINUE: budget ran out with work still queued — wake ourselves
     // instead of waiting for a user ping. Bounded by the wake:runs cap.
@@ -4620,6 +4703,35 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
           return res.status(200).send('OK')
         }
         return await launchScoutFromPending(cbChatId, cbUserId, code === 'any' ? 'any' : code.toUpperCase())
+      }
+
+      // v10: one-tap filter relaxation from a "dug short" wrap-up — reruns the
+      // SAME search with exactly one filter loosened (any social / any country /
+      // any age). Already-checked stores stay skipped; the urlscan cursor starts
+      // fresh and pages DEEPER into the index for new candidates.
+      if (data.startsWith('scoutrelax:')) {
+        const qR = await getUserQueue(cbUserId)
+        const ls = qR.lastSearch
+        if (!ls) { await send(cbChatId, 'That search has expired — send /scout to start again.'); return res.status(200).send('OK') }
+        const what = data.slice('scoutrelax:'.length)
+        const relaxed = { ...ls }
+        if (what === 'social') {
+          relaxed.requiredSocial = null
+          await send(cbChatId, `🔁 Restarting the same search with ANY social accepted…`)
+        } else if (what === 'country') {
+          relaxed.scoutCountry = null
+          await send(cbChatId, `🔁 Restarting the same search with ANY country accepted…`)
+        } else if (what === 'age') {
+          relaxed.freshDays = null
+          relaxed.ageGate = false
+          await send(cbChatId, `🔁 Restarting the same search with ANY store age accepted…`)
+        } else {
+          return res.status(200).send('OK')
+        }
+        return await startScoutJob(cbChatId, cbUserId, relaxed.query, relaxed.label, relaxed.wantCount,
+          relaxed.includeLocked, relaxed.month, relaxed.freshDays, relaxed.dateRange || null,
+          relaxed.requiredSocial || null, relaxed.ageGate, relaxed.platform || 'shopify',
+          relaxed.scoutCountry || null, relaxed.nicheTerms || null)
       }
 
       // ── 🏬 Online Stores platform picker (Shopify / Wix / Etsy / More) ──
