@@ -491,3 +491,49 @@ How discovery works: Lovable gives every project its own SSL certificate, so new
 - Max 50 results per `/find` job (safety limit).
 - Never commit `gm_cookies.json` or `_env` — the `.gitignore` in this repo
   blocks them, but double-check before pushing if you ever restructure files.
+
+
+---
+
+## v11 — Multi-country store searches + hunts that finish by themselves
+
+### 🌍 Pick several countries in 🏬 Online Stores
+The last `/scout` question is now a **multi-select**: tap every country you
+want (✅ marks the picked ones — tap again to untick), then press
+**✅ Done — start search**. A store passes if it provably sells to **ANY** of
+your picked countries (currency £/€/₦…, phone prefixes, addresses, page
+language); stores the bot can't place are still kept, never dropped.
+`🌍 Any country (clear selection)` resets it.
+
+You can also type them at once instead of tapping:
+```
+/country NG US GH      ← several codes = multi-select for store searches
+/country US            ← a single code ALSO sets the AI-hunt filter
+/country               ← shows what's currently selected
+/country any           ← clears every country filter
+```
+
+### ♻️ Auto-continue that heals itself (built-in — nothing to set up)
+When a run hits Vercel's ~40s budget with work left, the bot now:
+1. Calls its own webhook and **retries up to 3×** with backoff — one flaky
+   fetch used to silently kill the whole loop.
+2. Puts you on the `wake:watch` list in Redis — so if the self-call still
+   fails, **any** later message or button tap resumes the run, and an
+   external pinger (below) can resume it too.
+3. Only asks you to "send anything to continue" if all of the above failed.
+
+### Optional free external pinger — continuation with zero interaction
+If you want hunts to keep digging even when Vercel freezes the bot's own
+self-calls completely, point a free cron at the endpoint (e.g.
+[cron-job.org](https://cron-job.org)):
+
+- **URL:** `https://YOUR-APP.vercel.app/api/scraper_bot.js?wake=1`
+- **Interval:** every 2–5 minutes · **Method:** GET
+- If you set a `WAKE_PING_SECRET` env var in Vercel, use
+  `...?wake=1&key=YOURSECRET` (and/or send the header `x-auto-ping: YOURSECRET`)
+  so strangers can't trigger resumes.
+
+Each ping resumes **one** armed, unfinished run (scout / AI hunt / deep
+search) and replies `OK` when there's nothing to do — it never touches
+anything else and costs nothing. `/cancel` removes you from the watch list
+immediately.

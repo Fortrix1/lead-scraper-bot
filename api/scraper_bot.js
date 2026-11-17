@@ -1,5 +1,15 @@
 // api/scraper_bot.js
 // Personal Telegram lead-scraper bot — hosted on Vercel
+// v11 (this build):
+//   • 🌍 MULTI-COUNTRY store searches: the /scout country step is now a
+//     multi-select — tap as many countries as you like (✅ = picked), then
+//     press "✅ Done — start search". A store passes if it provably sells
+//     to ANY picked country. Also: /country NG US GH sets several at once.
+//   • ♻️ SELF-HEALING AUTO-CONTINUE: the self-webhook now retries 3× with
+//     backoff, and every unfinished run is put on a wake:watch list — ANY
+//     later message/callback resumes it, and an external free cron ping
+//     (GET .../api/scraper_bot.js?wake=1, see SETUP.md) resumes one armed
+//     run per hit even when Vercel freezes self-calls completely.
 // v4: admin lock, audit log, /fresh as automatic tick switch, relay-aware age lookups
 // v5: scout date windows skip the redundant freshness question (the chosen
 //     window is enforced strictly, then it goes straight to the password
@@ -55,7 +65,14 @@
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*')
-  if (req.method === 'GET') return res.status(200).send('OK')
+  // Keep-alive ping detection (must run BEFORE the GET early-return so cron
+  // pingers work): header x-auto-ping: 1 (or your WAKE_PING_SECRET), or
+  // ?wake=1 in the query (add &key=YOURSECRET when a secret is set).
+  const pingSecret = process.env.WAKE_PING_SECRET || ''
+  const _urlStr = String(req.url || '')
+  const isWakePing = (req.headers['x-auto-ping'] === (pingSecret || '1')) ||
+    (/[?&]wake=1(?:&|$)/.test(_urlStr) && (!pingSecret || new RegExp('[?&]key=' + pingSecret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:&|$)').test(_urlStr)))
+  if (req.method === 'GET' && !isWakePing) return res.status(200).send('OK')
 
   const BOT_TOKEN = process.env.SCRAPER_BOT_TOKEN || ''
   const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL   || ''
@@ -361,19 +378,55 @@ module.exports = async (req, res) => {
   }
   // Per-user country filter for online-store searches (same idea as the hunt
   // filter, separate key so the two flows don't fight each other).
-  async function getScoutCountry(userId) {
+  // ── Store-search country filter — MULTI-SELECT (v11): tap as many
+  // countries as you like, press Done. Stored as a JSON array; the legacy
+  // single-value key is still read once. An empty list = any country, and a
+  // store passes if it provably sells to ANY of the picked countries.
+  async function getScoutCountries(userId) {
     try {
-      const { result } = await redis('GET', `scout:country:${userId}`)
-      const c = String(result || '').toLowerCase()
-      return STORE_COUNTRY_LABELS[c.toUpperCase()] ? c : 'any'
-    } catch { return 'any' }
+      const { result } = await redis('GET', `scout:countries:${userId}`)
+      if (result) {
+        const arr = JSON.parse(result)
+        if (Array.isArray(arr)) {
+          return [...new Set(arr.map(c => String(c).toUpperCase()).filter(c => STORE_COUNTRY_LABELS[c]))]
+        }
+      }
+      const { result: old } = await redis('GET', `scout:country:${userId}`)
+      const oc = String(old || '').toUpperCase()
+      return (old && STORE_COUNTRY_LABELS[oc]) ? [oc] : []
+    } catch { return [] }
   }
-  async function setScoutCountry(userId, code) {
-    const c = String(code || '').toLowerCase()
+  async function setScoutCountries(userId, codes) {
+    const clean = [...new Set((codes || []).map(c => String(c).toUpperCase()).filter(c => STORE_COUNTRY_LABELS[c]))]
     try {
-      if (c === 'any' || !STORE_COUNTRY_LABELS[c.toUpperCase()]) await redis('DEL', `scout:country:${userId}`)
-      else await redis('SET', `scout:country:${userId}`, c, 'EX', 2592000)
+      if (!clean.length) {
+        await redis('DEL', `scout:countries:${userId}`)
+        await redis('DEL', `scout:country:${userId}`)
+      } else {
+        await redis('SET', `scout:countries:${userId}`, JSON.stringify(clean), 'EX', 2592000)
+      }
     } catch {}
+  }
+  async function toggleScoutCountry(userId, code) {
+    const cur = await getScoutCountries(userId)
+    const c = String(code || '').toUpperCase()
+    if (!STORE_COUNTRY_LABELS[c]) return cur
+    const next = cur.includes(c) ? cur.filter(x => x !== c) : [...cur, c]
+    await setScoutCountries(userId, next)
+    return next
+  }
+  // The multi-select keyboard: ✅ marks picked countries; Done launches.
+  function scoutCountryKeyboard(selected) {
+    const sel = new Set((selected || []).map(c => String(c).toUpperCase()))
+    const mk = (code, label) => ({ text: (sel.has(code) ? '✅ ' : '') + label, callback_data: `scoutcountry:${code.toLowerCase()}` })
+    return [
+      [mk('us', '🇺🇸 US'), mk('uk', '🇬🇧 UK'), mk('ng', '🇳🇬 NG'), mk('in', '🇮🇳 IN'), mk('ca', '🇨🇦 CA')],
+      [mk('gh', '🇬🇭 GH'), mk('ke', '🇰🇪 KE'), mk('za', '🇿🇦 ZA'), mk('ph', '🇵🇭 PH'), mk('de', '🇩🇪 DE')],
+      [mk('eu', '🇪🇺 Europe (€)'), mk('au', '🇦🇺 AU'), mk('br', '🇧🇷 BR'), mk('fr', '🇫🇷 FR')],
+      [{ text: '🌍 Any country (clear selection)', callback_data: 'scoutcountry:any' }],
+      [{ text: `✅ Done — start search${sel.size ? ` (${sel.size} picked)` : ''}`, callback_data: 'scoutdone' }],
+      [{ text: '✍️ More countries — type /country NG US GH', callback_data: 'countryhint' }]
+    ]
   }
 
   // ── ANTI-BLOCK fetch: rotating UAs, one retry with backoff, and explicit
@@ -431,6 +484,37 @@ module.exports = async (req, res) => {
     return out
   }
 
+  // ── WAKE WATCH — users with unfinished work that ANY later input (or an
+  // external keep-alive ping) can resume. Members are user ids; the chat id
+  // lives in wake:chat:{uid} so pings never need a Telegram body.
+  async function watchUser(userId, chatId) {
+    try {
+      await redis('SADD', 'wake:watch', String(userId))
+      await redis('SET', `wake:chat:${userId}`, String(chatId), 'EX', '86400')
+    } catch {}
+  }
+  async function unwatchUser(userId) {
+    try {
+      await redis('SREM', 'wake:watch', String(userId))
+      await redis('DEL', `wake:chat:${userId}`)
+    } catch {}
+  }
+
+  // Shared "resume whatever is in progress" dispatcher — used by normal user
+  // pings AND by the keep-alive ping. Returns falsy when nothing to do.
+  async function resumeQueuedWork(chatId, userId, userQueue) {
+    if (userQueue.deepQ && userQueue.deepQ.started && userQueue.deepIdx < userQueue.deepQ.urls.length) {
+      return await runDeepSearchBatch(chatId, userId, userQueue)
+    }
+    if (userQueue.aiHunt && !userQueue.aiHunt.done) {
+      return await runAiHuntBatch(chatId, userId, userQueue)
+    }
+    if (!userQueue.done && (userQueue.pending.length > 0 || (userQueue.searchCtx && !userQueue.searchCtx.exhausted))) {
+      return await runBatch(chatId, userId, userQueue)
+    }
+    return false
+  }
+
   // ── AUTO-CONTINUE: keep hunting without the user sending anything. When a
   // run hits its 40s budget with work still pending, we POST to our own
   // webhook with an auto_wake marker; the next invocation resumes the saved
@@ -440,25 +524,36 @@ module.exports = async (req, res) => {
     try {
       const { result: runs } = await redis('GET', `wake:runs:${userId}`)
       const n = parseInt(runs || '0', 10) || 0
-      if (n >= 40) return false
+      if (n >= 40) { await watchUser(userId, chatId); return false }
       await redis('SET', `wake:runs:${userId}`, String(n + 1), 'EX', 1800)
       const proto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim()
       const host = req.headers['x-forwarded-host'] || req.headers.host || ''
       const path = String(req.url || '/api/scraper_bot.js').split('?')[0]
       const selfUrl = process.env.SCRAPER_SELF_URL || (host ? `${proto}://${host}${path}` : '')
-      if (!selfUrl) return false
+      if (!selfUrl) { await watchUser(userId, chatId); return false }
       // AWAIT the self-call before this invocation responds — Vercel freezes
       // fire-and-forget fetches the moment the response is sent, which is why
-      // auto-continue silently died and you had to type to continue.
-      try {
-        await fetch(selfUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-bot-wake': '1' },
-          body: JSON.stringify({ auto_wake: true, chat_id: chatId, user_id: userId, reason, ts: Date.now() }),
-          signal: AbortSignal.timeout(9000)
-        })
-      } catch { return false }
-      return true
+      // auto-continue silently died and you had to type to continue. v11:
+      // retry up to 3× with backoff (one flaky fetch used to silently kill
+      // the whole loop), and ALWAYS arm the wake:watch list — so even if
+      // every self-call fails, an external pinger (SETUP.md) or ANY later
+      // message/callback can still resume the run.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await fetch(selfUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-bot-wake': '1' },
+            body: JSON.stringify({ auto_wake: true, chat_id: chatId, user_id: userId, reason, ts: Date.now() }),
+            signal: AbortSignal.timeout(9000)
+          })
+          await watchUser(userId, chatId)
+          return true
+        } catch {
+          if (attempt < 2) await sleep(1500 * (attempt + 1))
+        }
+      }
+      await watchUser(userId, chatId)
+      return false
     } catch { return false }
   }
 
@@ -466,6 +561,25 @@ module.exports = async (req, res) => {
 
   let body = req.body
   if (typeof body === 'string') { try { body = JSON.parse(body) } catch { return res.status(200).send('OK') } }
+
+  // ── KEEP-ALIVE PING (cron-job.org / UptimeRobot / your own cron) ──
+  // Resumes one armed, unfinished scout / AI hunt / deep search per hit —
+  // the "something that sends the message itself" fallback for when Vercel
+  // freezes or drops the bot's own self-webhook. Does nothing (replies OK)
+  // when no run is armed.
+  if (isWakePing) {
+    try {
+      const { result: watchIds } = await redis('SMEMBERS', 'wake:watch')
+      for (const uid of (watchIds || [])) {
+        const q = await getUserQueue(String(uid))
+        const pingChat = await redis('GET', `wake:chat:${uid}`)
+        if (!pingChat) { await unwatchUser(uid); continue }
+        const resumed = await resumeQueuedWork(pingChat, String(uid), q)
+        if (resumed) return   // the resumed runner already sent the response
+      }
+    } catch (e) { console.error('keep-alive ping error:', e.message) }
+    return res.status(200).send('OK')
+  }
   if (!body) return res.status(200).send('OK')
 
   // ── AUTO-WAKE ENTRY: a continuation ping we scheduled ourselves. It arrives
@@ -2743,6 +2857,7 @@ module.exports = async (req, res) => {
     const huntSrc = AI_HUNT_SOURCES[h.srcKey]
     const maxDig = huntMaxDig(huntSrc, h.age || 'newest')
     h.done = archiveExhausted || live.length >= h.want || (!h.candidates.length && (h.dig || 1) > maxDig)
+    if (h.done && !(userQueue.deepQ && userQueue.deepQ.started && userQueue.deepIdx < userQueue.deepQ.urls.length)) await unwatchUser(userId)
     const gaveUpShort = h.done && live.length < h.want
 
     // ── TOP-UP (v7.3): hunt ended short of `want` with a country filter on.
@@ -3288,6 +3403,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     if (userQueue.deepIdx >= total) {
       userQueue.deepQ = null
       userQueue.deepIdx = 0
+      if (!(userQueue.aiHunt && !userQueue.aiHunt.done)) await unwatchUser(userId)
       await saveUserQueue(userId, userQueue)
       await send(chatId, `✅ Deep search complete — ${total} full dossier${total === 1 ? '' : 's'} delivered, each with its paste-ready rebuild blueprint + pitch. Copy any blueprint into Lovable/v0 and pitch the owner.${userQueue.aiHunt && !userQueue.aiHunt.done ? '\n\n⛏ Your hunt was paused for this — send anything and it keeps digging.' : ''}`)
     } else {
@@ -3403,7 +3519,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
   // Shared launcher: takes the pending search after the LAST filter question
   // (social → country) and actually starts the hunt. Used by the country
   // buttons, typed country answers, and any future last-step filters.
-  async function launchScoutFromPending(chatId, userId, countryCode) {
+  async function launchScoutFromPending(chatId, userId) {
     const userQueue = await getUserQueue(userId)
     const search = userQueue.pendingSearch
     userQueue.awaitingScoutCountry = false
@@ -3413,8 +3529,9 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       await send(chatId, 'That search expired — send /scout to start again.')
       return res.status(200).send('OK')
     }
-    if (countryCode) await setScoutCountry(userId, countryCode)
-    const scoutCountry = await getScoutCountry(userId)
+    // The multi-select picker already stored the countries when the user
+    // tapped Done (or typed them) — just read the current list.
+    const scoutCountries = await getScoutCountries(userId)
     if (!isOwner) {
       const scoutTier = await tierOf(userId)
       if (!(await spendFreeCredit(chatId, scoutTier, userId))) return res.status(200).send('OK')
@@ -3428,7 +3545,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     const out = await startScoutJob(chatId, userId, search.query, search.label, search.wantCount,
       !!search.includeLocked, search.month, scoutFresh, search.dateRange || null,
       search.requiredSocial || null, !!search.ageGate, search.platform || await getScoutPlatform(userId),
-      scoutCountry, search.nicheTerms || null)
+      scoutCountries, search.nicheTerms || null)
     // v10: remember the exact search so a wrap-up that fell short can offer
     // one-tap filter relaxation (scoutrelax:*) without re-asking everything.
     const q2 = await getUserQueue(userId)
@@ -3437,14 +3554,14 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       includeLocked: !!search.includeLocked, month: search.month || null,
       dateRange: search.dateRange || null, freshDays: scoutFresh,
       requiredSocial: search.requiredSocial || null, ageGate: !!search.ageGate,
-      platform: search.platform || 'shopify', scoutCountry,
+      platform: search.platform || 'shopify', scoutCountries: [...scoutCountries],
       nicheTerms: search.nicheTerms || null
     }
     await saveUserQueue(userId, q2)
     return out
   }
 
-  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked, month = null, freshDays = null, dateRange = null, requiredSocial = null, ageGate = false, platform = 'shopify', scoutCountry = null, nicheTerms = null) {
+  async function startScoutJob(chatId, userId, query, label, wantCount, includeLocked, month = null, freshDays = null, dateRange = null, requiredSocial = null, ageGate = false, platform = 'shopify', scoutCountries = null, nicheTerms = null) {
     const scope = dateRange ? dateRangeLabel(dateRange) : ymLabel(month)
     const ageNote = ageGate && freshDays ? ` · 🎂 store age ≤${freshDays}d ✅ enforced` : ''
     const plat = PLATFORMS[platform] || PLATFORMS.shopify
@@ -3454,7 +3571,8 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     nicheTerms = (nicheTerms && nicheTerms.length) ? nicheTerms : extractNicheTerms(query)
     const requireNiche = nicheTerms.length > 0
     await redis('DEL', `wake:runs:${userId}`)   // fresh hunt → fresh auto-continue budget
-    const countryNote = scoutCountry ? `, 🌍 ${STORE_COUNTRY_LABELS[scoutCountry.toUpperCase()] || scoutCountry}` : ''
+    const scoutCountryArr = [...new Set((scoutCountries || []).map(c => String(c).toUpperCase()).filter(c => STORE_COUNTRY_LABELS[c]))]
+    const countryNote = scoutCountryArr.length ? `, 🌍 ${scoutCountryArr.map(c => STORE_COUNTRY_LABELS[c]).join(' / ')}` : ''
     await send(chatId, `🔍 Hunting for ${wantCount} leads — "${label}" (${scope}${platNote}${freshDays ? `, ≤${freshDays}d old` : ''}${ageNote}${requiredSocial ? `, must have ${requiredSocial === 'x' ? 'X' : requiredSocial[0].toUpperCase() + requiredSocial.slice(1)}` : ''}${countryNote})...\n\n` +
       (requireNiche
         ? `🧪 Product-level check ON: every store must prove its niche with ${NICHE_MATCH_MIN}+ matching products from its LIVE catalog — page titles alone don't count.\n`
@@ -3469,7 +3587,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       awaitingMessages: false, messages: [], awaitingCustomQuery: false,
       label: label || '', includeLocked: !!includeLocked,
       wantCount, freshDays, requiredSocial, ageGate: !!ageGate,
-      platform, nicheTerms, requireNiche, scoutCountry,
+      platform, nicheTerms, requireNiche, scoutCountries: scoutCountryArr,
       searchCtx: { query: applyScoutDateFilter(query, month, dateRange), searchAfter: null, exhausted: false, total: null }
     }
     await saveUserQueue(userId, userQueue)
@@ -3517,9 +3635,8 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     // v9 country filter — LENIENT: only a PROVABLY different country drops a
     // store; a page that prints no currency/phones passes untagged, so the
     // run can never be starved to zero by silent pages.
-    const scoutCountry = (userQueue.scoutCountry && STORE_COUNTRY_LABELS[userQueue.scoutCountry.toUpperCase()])
-      ? userQueue.scoutCountry.toUpperCase() : null
-    const provenCountryMiss = r => scoutCountry && r.country && r.country.code !== scoutCountry
+    const scoutCountryList = [...new Set((userQueue.scoutCountries || []).map(c => String(c).toUpperCase()).filter(c => STORE_COUNTRY_LABELS[c]))]
+    const provenCountryMiss = r => scoutCountryList.length > 0 && !!r.country && !scoutCountryList.includes(r.country.code)
     const checkCtx = { nicheTerms: userQueue.nicheTerms || null, platform: userQueue.platform || 'shopify', requiredSocial }
     let didWork = false
 
@@ -3562,6 +3679,9 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     const sourceExhausted = !userQueue.pending.length && (!userQueue.searchCtx || userQueue.searchCtx.exhausted)
     const reached = !!(want && usableAll.length >= want)
     userQueue.done = !!(reached || sourceExhausted)
+    // Scout finished for good → drop this user from the keep-alive watch list
+    // (unless an AI hunt is also still live under the same queue).
+    if (userQueue.done && !(userQueue.aiHunt && !userQueue.aiHunt.done)) await unwatchUser(userId)
 
     // Transparency: where every checked candidate went (the "checked 336,
     // saw 0" mystery gets an exact breakdown now).
@@ -3570,14 +3690,14 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     const noContactC = userQueue.results.filter(r => r.status === 'OK' && !(r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length)).length
     const nicheMissC = requireNiche ? userQueue.results.filter(r => r.status === 'OK' && r.niche && r.niche.matches < NICHE_MATCH_MIN && !(r.niche.blocked && r.niche.titleMatched)).length : 0
     const socialMissC = requiredSocial ? userQueue.results.filter(r => r.status === 'OK' && !r.socials?.[requiredSocial]).length : 0
-    const countryMissC = scoutCountry ? userQueue.results.filter(r => r.status === 'OK' && r.country && r.country.code !== scoutCountry).length : 0
+    const countryMissC = scoutCountryList.length ? userQueue.results.filter(r => r.status === 'OK' && r.country && !scoutCountryList.includes(r.country.code)).length : 0
     const breakdown = []
     if (deadC) breakdown.push(`${deadC} dead`)
     if (blockedC) breakdown.push(`${blockedC} blocked (retrying)`)
     if (noContactC) breakdown.push(`${noContactC} no contact info`)
     if (nicheMissC) breakdown.push(`${nicheMissC} niche-miss (<${NICHE_MATCH_MIN} products)`)
     if (socialMissC) breakdown.push(`${socialMissC} missing ${requiredSocial === 'x' ? 'X' : requiredSocial}`)
-    if (countryMissC) breakdown.push(`${countryMissC} wrong country (≠ ${STORE_COUNTRY_LABELS[scoutCountry] || scoutCountry})`)
+    if (countryMissC) breakdown.push(`${countryMissC} wrong country (none of: ${scoutCountryList.map(c => STORE_COUNTRY_LABELS[c]).join(' / ')})`)
     const breakdownLine = breakdown.length ? ` — dropped: ${breakdown.join(', ')}` : ''
 
     let header
@@ -3585,7 +3705,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     else if (sourceExhausted) header = `✓ Source finished — ${usableAll.length} usable of ${userQueue.results.length} checked.${breakdownLine}`
     else header = `⏳ ${usableAll.length} of ${want} so far (checked ${userQueue.results.length}${breakdownLine}) — AUTO-CONTINUING, no need to reply.`
     if (userQueue.ageGate && freshDays) header += `\n🎂 Store age ≤ ${freshDays}d enforced — older stores dropped (see /others).`
-    if (scoutCountry) header += `\n🌍 Country filter: ${STORE_COUNTRY_LABELS[scoutCountry]} — provably-different stores dropped; unprovable ones kept. Change with /country.`
+    if (scoutCountryList.length) header += `\n🌍 Country filter: ${scoutCountryList.map(c => STORE_COUNTRY_LABELS[c]).join(' / ')} — a store passes if it provably sells to ANY of them; unprovable ones kept. Change with /country.`
     if (userQueue.searchCtx && userQueue.searchCtx.total != null && !sourceExhausted) header += `\n📊 ${userQueue.searchCtx.total} total matches in this window.`
 
     let reply = header
@@ -3634,7 +3754,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         !(r.isPasswordProtected && !includeLocked) &&
         (r.email !== 'no email' || r.contact_page || Object.keys(r.socials || {}).length) &&
         !r.socials?.[requiredSocial] &&
-        !(scoutCountry && r.country && r.country.code !== scoutCountry) &&
+        !(scoutCountryList.length && r.country && !scoutCountryList.includes(r.country.code)) &&
         !(freshDays && typeof r.ageDays === 'number' && r.ageDays > freshDays) &&
         !(requireNiche && r.niche && r.niche.matches < NICHE_MATCH_MIN && !(r.niche.blocked && r.niche.titleMatched)) &&
         !chosenUrls.has(r.url)
@@ -3659,7 +3779,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     const relaxKb = []
     if (gaveUpShort) {
       if (requiredSocial) relaxKb.push([B(`💬 Any social — drop the "${requiredSocial}" requirement`, `scoutrelax:social`)])
-      if (scoutCountry) relaxKb.push([B(`🌍 Any country — drop ${STORE_COUNTRY_LABELS[scoutCountry] || scoutCountry}`, `scoutrelax:country`)])
+      if (scoutCountryList.length) relaxKb.push([B(`🌍 Any country — drop the country filter`, `scoutrelax:country`)])
       if (freshDays) relaxKb.push([B('🗓 Any store age — drop the freshness limit', `scoutrelax:age`)])
     }
     if (relaxKb.length) await sendKeyboard(chatId, reply, relaxKb)
@@ -4696,13 +4816,32 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       }
 
       if (data.startsWith('scoutcountry:')) {
+        // v11 multi-select: tap = toggle (✅), then press Done to launch.
         const code = data.slice('scoutcountry:'.length)
         const q0 = await getUserQueue(cbUserId)
         if (!q0.pendingSearch || !q0.awaitingScoutCountry) {
           await send(cbChatId, 'That search expired — send /scout to start again.')
           return res.status(200).send('OK')
         }
-        return await launchScoutFromPending(cbChatId, cbUserId, code === 'any' ? 'any' : code.toUpperCase())
+        if (code === 'any') await setScoutCountries(cbUserId, [])
+        else await toggleScoutCountry(cbUserId, code)
+        const sel = await getScoutCountries(cbUserId)
+        try {
+          await tgCall('editMessageReplyMarkup', {
+            chat_id: cbChatId, message_id: body.callback_query.message.message_id,
+            reply_markup: { inline_keyboard: scoutCountryKeyboard(sel) }
+          })
+        } catch {}
+        return res.status(200).send('OK')
+      }
+
+      if (data === 'scoutdone') {
+        const q0 = await getUserQueue(cbUserId)
+        if (!q0.pendingSearch || !q0.awaitingScoutCountry) {
+          await send(cbChatId, 'That search expired — send /scout to start again.')
+          return res.status(200).send('OK')
+        }
+        return await launchScoutFromPending(cbChatId, cbUserId)
       }
 
       // v10: one-tap filter relaxation from a "dug short" wrap-up — reruns the
@@ -4719,7 +4858,8 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
           relaxed.requiredSocial = null
           await send(cbChatId, `🔁 Restarting the same search with ANY social accepted…`)
         } else if (what === 'country') {
-          relaxed.scoutCountry = null
+          relaxed.scoutCountries = []
+          await setScoutCountries(cbUserId, [])
           await send(cbChatId, `🔁 Restarting the same search with ANY country accepted…`)
         } else if (what === 'age') {
           relaxed.freshDays = null
@@ -4731,7 +4871,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         return await startScoutJob(cbChatId, cbUserId, relaxed.query, relaxed.label, relaxed.wantCount,
           relaxed.includeLocked, relaxed.month, relaxed.freshDays, relaxed.dateRange || null,
           relaxed.requiredSocial || null, relaxed.ageGate, relaxed.platform || 'shopify',
-          relaxed.scoutCountry || null, relaxed.nicheTerms || null)
+          relaxed.scoutCountries || null, relaxed.nicheTerms || null)
       }
 
       // ── 🏬 Online Stores platform picker (Shopify / Wix / Etsy / More) ──
@@ -5326,6 +5466,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     q.pendingFindJob = null; q.pending = []; q.results = []; q.messages = []
     await saveUserQueue(userId, q)
     await redis('DEL', `wake:runs:${userId}`)   // /cancel also stops the auto-continue loop
+    await unwatchUser(userId)
     await send(chatId, '🧹 Cleared. The bot is no longer waiting for anything — old scout results and pending batches were dropped. Auto-continue stopped too.')
     return res.status(200).send('OK')
   }
@@ -5854,34 +5995,45 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     return res.status(200).send('OK')
   }
 
-  // ── /country XX — set the AI-hunter country filter ──
+  // ── /country XX [YY ZZ...] — set country filters for BOTH hunters ──
+  // Store searches: MULTI — every code you list is accepted (a store passes
+  // if it provably sells to ANY of them). AI hunts: single — when you pass
+  // exactly one code it sets the hunt filter too; with several, hunts stay
+  // as they were (they're one-country by design).
   if (/^\/country(@\w+)?(\s|$)/.test(text)) {
     const arg = text.replace(/^\/country(@\w+)?\s*/, '').trim().toLowerCase()
-    const current = await getHuntCountry(userId)
+    const scoutSel = await getScoutCountries(userId)
     if (!arg) {
       const popular = 'NG 🇳🇬 · US 🇺🇸 · UK 🇬🇧 · IN 🇮🇳 · GH 🇬🇭 · KE 🇰🇪 · ZA 🇿🇦 · PH 🇵🇭 · DE 🇩🇪 · BR 🇧🇷 · CA 🇨🇦 · AU 🇦🇺'
       await send(chatId,
-        `🌍 Country filter right now: ${current === 'any' ? 'Any country' : COUNTRY_LABELS[current.toUpperCase()]}\n\n` +
-        `Set one with:\n/country NG   /country US   /country UK   /country GH …\n\n` +
+        `🌍 Country filters right now:\n` +
+        `• 🏬 Online-store searches: ${scoutSel.length ? scoutSel.map(c => STORE_COUNTRY_LABELS[c]).join(' / ') : 'Any country'}\n` +
+        `• 🤖 AI hunts: ${(await getHuntCountry(userId)) === 'any' ? 'Any country' : COUNTRY_LABELS[(await getHuntCountry(userId)).toUpperCase()]}\n\n` +
+        `Set them with one or more codes:\n/country NG\n/country NG US GH   ← multi-select for store searches\n/country US         ← a single code also sets the AI-hunt filter\n\n` +
         `Popular: ${popular}\n\n` +
-        `Detection uses the site's domain ending (.ng, .co.uk…), the phone numbers it prints (+234, +44…) and its page content (addresses, cities, currency).\n` +
-        `/country any removes the filter. You can also tap the country buttons in any hunt menu.`)
+        `Detection uses the site's domain ending (.ng, .co.uk…), the phone numbers it prints (+234, +44…), store currency (₦ £ € R$…) and page content.\n` +
+        `/country any removes every country filter.`)
       return res.status(200).send('OK')
     }
-    if (arg === 'any') {
+    if (arg === 'any' || arg === 'all') {
+      await setScoutCountries(userId, [])
       await redis('SET', `hunt:country:${userId}`, 'any', 'EX', 43200)
-      await setScoutCountry(userId, 'any')
-      await send(chatId, `🌍 Country filter removed — AI hunts AND online-store searches scan every country again.`)
+      await send(chatId, `🌍 All country filters removed — store searches AND AI hunts scan every country again.`)
       return res.status(200).send('OK')
     }
-    if (!COUNTRY_LABELS[arg.toUpperCase()] && !STORE_COUNTRY_LABELS[arg.toUpperCase()]) {
-      await send(chatId, `❓ Unknown country code "${arg.toUpperCase()}". Use a 2-letter code like /country NG, /country US, /country UK — or /country any to remove the filter.`)
+    const codes = [...new Set(arg.toUpperCase().split(/[\s,]+/).filter(Boolean))]
+    const valid = codes.filter(c => STORE_COUNTRY_LABELS[c])
+    if (!valid.length) {
+      await send(chatId, `❓ Unknown country code(s) "${codes.join(' ')}". Use 2-letter codes like /country NG, /country US, /country UK — or /country any to remove the filters.`)
       return res.status(200).send('OK')
     }
-    await redis('SET', `hunt:country:${userId}`, arg.toLowerCase(), 'EX', 43200)
-    await setScoutCountry(userId, arg)
-    const cLbl = COUNTRY_LABELS[arg.toUpperCase()] || STORE_COUNTRY_LABELS[arg.toUpperCase()]
-    await send(chatId, `🌍 Country filter set: ${cLbl} (auto-expires after 12h).\nFrom now on AI hunts AND 🏬 online-store searches only deliver sites that look ${cLbl.replace(/^\S+\s/, '')} — matched by domain ending, phone numbers, page content and store currency (₦, £, €, R$…).`)
+    await setScoutCountries(userId, valid)
+    if (valid.length === 1) await redis('SET', `hunt:country:${userId}`, valid[0].toLowerCase(), 'EX', 43200)
+    const cLbl = valid.map(c => STORE_COUNTRY_LABELS[c]).join(' / ')
+    await send(chatId,
+      `🌍 Country filter set: ${cLbl} (auto-expires after 12h).\n` +
+      `• 🏬 Online-store searches now accept ANY of these countries — matched by domain ending, phone numbers, store currency (₦, £, €, R$…) and page content.` +
+      (valid.length === 1 ? `\n• 🤖 AI hunts now also target ${COUNTRY_LABELS[valid[0]]}.` : `\n• 🤖 AI hunts stay single-country — send /country XX with one code if you want to filter them too.`))
     return res.status(200).send('OK')
   }
 
@@ -6152,25 +6304,27 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       await saveUserQueue(userId, userQueue)
       await sendKeyboard(chatId,
         `✅ Social filter set: ${requiredSocial ? (requiredSocial === 'x' ? 'X' : requiredSocial[0].toUpperCase() + requiredSocial.slice(1)) + ' — required on every store' : 'any social'}` +
-        `\n\n🌍 Last filter — which country should the stores sell to?\nI read it off the page: prices (£/€/₦…), phone prefixes, language, addresses. Stores I can't place are KEPT, not dropped.`, [
-        [{ text: '🌍 Any country', callback_data: 'scoutcountry:any' }],
-        [{ text: '🇺🇸 US', callback_data: 'scoutcountry:us' }, { text: '🇬🇧 UK', callback_data: 'scoutcountry:uk' }, { text: '🇳🇬 NG', callback_data: 'scoutcountry:ng' }],
-        [{ text: '🇨🇦 CA', callback_data: 'scoutcountry:ca' }, { text: '🇦🇺 AU', callback_data: 'scoutcountry:au' }, { text: '🇮🇳 IN', callback_data: 'scoutcountry:in' }],
-        [{ text: '🇬🇭 GH', callback_data: 'scoutcountry:gh' }, { text: '🇰🇪 KE', callback_data: 'scoutcountry:ke' }, { text: '🇿🇦 ZA', callback_data: 'scoutcountry:za' }],
-        [{ text: '🇩🇪 DE', callback_data: 'scoutcountry:de' }, { text: '🇫🇷 FR', callback_data: 'scoutcountry:fr' }, { text: '🇧🇷 BR', callback_data: 'scoutcountry:br' }],
-        [{ text: '🇪🇺 Europe (€)', callback_data: 'scoutcountry:eu' }, { text: '🇵🇭 PH', callback_data: 'scoutcountry:ph' }, { text: '✍️ Other (/country XX)', callback_data: 'countryhint' }]
-      ])
+        `\n\n🌍 Last filter — pick the country/countries the stores should sell to.\nTap to toggle (✅ = selected — pick as many as you like, e.g. NG + US + GH), then press Done. ` +
+        `I read the country off each page: prices (£/€/₦…), phone prefixes, language, addresses. Stores I can't place are KEPT, not dropped.`,
+        scoutCountryKeyboard(await getScoutCountries(userId)))
       return res.status(200).send('OK')
     }
 
     // ── Country answer for a store search (typed instead of tapped) ──
     if (userQueue.awaitingScoutCountry) {
-      const code = text.trim().toLowerCase().replace(/[^a-z]/g, '').slice(0, 2)
-      if (code !== 'any' && !STORE_COUNTRY_LABELS[code.toUpperCase()]) {
-        await send(chatId, 'Type a country code like US, UK, NG, GH, KE, ZA, IN, DE — or tap the 🌍 Any country button above.')
+      const low = text.trim().toLowerCase()
+      if (low === 'any' || low === 'all' || low === 'none') {
+        await setScoutCountries(userId, [])
+        return await launchScoutFromPending(chatId, userId)
+      }
+      const codes = [...new Set((text.toUpperCase().match(/\b[A-Z]{2}\b/g) || []))]
+      const valid = codes.filter(c => STORE_COUNTRY_LABELS[c])
+      if (!valid.length) {
+        await send(chatId, 'Type one or more country codes like US, UK, NG, GH — or tap the buttons above and press Done. "any" = every country.')
         return res.status(200).send('OK')
       }
-      return await launchScoutFromPending(chatId, userId, code.toUpperCase())
+      await setScoutCountries(userId, valid)
+      return await launchScoutFromPending(chatId, userId)
     }
 
     // ── Awaiting a URL for the AI Site Hunter deep check ──
@@ -6265,27 +6419,17 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       return res.status(200).send('OK')
     }
 
-    // ── Continue a deep search run the user EXPLICITLY started (button tap).
-    // A fresh offer under a hunt message is started=false and must NEVER
-    // hijack the ping — "send anything to keep hunting" stays true.
-    if (userQueue.deepQ && userQueue.deepQ.started && userQueue.deepIdx < userQueue.deepQ.urls.length) {
-      return await runDeepSearchBatch(chatId, userId, userQueue)
-    }
-
-    // ── Continue an AI Site Hunter run cut short by the time budget ──
-    if (userQueue.aiHunt && !userQueue.aiHunt.done) {
-      return await runAiHuntBatch(chatId, userId, userQueue)
-    }
-
-    // ── Continue hunting: user pinged while a scout is still short of its target ──
-    if (!userQueue.done && (userQueue.pending.length > 0 || (userQueue.searchCtx && !userQueue.searchCtx.exhausted))) {
-      return await runBatch(chatId, userId, userQueue)
-    }
+    // ── Resume whatever is in progress (a deep search the user started, a
+    // live AI hunt, or a scout still short of its target). Same dispatcher
+    // the keep-alive ping uses — any message or callback continues the run.
+    const resumedWork = await resumeQueuedWork(chatId, userId, userQueue)
+    if (resumedWork) return resumedWork
 
     // Re-offer outreach collection only for users who never moved on to AI
     // hunts — once a hunt session exists, an idle ping must land on the menu,
     // never resurrect this collector (it ate hunt pings as outreach drafts).
     if (userQueue.results.length > 0 && !userQueue.awaitingMessages && userQueue.done && !userQueue.aiHunt) {
+      await unwatchUser(userId)
       const withEmail = userQueue.results.filter(r => r.email !== 'no email')
       userQueue.awaitingMessages = true
       await saveUserQueue(userId, userQueue)
