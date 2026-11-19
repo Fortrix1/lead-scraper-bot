@@ -111,6 +111,27 @@ module.exports = async (req, res) => {
     '7': { label: 'Home & decor niche',                 query: 'page.domain:myshopify.com', niche: 'home' },
     '8': { label: 'Electronics/gadgets niche',          query: 'page.domain:myshopify.com', niche: 'electronics' },
   }
+  // Platform-aware menu labels: the saved searches below are written for
+// Shopify, so when the user picked Wix / Etsy / More / ALL under 🏬 Online
+// Stores the labels are rewritten ("All online stores — every platform",
+// "Jewelry — Wix") instead of still saying "Shopify". Function declarations
+// hoist, so this can sit here and be called from the /scout handler.
+function scoutSearchLabel(savedSearch, platform) {
+  const base = savedSearch.label
+  if (!platform || platform === 'shopify') return base
+  if (platform === 'all') {
+    return base.replace(/^All Shopify stores/, 'All online stores (Shopify + Wix + Etsy)')
+               .replace(/ niche$/, ' — ALL platforms')
+  }
+  if (platform === 'more') {
+    return base.replace(/^All Shopify stores/, 'All online stores (any builder)')
+               .replace(/ niche$/, ' — any builder')
+  }
+  const p = PLATFORMS[platform] || PLATFORMS.shopify
+  return base.replace(/^All Shopify stores/, `All ${p.name} stores`)
+             .replace(/ niche$/, ` — ${p.name}`)
+}
+
   // Base niche words per category (matched against catalog titles/tags/types).
   const NICHE_TERMS = {
     jewelry: ['jewelry', 'jewellery', 'jewel'],
@@ -3708,10 +3729,9 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     if (scoutCountryList.length) header += `\n🌍 Country filter: ${scoutCountryList.map(c => STORE_COUNTRY_LABELS[c]).join(' / ')} — a store passes if it provably sells to ANY of them; unprovable ones kept. Change with /country.`
     if (userQueue.searchCtx && userQueue.searchCtx.total != null && !sourceExhausted) header += `\n📊 ${userQueue.searchCtx.total} total matches in this window.`
 
-    let reply = header
-    let leadNum = prevDelivered
-    for (const r of fresh) {
-      leadNum++
+    // One shared formatter so the batch AND the final consolidated list
+    // print identical cards.
+    const leadCard = (r, leadNum) => {
       const nameLine = r.store_name ? `${r.store_name}\n    🔗 ${r.url}` : `🔗 ${r.url}`
       // Strict social search: when the user demanded ONE platform, the lead
       // line shows that platform's link first and only it.
@@ -3734,7 +3754,13 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         : ''
       const hook = auditHookLine(r)
       const hookNote = hook ? `\n    💡 ${hook}` : ''
-      reply += `\n\n${leadNum}. ${nameLine}${scoreNote}${ageNote}${countryNote}${nicheNote}${hookNote}${socialsNote}${contactNote}${emailNote}`
+      return `\n\n${leadNum}. ${nameLine}${scoreNote}${ageNote}${countryNote}${nicheNote}${hookNote}${socialsNote}${contactNote}${emailNote}`
+    }
+    let reply = header
+    let leadNum = prevDelivered
+    for (const r of fresh) {
+      leadNum++
+      reply += leadCard(r, leadNum)
     }
     if (!fresh.length && !userQueue.done) reply += `\n\n(The last batch didn't add any leads that pass your filters — still hunting.)`
     if (userQueue.done) reply += `\n\n────────\nSend anything to move to the message-writing step.`
@@ -3775,6 +3801,25 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       reply += `\n\n👇 Or rerun the SAME search with one filter loosened:`
     }
     await saveUserQueue(userId, userQueue)
+
+    // ── CONSOLIDATED FULL LIST ── when the run is finished, re-print EVERY
+    // store that passed the filters as one numbered list (1..N), chunked to
+    // stay under Telegram's message cap. This is the "everything it found,
+    // all in one place" recap — the same card format as the batches above.
+    if (userQueue.done && usableAll.length) {
+      let fullList = `📋 COMPLETE LIST — every store that passed your filters (${usableAll.length} total):`
+      let listN = 0
+      for (const r of usableAll) {
+        listN++
+        const block = leadCard(r, listN)
+        if ((fullList + block).length > 3800) {
+          await send(chatId, fullList)
+          fullList = ''
+        }
+        fullList += block
+      }
+      if (fullList.trim()) await send(chatId, fullList)
+    }
 
     const relaxKb = []
     if (gaveUpShort) {
@@ -4897,12 +4942,13 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         if (!search) return res.status(200).send('OK')
         const platform = await getScoutPlatform(cbUserId)
         const query = buildPlatformQuery(search.query, platform)
-        const platPrefix = (platform && platform !== 'shopify' && PLATFORMS[platform]) ? `${PLATFORMS[platform].emoji} ${PLATFORMS[platform].name} · ` : ''
+        const platPrefix = (platform && platform !== 'shopify' && platform !== 'all' && PLATFORMS[platform]) ? `${PLATFORMS[platform].emoji} ${PLATFORMS[platform].name} · ` : ''
         const q = await getUserQueue(cbUserId)
-        q.pendingSearch = { query, label: platPrefix + search.label, platform, nicheTerms: search.niche ? [NICHE_TERMS[search.niche]] : null }
+        const dispLabel = scoutSearchLabel(search, platform)
+        q.pendingSearch = { query, label: platPrefix + dispLabel, platform, nicheTerms: search.niche ? [NICHE_TERMS[search.niche]] : null }
         q.awaitingScoutMonth = true
         await saveUserQueue(cbUserId, q)
-        await sendKeyboard(cbChatId, `${platPrefix}${search.label}" — which month and year should I pull from?\n\nPick a window — the search index only reaches back 30 days, so older months aren't searchable.`, monthPickerKeyboard())
+        await sendKeyboard(cbChatId, `${platPrefix}${dispLabel}" — which month and year should I pull from?\n\nPick a window — the search index only reaches back 30 days, so older months aren't searchable.`, monthPickerKeyboard())
         return res.status(200).send('OK')
       }
 
@@ -5950,11 +5996,16 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
 
   // ── /scout ──
   if (text === '/scout') {
+    const platform = await getScoutPlatform(userId)
+    const p = PLATFORMS[platform] || PLATFORMS.shopify
     const keyboard = Object.entries(SAVED_SEARCHES).map(([key, s]) =>
-      [{ text: s.label, callback_data: `scout_${key}` }]
+      [{ text: scoutSearchLabel(s, platform), callback_data: `scout_${key}` }]
     )
     keyboard.push([{ text: '✏️ Custom search term', callback_data: 'scout_custom' }])
-    await sendKeyboard(chatId, 'Which search do you want to run?', keyboard)
+    const platNote = platform && platform !== 'shopify'
+      ? `\n\n🏬 Platform: ${p.emoji} <b>${p.name}</b> — every option below searches ${platform === 'all' ? '<b>all online stores across every platform</b>' : 'stores built with ' + p.name} (switch under 🏬 Online Stores in the menu).`
+      : ''
+    await sendKeyboard(chatId, `Which search do you want to run?${platNote}`, keyboard)
     return res.status(200).send('OK')
   }
 
@@ -6146,7 +6197,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     // ── Awaiting custom search query ──
     if (userQueue.awaitingCustomQuery) {
       const platform = await getScoutPlatform(userId)
-      const platPrefix = (platform && platform !== 'shopify' && PLATFORMS[platform]) ? `${PLATFORMS[platform].emoji} ${PLATFORMS[platform].name} · ` : ''
+      const platPrefix = (platform && platform !== 'shopify' && platform !== 'all' && PLATFORMS[platform]) ? `${PLATFORMS[platform].emoji} ${PLATFORMS[platform].name} · ` : ''
       userQueue.awaitingCustomQuery = false
       // v9: custom niche = broad platform pool + your word matched against the
       // live product catalog (title filtering missed most real stores).
