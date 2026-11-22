@@ -120,11 +120,16 @@ function scoutSearchLabel(savedSearch, platform) {
   const base = savedSearch.label
   if (!platform || platform === 'shopify') return base
   if (platform === 'all') {
-    return base.replace(/^All Shopify stores/, 'All online stores (Shopify + Wix + Etsy)')
-               .replace(/ niche$/, ' — ALL platforms')
+    // v12 FIX: EVERY button must read as a cross-platform search when
+    // "All online stores" is picked — never "Shopify" — and the niches
+    // must say "all platforms", not "Shopify".
+    return base.replace(/^All Shopify stores \(newest first\)/, 'All online stores — every platform (newest first)')
+               .replace(/^All Shopify stores/, 'All online stores — every platform')
+               .replace(/ niche$/, ' — all platforms')
   }
   if (platform === 'more') {
-    return base.replace(/^All Shopify stores/, 'All online stores (any builder)')
+    return base.replace(/^All Shopify stores \(newest first\)/, 'All online stores — any builder (newest first)')
+               .replace(/^All Shopify stores/, 'All online stores — any builder')
                .replace(/ niche$/, ' — any builder')
   }
   const p = PLATFORMS[platform] || PLATFORMS.shopify
@@ -283,7 +288,19 @@ function scoutSearchLabel(savedSearch, platform) {
     } catch { return 'shopify' }
   }
   async function setScoutPlatform(userId, key) {
-    try { await redis('SET', `scout:platform:${userId}`, PLATFORMS[key] ? key : 'shopify', 'EX', 2592000) } catch {}
+    // v12 FIX: a silent catch here used to leave the OLD platform in Redis,
+    // so the next /scout still read 'shopify' no matter what the user picked.
+    // Now a failed save is retried once, and a total failure is reported
+    // instead of silently keeping Shopify.
+    const val = PLATFORMS[key] ? key : 'shopify'
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await redis('SET', `scout:platform:${userId}`, val, 'EX', 2592000)
+        if (r && r.ok) return true
+      } catch {}
+    }
+    console.error('setScoutPlatform failed for', userId, '->', val)
+    return false
   }
   // Swap the platform domain clause into a saved-search query. Shopify is the
   // native shape (queries are written for myshopify.com); everything else
@@ -418,15 +435,21 @@ function scoutSearchLabel(savedSearch, platform) {
     } catch { return [] }
   }
   async function setScoutCountries(userId, codes) {
+    // v12 FIX: same silent-catch bug as setScoutPlatform — a failed save
+    // used to leave the old (or no) country list in place without any sign.
     const clean = [...new Set((codes || []).map(c => String(c).toUpperCase()).filter(c => STORE_COUNTRY_LABELS[c]))]
-    try {
-      if (!clean.length) {
-        await redis('DEL', `scout:countries:${userId}`)
-        await redis('DEL', `scout:country:${userId}`)
-      } else {
-        await redis('SET', `scout:countries:${userId}`, JSON.stringify(clean), 'EX', 2592000)
-      }
-    } catch {}
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (!clean.length) {
+          await redis('DEL', `scout:countries:${userId}`)
+          await redis('DEL', `scout:country:${userId}`)
+        } else {
+          await redis('SET', `scout:countries:${userId}`, JSON.stringify(clean), 'EX', 2592000)
+        }
+        return
+      } catch {}
+    }
+    console.error('setScoutCountries failed for', userId)
   }
   async function toggleScoutCountry(userId, code) {
     const cur = await getScoutCountries(userId)
@@ -3878,7 +3901,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     // store that passed the filters as one numbered list (1..N), chunked to
     // stay under Telegram's message cap. This is the "everything it found,
     // all in one place" recap — the same card format as the batches above.
-    if (userQueue.done && usableAll.length) {
+    if (userQueue.done && (usableAll.length || topUp.length)) {
       // ── COMPACT LINK INDEX: every URL + email in ONE place first, so you
       // never scroll back through batches. Near-misses included, tagged.
       let indexMsg = `🔗 ALL FOUND LINKS — ${usableAll.length} lead${usableAll.length === 1 ? '' : 's'}${topUp.length ? ` + ${topUp.length} near-miss${topUp.length === 1 ? '' : 'es'}` : ''} (one place, no scrolling):`
