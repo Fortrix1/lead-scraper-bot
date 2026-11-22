@@ -273,7 +273,7 @@ function scoutSearchLabel(savedSearch, platform) {
       desc: 'Shop pages are fetched live and listing titles matched against your niche — 3+ real listings required.' },
     more:    { key: 'more', name: 'More platforms', emoji: '➕', domain: null,
       desc: 'Any builder — WooCommerce (live store API), Squarespace, BigCommerce, custom shops. The search widens beyond one platform\'s domain and the product-level check auto-detects each store\'s catalog.' },
-    all:     { key: 'all', name: 'All platforms', emoji: '🌐', domain: '(page.domain:myshopify.com OR page.domain:wixsite.com OR page.domain:etsy.com)',
+    all:     { key: 'all', name: 'All online stores', emoji: '🌐', domain: 'page.domain:(myshopify.com OR wixsite.com OR etsy.com)',
       desc: 'A mix of Shopify, Wix and Etsy candidates — each one verified with its own platform check.' },
   }
   async function getScoutPlatform(userId) {
@@ -1972,6 +1972,62 @@ function scoutSearchLabel(savedSearch, platform) {
     }
   }
 
+  // ── EMAIL VERIFICATION (real, not guessed) ──
+  // What we CAN prove from a serverless function without sending mail:
+  // does the domain actually run mail servers (MX / A record via free
+  // DNS-over-HTTPS), and is it a disposable provider. If the domain has
+  // mail servers, the address is deliverable; if not, it's dead. What no
+  // one can prove without mailing the person is whether the exact mailbox
+  // exists on catch-all domains — so 'verified' here means "mail server
+  // confirmed", never a guess. Results cached per domain in Redis (24h).
+  const DISPOSABLE_EMAIL_DOMAINS = new Set([
+    'mailinator.com','tempmail.com','temp-mail.org','temp-mail.io','10minutemail.com',
+    'guerrillamail.com','guerrillamail.net','yopmail.com','trashmail.com','getnada.com',
+    'dispostable.com','maildrop.cc','sharklasers.com','yomail.info','tempinbox.com',
+    'fakeinbox.com','emailondeck.com','mohmal.com','mailnesia.com','mintemail.com',
+    'throwawaymail.com','tempail.com','mailsac.com','receiveee.com','tempmailo.com',
+  ])
+  async function verifyEmail(email) {
+    const m = String(email || '').toLowerCase().match(/^([a-z0-9._%+-]+)@([a-z0-9.-]+\.[a-z]{2,})$/)
+    if (!m) return { status: 'invalid', why: 'bad format' }
+    const domain = m[2]
+    if (DISPOSABLE_EMAIL_DOMAINS.has(domain)) return { status: 'invalid', why: 'disposable provider' }
+    const cached = await redis('GET', `emailver:${domain}`)
+    if (cached === 'mx')    return { status: 'verified', why: 'mail server (MX) found' }
+    if (cached === 'nomx')  return { status: 'invalid',  why: 'domain has no mail server' }
+    if (cached === 'unk')   return { status: 'unknown',  why: 'lookup unavailable' }
+    // DNS-over-HTTPS MX lookup — dns.google first, Cloudflare fallback.
+    for (const base of ['https://dns.google/resolve', 'https://cloudflare-dns.com/dns-query']) {
+      try {
+        const hdrs = base.includes('cloudflare') ? { accept: 'application/dns-json' } : {}
+        const r  = await fetch(`${base}?name=${domain}&type=MX`, { signal: AbortSignal.timeout(4000), headers: hdrs })
+        const d  = await r.json()
+        const mx = (d.Answer || []).filter(a => a.type === 15)
+        if (mx.length || d.Status === 0) {
+          if (mx.length) {
+            await redis('SET', `emailver:${domain}`, 'mx', 'EX', 86400)
+            return { status: 'verified', why: 'mail server (MX) found' }
+          }
+          // No MX record — some domains accept mail via their A record (implicit MX)
+          const r2 = await fetch(`${base}?name=${domain}&type=A`, { signal: AbortSignal.timeout(4000), headers: hdrs })
+          const d2 = await r2.json()
+          if ((d2.Answer || []).some(a => a.type === 1)) {
+            await redis('SET', `emailver:${domain}`, 'mx', 'EX', 86400)
+            return { status: 'verified', why: 'domain accepts mail (A record)' }
+          }
+          await redis('SET', `emailver:${domain}`, 'nomx', 'EX', 86400)
+          return { status: 'invalid', why: 'domain has no mail server' }
+        }
+        if (d.Status === 3) {  // NXDOMAIN — the domain itself doesn't exist
+          await redis('SET', `emailver:${domain}`, 'nomx', 'EX', 86400)
+          return { status: 'invalid', why: 'domain does not exist' }
+        }
+      } catch { /* try next resolver */ }
+    }
+    await redis('SET', `emailver:${domain}`, 'unk', 'EX', 3600)
+    return { status: 'unknown', why: 'email check unavailable' }
+  }
+
   async function checkOneStore(url, checkCtx = {}) {
     const result = {
       url, store_name: '', email: 'no email', email_is_generic: false,
@@ -2063,6 +2119,11 @@ function scoutSearchLabel(savedSearch, platform) {
         result.niche = await deepNicheCheck(url, html, checkCtx.nicheTerms, checkCtx.platform || 'shopify')
       }
     } catch (e) {}
+
+    // Real email verification: MX lookup, cached per domain. Never a guess.
+    if (result.email && result.email !== 'no email') {
+      try { result.email_status = (await verifyEmail(result.email)).status } catch { result.email_status = 'unknown' }
+    }
 
     const { score, reasons } = scoreLead(result)
     result.score = score
@@ -2687,6 +2748,10 @@ function scoutSearchLabel(savedSearch, platform) {
       }
     }
     if (!out.formUrl && !out.emails.length && /<form[\s>]/i.test(html)) out.formUrl = url
+    out.email_status = {}
+    for (const em of out.emails.slice(0, 3)) {
+      try { out.email_status[em] = (await verifyEmail(em)).status } catch { out.email_status[em] = 'unknown' }
+    }
     out.socials = await validateSocials(out.socials)
     return out
   }
@@ -2695,7 +2760,10 @@ function scoutSearchLabel(savedSearch, platform) {
 
   function aiLeadCard(lead, idx, showWhy = false) {
     const contactBits = []
-    if (lead.emails.length) contactBits.push(`📧 ${lead.emails.join(', ')}`)
+    if (lead.emails.length) {
+      const marked = lead.emails.map(em => em + (lead.email_status?.[em] === 'verified' ? ' ✅' : lead.email_status?.[em] === 'invalid' ? ' ❌' : ' ⚠️'))
+      contactBits.push(`📧 ${marked.join(', ')}`)
+    }
     const socialBits = Object.entries(lead.socials || {}).map(([k, v]) => `${k}: ${v}`)
     if (socialBits.length) contactBits.push(`💬 ${socialBits.join(' · ')}`)
     if (lead.formUrl) contactBits.push(`📝 form: ${lead.formUrl}`)
@@ -3742,7 +3810,10 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       const socialsNote = socialsList ? `\n    💬 social: ${socialsList}` : ''
       const contactNote = r.contact_page ? `\n    🌐 contact page: ${r.contact_page}` : ''
       const genericNote = r.email_is_generic ? ' (generic)' : ''
-      const emailNote = r.email !== 'no email' ? `\n    📧 ${r.email}${genericNote}` : ''
+      const verMark = r.email_status === 'verified' ? ' ✅ verified'
+        : r.email_status === 'invalid' ? ' ❌ no mail server'
+        : r.email_status === 'unknown' ? ' ⚠️ unverified' : ''
+      const emailNote = r.email !== 'no email' ? `\n    📧 ${r.email}${genericNote}${verMark}` : ''
       const hotTag = r.score >= 70 ? ' 🔥' : ''
       const scoreNote = `\n    📊 score: ${r.score}${hotTag}` + (r.scoreReasons?.length ? ` (${r.scoreReasons.join(', ')})` : '')
       const ageNote = (typeof r.ageDays === 'number') ? `\n    🎂 age: ${r.ageDays}d${r.ageDays <= 30 ? ' 🔥' : ''}` : (userQueue.ageGate ? '\n    🎂 age unknown — no source could prove it' : '')
@@ -3791,7 +3862,8 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       for (const r of topUp) {
         leadNum++
         const nmLine = r.store_name ? `${r.store_name}\n    🔗 ${r.url}` : `🔗 ${r.url}`
-        const nmEmail = r.email !== 'no email' ? `\n    📧 ${r.email}${r.email_is_generic ? ' (generic)' : ''}` : ''
+        const nmVer = r.email_status === 'verified' ? ' ✅' : r.email_status === 'invalid' ? ' ❌' : r.email_status === 'unknown' ? ' ⚠️' : ''
+        const nmEmail = r.email !== 'no email' ? `\n    📧 ${r.email}${r.email_is_generic ? ' (generic)' : ''}${nmVer}` : ''
         const nmSocials = Object.keys(r.socials || {})
         const nmSocial = nmSocials.length ? `\n    💬 has ${nmSocials.join(', ')} — but no ${requiredSocial}` : `\n    💬 no social links found at all`
         const nmAge = (typeof r.ageDays === 'number') ? `\n    🎂 age: ${r.ageDays}d` : ''
@@ -3807,6 +3879,23 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     // stay under Telegram's message cap. This is the "everything it found,
     // all in one place" recap — the same card format as the batches above.
     if (userQueue.done && usableAll.length) {
+      // ── COMPACT LINK INDEX: every URL + email in ONE place first, so you
+      // never scroll back through batches. Near-misses included, tagged.
+      let indexMsg = `🔗 ALL FOUND LINKS — ${usableAll.length} lead${usableAll.length === 1 ? '' : 's'}${topUp.length ? ` + ${topUp.length} near-miss${topUp.length === 1 ? '' : 'es'}` : ''} (one place, no scrolling):`
+      let idxN = 0
+      const indexLine = (r, tag) => `${++idxN}. ${r.store_name ? r.store_name + ' — ' : ''}${r.url}` +
+        (r.email && r.email !== 'no email' ? ` — 📧 ${r.email}${r.email_status === 'verified' ? ' ✅' : r.email_status === 'invalid' ? ' ❌' : r.email_status === 'unknown' ? ' ⚠️' : ''}` : '') + (tag || '')
+      for (const r of usableAll) {
+        const line = '\n' + indexLine(r)
+        if ((indexMsg + line).length > 3800) { await send(chatId, indexMsg); indexMsg = '' }
+        indexMsg += line
+      }
+      for (const r of topUp) {
+        const line = '\n' + indexLine(r, '   ⚠️ near-miss')
+        if ((indexMsg + line).length > 3800) { await send(chatId, indexMsg); indexMsg = '' }
+        indexMsg += line
+      }
+      if (indexMsg.trim()) await send(chatId, indexMsg)
       let fullList = `📋 COMPLETE LIST — every store that passed your filters (${usableAll.length} total):`
       let listN = 0
       for (const r of usableAll) {
@@ -6003,9 +6092,9 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     )
     keyboard.push([{ text: '✏️ Custom search term', callback_data: 'scout_custom' }])
     const platNote = platform && platform !== 'shopify'
-      ? `\n\n🏬 Platform: ${p.emoji} <b>${p.name}</b> — every option below searches ${platform === 'all' ? '<b>all online stores across every platform</b>' : 'stores built with ' + p.name} (switch under 🏬 Online Stores in the menu).`
+      ? `\n\n🏬 Platform: ${p.emoji} ${p.name} — every option below searches ${platform === 'all' ? 'ALL online stores across every platform (Shopify + Wix + Etsy)' : 'stores built with ' + p.name}. Switch under 🏬 Online Stores in the menu.`
       : ''
-    await sendKeyboard(chatId, `Which search do you want to run?${platNote}`, keyboard)
+    await sendKeyboard(chatId, `Which search do you want to run?${platNote}\n\n(build v12 — platform fix · email verification · all-links summary)`, keyboard)
     return res.status(200).send('OK')
   }
 
