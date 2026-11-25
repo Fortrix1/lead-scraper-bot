@@ -537,3 +537,30 @@ Each ping resumes **one** armed, unfinished run (scout / AI hunt / deep
 search) and replies `OK` when there's nothing to do — it never touches
 anything else and costs nothing. `/cancel` removes you from the watch list
 immediately.
+
+---
+
+## 📘 Facebook Search (people & pages)
+
+New module: `fb_scraper.py` (the browser scraper) + `fb_scraper_job.py` (the daemon
+runner). The bot side is a 📘 button on the main menu with a guided flow:
+search phrase → country → minimum account age → recent-activity filter
+(last 7 / 30 / 90 days, **a custom date range you type**, or any activity) →
+how many profiles. Profiles whose posts can't be dated are kept, tagged
+"activity unknown".
+
+**The Facebook login lives only on your PC.** In the folder that runs
+`maps_daemon.py`:
+
+```bash
+pip install -r requirements.txt    # adds playwright + rich
+python fb_scraper.py login         # one time — log in fully, press ENTER
+```
+
+That saves `fb_state.json` next to the daemon. **It is gitignored — never push
+it** (it's a live login session). Results land in `fb_results/` (also gitignored).
+
+**GitHub Actions:** the Actions runner has no FB session, so it will NOT eat an
+FB job — it puts it back on the queue and tells the user to wait for the local
+daemon. Optional: paste the whole contents of `fb_state.json` into an
+`FB_STATE_JSON` repo secret to let Actions run FB jobs too.

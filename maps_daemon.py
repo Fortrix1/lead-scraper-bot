@@ -1779,7 +1779,37 @@ def handle_job(job_raw):
             print(f"  couldn't send 'starting now' ping: {e}")
 
     try:
-        if data.get("type") == "discovery":
+        if data.get("type") == "fbscrape":
+            # Facebook people/pages search — runs the local fb_scraper.py via
+            # fb_scraper_job.py (needs fb_state.json saved by
+            # `python fb_scraper.py login` on THIS machine).
+            import os as _os
+            state_file = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "fb_state.json")
+            if not _os.path.exists(state_file) and _os.environ.get("RUN_MODE", "loop") == "once":
+                # GitHub Actions runner: no FB login session lives here, so it
+                # must NOT consume the job — put it back on the queue so the
+                # local PC daemon (which holds the session) picks it up, and
+                # tell the user once per job instead of failing silently.
+                redis("RPUSH", "jobs:find", job_raw)
+                jid = str(data.get("job_id", ""))
+                if jid and not redis_sismember("fb:requeued:notified", jid):
+                    redis_sadd("fb:requeued:notified", jid)
+                    send_telegram(chat_id,
+                        "⏳ Facebook searches run on the PC that has the logged-in "
+                        "Facebook session. Your job stays queued until that machine's "
+                        "daemon picks it up — make sure it's running, and that you "
+                        "did the one-time `python fb_scraper.py login` there.")
+                return
+            try:
+                import fb_scraper_job
+                fb_scraper_job.process_job(data)
+            except Exception as e:
+                print(f"  FB job failed: {e}")
+                try:
+                    send_telegram(chat_id, f"⚠️ Facebook job failed: {str(e)[:150]}")
+                except Exception:
+                    pass
+        elif data.get("type") == "discovery":
             # Company web-presence discovery via authenticated Google searches
             # (web_discovery.py). Runs on the same daemon schedule as /find.
             try:

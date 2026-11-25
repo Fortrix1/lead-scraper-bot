@@ -64,6 +64,20 @@ jobs:
           printf '%s' "$GOOGLE_COOKIES_JSON" > cookies/google_cookies.json
           python3 -c "import json,os;d=json.load(open('cookies/google_cookies.json'));print('google cookies in secret:',len(d))" || echo "!! GOOGLE_COOKIES_JSON secret is missing, empty, or not valid JSON"
 
+      - name: Restore Facebook session (optional)
+        # Only used if you created an FB_STATE_JSON secret (contents of
+        # fb_state.json). Without it, FB jobs are re-queued for the local PC
+        # daemon, which holds the real login session.
+        env:
+          FB_STATE_JSON: ${{ secrets.FB_STATE_JSON }}
+        run: |
+          if [ -n "$FB_STATE_JSON" ]; then
+            printf '%s' "$FB_STATE_JSON" > fb_state.json
+            echo "fb_state.json restored from FB_STATE_JSON secret"
+          else
+            echo "no FB_STATE_JSON secret — FB jobs stay queued for the local daemon"
+          fi
+
       - name: Run the daemon (single pass)
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}

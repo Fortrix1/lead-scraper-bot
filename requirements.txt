@@ -2,3 +2,4 @@ playwright
 requests
 python-dotenv
 certstream
+rich

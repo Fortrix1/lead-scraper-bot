@@ -24,3 +24,7 @@ node_modules/
 cookies/
 *.cookies.json
 discovery_cache.db
+
+# Facebook scraper — session + lead output (login session data!)
+fb_state.json
+fb_results/

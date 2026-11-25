@@ -793,7 +793,7 @@ function scoutSearchLabel(savedSearch, platform) {
   let ACCESS_PRICE = process.env.ACCESS_PRICE_TEXT || '$1'
   let PAY_CONTACT = process.env.PAY_CONTACT || ''     // e.g. "@zammynn" or a full payment link
   let PAYMENT_LINK = process.env.PAYMENT_LINK || ''   // legacy raw-URL env var, still honoured
-  const OWNER_SESSION_CMDS = ['/find', '/findco', '/scout', '/fresh', '/freshoff', '/scoutlist', '/autopitch']
+  const OWNER_SESSION_CMDS = ['/find', '/findco', '/scout', '/fresh', '/freshoff', '/scoutlist', '/autopitch', '/fb']
   // Of those, only these three are bounded, one-shot searches a free credit can safely
   // cover — /fresh turns on INDEFINITE background monitoring (not a search that finishes),
   // /freshoff/scoutlist/autopitch stay paid/owner-only too.
@@ -4139,6 +4139,17 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
             nav()
           ]
         }
+      case 'fb':
+        return {
+          text:
+            `<b>📘 Facebook Search</b>\n\n` +
+            `Find people or pages on Facebook, filtered by country, account age and <b>recent activity</b>: only profiles that posted within the last N days — or between two dates you pick — so you know they're alive. Profiles whose posts can't be dated are kept, tagged "activity unknown".\n\n` +
+            `Runs on the PC running the daemon — it drives a real browser with your logged-in Facebook session (one-time <code>python fb_scraper.py login</code> there).`,
+          kb: [
+            [go('👤 Find people', 'fb:start:people'), go('📄 Find pages', 'fb:start:pages')],
+            nav()
+          ]
+        }
       case 'help':
         return {
           text:
@@ -4202,6 +4213,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
             [go('🗺️ Local Businesses', 'menu:local'), go('🕵️ Find Contacts', 'menu:findco')],
             [B('🇬🇧 New UK Companies', 'menu:uk'), B('🏬 Online Stores', 'menu:onlinestores')],
             [go('🤖 AI-Built Sites', 'menu:aihunter'), go('📂 My Leads', 'menu:leads')],
+            [go('📘 Facebook', 'menu:fb')],
             [B('🎁 Gifts', 'menu:gifts'), B('🧰 Tools', 'menu:tools')],
             [B('❓ How it works', 'menu:help')],
             owner ? [B('🛠 Admin', 'menu:admin')] : [B('💳 Get Access', 'run:/access')],
@@ -4474,6 +4486,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
       ['start', '🏠 Open the main menu'], ['menu', '🏠 Main menu'], ['help', '❓ How this bot works'],
       ['newuk', '🇬🇧 New UK companies'], ['findco', '🕵️ Find contacts for companies'],
       ['find', '🗺️ Local businesses'], ['scout', '🛍️ Search Shopify stores'],
+      ['fb', '📘 Facebook people/pages search'],
       ['hunt', '🤖 Hunt AI-built sites'], ['check', '🔬 Deep-check one site'],
       ['fresh', '🌱 Watch for brand-new stores'], ['freshoff', '🛑 Stop watching new stores'],
       ['campaigns', '📋 Your campaigns'], ['leads', '📂 Leads by status'], ['mark', '✅ Update a lead\'s status'],
@@ -4992,6 +5005,60 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
         return res.status(200).send('OK')
       }
 
+      if (data.startsWith('fb:start:')) {
+        if (!(await gateOwnerSession(cbChatId, cbUserId, '/fb', ''))) return res.status(200).send('OK')
+        const wq = await getUserQueue(cbUserId)
+        wq.wizard = { cmd: 'fb', ftype: data.endsWith(':people') ? 'people' : 'pages', step: 'query' }
+        await saveUserQueue(cbUserId, wq)
+        await send(cbChatId, `📘 What should I search for on Facebook? Type a phrase, e.g. "coffee shop owners".`)
+        return res.status(200).send('OK')
+      }
+      if (data.startsWith('fbact:') || data.startsWith('fbcount:')) {
+        const wq = await getUserQueue(cbUserId)
+        if (!wq.wizard || wq.wizard.cmd !== 'fb') {
+          await send(cbChatId, 'That search expired — open 📘 Facebook to start again.')
+          return res.status(200).send('OK')
+        }
+        if (data.startsWith('fbact:')) {
+          const choice = data.split(':')[1]
+          if (choice === 'custom') {
+            // Date-range activity filter: wizard asks for start, then end date.
+            wq.wizard.active_within = 0
+            wq.wizard.active_from = ''
+            wq.wizard.active_until = ''
+            wq.wizard.step = 'fbfrom'
+            await saveUserQueue(cbUserId, wq)
+            await send(cbChatId, `📅 Custom activity range — I'll only keep profiles whose most recent post falls between two dates.\n\nSend the START date as YYYY-MM-DD (e.g. 2026-10-01) — or "skip" for no start limit.`)
+            return res.status(200).send('OK')
+          }
+          wq.wizard.active_within = parseInt(choice) || 0
+          wq.wizard.active_from = ''
+          wq.wizard.active_until = ''
+          wq.wizard.step = 'count'
+          await saveUserQueue(cbUserId, wq)
+          await sendKeyboard(cbChatId, `✅ Activity filter set. How many profiles should I visit (max 40)?`, [
+            [{ text: '10', callback_data: 'fbcount:10' }, { text: '20', callback_data: 'fbcount:20' }, { text: '40', callback_data: 'fbcount:40' }]
+          ])
+          return res.status(200).send('OK')
+        }
+        const max = Math.min(Math.max(parseInt(data.split(':')[1]) || 20, 1), 40)
+        const w = wq.wizard
+        wq.wizard = null
+        await saveUserQueue(cbUserId, wq)
+        const payload = { type: 'fbscrape', chat_id: cbChatId, query: w.query, ftype: w.ftype,
+                          country: w.country || '', min_age_years: w.min_age_years || 0,
+                          active_within: w.active_within || 0,
+                          active_from: w.active_from || '', active_until: w.active_until || '',
+                          max, job_id: `fb-${Date.now()}` }
+        const label = `${w.ftype} "${w.query}"`
+        const queued = await queueJob(cbChatId, cbUserId, payload, label)
+        if (!queued) return res.status(200).send('OK')
+        const dispatched = await triggerGithubWorkflow()
+        await send(cbChatId, `✅ Facebook job posted: ${label} (max ${max}). ` +
+          (dispatched ? '⚡ Starting now.' : '⏳ Queued — starts on the next daemon pass.') + ' Results land here.')
+        return res.status(200).send('OK')
+      }
+
       if (data === 'scoutdone') {
         const q0 = await getUserQueue(cbUserId)
         if (!q0.pendingSearch || !q0.awaitingScoutCountry) {
@@ -5483,6 +5550,71 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
   if (text) {
     const wq = await getUserQueue(userId)
     if (wq.wizard) {
+      if (wq.wizard.cmd === 'fb') {
+        if (text.startsWith('/')) {
+          // a real command cancels the wizard and falls through to normal handling
+          wq.wizard = null
+          await saveUserQueue(userId, wq)
+        } else
+        if (wq.wizard.step === 'query') {
+          wq.wizard.query = text.slice(0, 80)
+          wq.wizard.step = 'country'
+          await saveUserQueue(userId, wq)
+          await send(chatId, `🌍 Country filter? Reply with a code like GB, US, NG — or "skip" for any country.`)
+          return res.status(200).send('OK')
+        } else if (wq.wizard.step === 'country') {
+          const c = text.trim().toLowerCase()
+          wq.wizard.country = (c && c !== 'skip' && /^[a-z]{2}$/.test(c)) ? c.toUpperCase() : ''
+          wq.wizard.step = 'minage'
+          await saveUserQueue(userId, wq)
+          await send(chatId, `🎂 Minimum account age in years? Reply with a number (e.g. 3) — or "skip".`)
+          return res.status(200).send('OK')
+        } else if (wq.wizard.step === 'minage') {
+          const n = parseInt(text)
+          wq.wizard.min_age_years = (!isNaN(n) && n > 0) ? n : 0
+          await saveUserQueue(userId, wq)
+          await sendKeyboard(chatId, `🕒 Recent-activity filter — only keep profiles that posted within:`, [
+            [{ text: '🟢 Last 7 days', callback_data: 'fbact:7' }],
+            [{ text: '🟡 Last 30 days', callback_data: 'fbact:30' }],
+            [{ text: '🟠 Last 90 days', callback_data: 'fbact:90' }],
+            [{ text: '📅 Custom date range', callback_data: 'fbact:custom' }],
+            [{ text: '♾ Any activity', callback_data: 'fbact:0' }]
+          ])
+          return res.status(200).send('OK')
+        } else if (wq.wizard.step === 'fbfrom') {
+          const t = text.trim()
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(t) && !/^skip$/i.test(t)) {
+            await send(chatId, `Send the start date as YYYY-MM-DD (e.g. 2026-10-01) — or "skip" for no start limit.`)
+            return res.status(200).send('OK')
+          }
+          wq.wizard.active_from = /^skip$/i.test(t) ? '' : t
+          wq.wizard.step = 'fbuntil'
+          await saveUserQueue(userId, wq)
+          await send(chatId, `📅 Start date saved${wq.wizard.active_from ? ': ' + wq.wizard.active_from : ' — no start limit'}.\n\nNow the END date — the profile's most recent post must be on or before it. Send YYYY-MM-DD (e.g. 2026-11-25) — or "skip" for no end limit.`)
+          return res.status(200).send('OK')
+        } else if (wq.wizard.step === 'fbuntil') {
+          const t = text.trim()
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(t) && !/^skip$/i.test(t)) {
+            await send(chatId, `Send the end date as YYYY-MM-DD — or "skip" for no end limit.`)
+            return res.status(200).send('OK')
+          }
+          const endDate = /^skip$/i.test(t) ? '' : t
+          if (endDate && wq.wizard.active_from && endDate < wq.wizard.active_from) {
+            await send(chatId, `⚠️ The end date can't be before the start date (${wq.wizard.active_from}). Send the end date again — YYYY-MM-DD — or "skip".`)
+            return res.status(200).send('OK')
+          }
+          wq.wizard.active_until = endDate
+          wq.wizard.step = 'count'
+          await saveUserQueue(userId, wq)
+          const rangeTxt = (wq.wizard.active_from || wq.wizard.active_until)
+            ? `📅 Activity range: ${wq.wizard.active_from || '…any time'} → ${wq.wizard.active_until || '…today'}. `
+            : ''
+          await sendKeyboard(chatId, `${rangeTxt}How many profiles should I visit (max 40)?`, [
+            [{ text: '10', callback_data: 'fbcount:10' }, { text: '20', callback_data: 'fbcount:20' }, { text: '40', callback_data: 'fbcount:40' }]
+          ])
+          return res.status(200).send('OK')
+        }
+      }
       if (text.startsWith('/')) {
         wq.wizard = null
         await saveUserQueue(userId, wq)
@@ -5621,7 +5753,7 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     q.awaitingHuntUrl = false; q.aiHunt = null
     q.awaitingPayContact = false; q.awaitingPayPrice = false; q.awaitingTrialSize = false
     q.answeringGift = null; q.giftDraft = null; q.awaitingStartText = false; q.awaitingBroadcast = false
-    q.pendingFindJob = null; q.pending = []; q.results = []; q.messages = []
+    q.pendingFindJob = null; q.pending = []; q.results = []; q.messages = []; q.wizard = null
     await saveUserQueue(userId, q)
     await redis('DEL', `wake:runs:${userId}`)   // /cancel also stops the auto-continue loop
     await unwatchUser(userId)
@@ -6155,6 +6287,12 @@ quality is an integer 0-100 overall site quality. Be specific and concrete every
     q.awaitingHuntUrl = true
     await saveUserQueue(userId, q)
     await send(chatId, `🔬 Send me the URL of the site you want deep-checked (e.g. https://some-site.com).\n\nI'll crawl every page top-to-bottom and write the full AI dossier: business breakdown, weaknesses, the likely prompt, rebuild plan and a ready-to-send pitch DM.`)
+    return res.status(200).send('OK')
+  }
+
+  // ── /fb — Facebook people/pages search (same screen as the 📘 menu button) ──
+  if (/^\/fb(@\w+)?(\s|$)/.test(text)) {
+    await showScreen(chatId, null, 'fb', isOwner, hasAccess)
     return res.status(200).send('OK')
   }
 
