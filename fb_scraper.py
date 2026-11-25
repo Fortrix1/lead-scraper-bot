@@ -4,7 +4,12 @@ fb_scraper.py - local Facebook people/pages scraper with country, account-age
 and recent-activity (last post) filters.
 
 Usage:
-  python fb_scraper.py login
+  python fb_scraper.py login                     # log in manually (browser window)
+  python fb_scraper.py login --cookies cookies.json
+      # import a Cookie-Editor export from your NORMAL browser instead of
+      # logging in manually. Best fix for the stuck two-step-verification /
+      # CAPTCHA spinner: complete the verification in your real browser, export
+      # the facebook.com cookies, feed them here.
   python fb_scraper.py scrape --query "coffee shops" --type pages --country GB \
       --min-age-years 3 --active-within 30 --max 60 --out ./results
   python fb_scraper.py scrape --query "boutique owners" --type people \
@@ -15,6 +20,20 @@ Activity filters (all keep profiles whose posts can't be dated, tagged):
   --posted-since DATE      most recent post on/after YYYY-MM-DD (with --active-within,
                            the stricter of the two wins)
   --posted-until DATE      most recent post on/before YYYY-MM-DD
+
+FIXES vs the old version (the "stuck on two_step_verification" bug):
+  * login() no longer saves whatever half-loaded page happened to be open.
+    It waits for ENTER, then CHECKS the real login cookies (c_user + xs)
+    and only saves a verified session — with 3 retries if you pressed
+    ENTER too early (e.g. while the challenge spinner was still showing).
+  * New: login --cookies <file> imports a Cookie-Editor export so you can
+    pass a session that was verified in your normal browser (where the
+    CAPTCHA / 2FA challenge actually loads and can be solved).
+  * Browser launched with --disable-blink-features=AutomationControlled —
+    without it Facebook's challenge page often hangs on a blank spinner.
+  * scrape() validates the saved session (c_user/xs) BEFORE driving the
+    search, and detects a live "checkpoint" wall with a clear message
+    instead of silently producing 0 links.
 """
 import argparse, asyncio, csv, json, random, re, sys, time
 from datetime import datetime, timedelta
@@ -25,6 +44,15 @@ from rich.console import Console
 console = Console()
 STATE_FILE = Path("fb_state.json")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+# Chromium's automation flag is the #1 reason Facebook's two-step-
+# verification / CAPTCHA page renders as a blank Meta-logo spinner: the
+# challenge JS detects it and never finishes. Disabling the flag lets the
+# page actually load so you can solve it in the window.
+STEALTH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+]
 
 COUNTRY_NAMES = {
     "GB": ["United Kingdom", "England", "Scotland", "Wales", "Northern Ireland", "London"],
@@ -59,6 +87,96 @@ CONSENT_BUTTONS = [
 MONTHS = ["January", "February", "March", "April", "May", "June", "July",
           "August", "September", "October", "November", "December"]
 MONTH_INDEX = {m.lower(): i + 1 for i, m in enumerate(MONTHS)}
+
+# URL fragments that mean "Facebook wants verification before proceeding".
+CHALLENGE_URL_BITS = ("checkpoint", "two_step_verification", "confirm", "challenge", "devices")
+
+
+# ------------------------------------------------------------------
+# Session helpers — the old code saved whatever page was open, which is
+# exactly how you end up re-opening on a spinning two_step_verification
+# page with no real login. These helpers verify the session by its
+# actual login cookies (c_user + xs), not by what the page looks like.
+# ------------------------------------------------------------------
+def session_cookie_names(state_path=STATE_FILE):
+    """Names of the cookies stored in a saved storage-state file."""
+    try:
+        data = json.loads(Path(state_path).read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    return {c.get("name") for c in data.get("cookies", []) if isinstance(c, dict)}
+
+
+def state_has_login(state_path=STATE_FILE):
+    """A saved state is only a real login if BOTH c_user and xs are present."""
+    return {"c_user", "xs"} <= session_cookie_names(state_path)
+
+
+def cookie_editor_to_playwright(raw):
+    """Convert a Cookie-Editor (or similar) JSON export into Playwright
+    cookie objects. Same SameSite/Secure rules as web_discovery.py."""
+    now = time.time()
+    out = []
+    for c in raw:
+        if not isinstance(c, dict) or "name" not in c:
+            continue
+        domain = (c.get("domain") or "").lower()
+        if "facebook.com" not in domain:
+            continue
+        exp = c.get("expirationDate") or c.get("expires")
+        if exp and float(exp) < now:
+            continue
+        secure = bool(c.get("secure"))
+        same_site = (c.get("sameSite") or "unspecified").lower()
+        same_site = {"no_restriction": "None", "unspecified": "None"}.get(
+            same_site, same_site.capitalize())
+        if same_site == "None" and not secure:
+            same_site = "Lax"
+        entry = {"name": c["name"], "value": c.get("value", ""),
+                 "domain": c["domain"], "path": c.get("path", "/"),
+                 "httpOnly": bool(c.get("httpOnly")),
+                 "secure": secure, "sameSite": same_site}
+        if exp:
+            entry["expires"] = float(exp)
+        out.append(entry)
+    return out
+
+
+async def verify_session_report():
+    """Open facebook.com headlessly with the saved state and report:
+       "ok"            -> logged in, feed loads
+       "checkpoint"    -> Facebook wants verification (2FA/CAPTCHA) on this session
+       "not_logged_in" -> no usable login (missing/expired cookies)
+       "missing"       -> no state file at all
+    """
+    if not STATE_FILE.exists():
+        return "missing"
+    if not state_has_login():
+        # Not even the login cookies are there — don't bother opening a browser.
+        return "not_logged_in"
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=STEALTH_ARGS)
+        ctx = await browser.new_context(user_agent=UA, storage_state=str(STATE_FILE))
+        page = await ctx.new_page()
+        try:
+            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded",
+                            timeout=45000)
+            await page.wait_for_timeout(4000)
+            url = page.url.lower()
+            if any(bit in url for bit in CHALLENGE_URL_BITS):
+                return "checkpoint"
+            cookies = {c["name"] for c in await ctx.cookies()}
+            if {"c_user", "xs"} <= cookies:
+                return "ok"
+            return "not_logged_in"
+        except Exception:
+            return "not_logged_in"
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
 
 def year_from_text(txt):
     if not txt: return None
@@ -124,17 +242,112 @@ async def dismiss_overlays(page):
         except Exception:
             pass
 
-async def login():
+async def login(cookies_file=None):
+    """Two ways to get a session:
+       (a) cookies_file given -> import a Cookie-Editor export (recommended
+           when the manual login keeps hanging on the verification spinner:
+           solve it once in your REAL browser, export, import here).
+       (b) otherwise -> open a headed browser and log in manually. The session
+           is only saved once the REAL login cookies (c_user + xs) exist, and
+           you get 3 attempts if you press ENTER too early."""
+    if cookies_file:
+        return await login_from_cookies(cookies_file)
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        ctx = await browser.new_context(user_agent=UA)
+        browser = await p.chromium.launch(headless=False, args=STEALTH_ARGS)
+        ctx = await browser.new_context(
+            user_agent=UA,
+            viewport={"width": 1366, "height": 900},
+            locale="en-US",
+            timezone_id="Europe/London",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
         page = await ctx.new_page()
-        await page.goto("https://www.facebook.com/login")
-        console.print("[yellow]Log in manually in the window, then press ENTER here.[/yellow]")
-        input()
-        await ctx.storage_state(path=str(STATE_FILE))
-        console.print("[green]Session saved to fb_state.json[/green]")
+        await page.goto("https://www.facebook.com/login",
+                        wait_until="domcontentloaded", timeout=60000)
+        console.print("[yellow]A browser window just opened. Then:[/yellow]")
+        console.print("[yellow]  1. Log in to Facebook IN THAT WINDOW.[/yellow]")
+        console.print("[yellow]  2. If Facebook shows a verification / CAPTCHA /[/yellow]")
+        console.print("[yellow]     2FA challenge, COMPLETE it in the window — wait[/yellow]")
+        console.print("[yellow]     until your News Feed (home page) is fully loaded.[/yellow]")
+        console.print("[yellow]  3. ONLY THEN press ENTER here.[/yellow]")
+        console.print("[dim]   (Pressing ENTER while the spinner is still showing saves[/dim]")
+        console.print("[dim]    a broken session — that was the old bug.)[/dim]")
+
+        saved = False
+        for attempt in range(3):
+            input()
+            cookies = await ctx.cookies()
+            names = {c["name"] for c in cookies}
+            if "c_user" in names and "xs" in names:
+                saved = True
+                break
+            url = page.url
+            if any(bit in url for bit in CHALLENGE_URL_BITS):
+                console.print(f"[red]You're still on the verification page ({url[:70]}...)[/red]")
+                console.print("[red]Finish it in the browser window — full News Feed first —[/red]")
+                console.print("[red]then press ENTER again. ({}/3)[/red]".format(attempt + 1))
+            else:
+                console.print("[red]No login session detected yet (no c_user/xs cookies).[/red]")
+                console.print("[red]Make sure you're fully logged in inside the window, then[/red]")
+                console.print("[red]press ENTER again. ({}/3)[/red]".format(attempt + 1))
+        if not saved:
+            console.print("[red]No verified login after 3 attempts — nothing was saved.[/red]")
+            console.print("[red]Tip: solve the verification in your normal browser and use:[/red]")
+            console.print("[red]  python fb_scraper.py login --cookies cookies.json[/red]")
+            await browser.close()
+            return
+
+        # Final sanity check: reload home and confirm the session sticks.
+        await page.goto("https://www.facebook.com/", wait_until="domcontentloaded",
+                        timeout=60000)
+        await page.wait_for_timeout(3000)
+        names = {c["name"] for c in await ctx.cookies()}
+        if {"c_user", "xs"} <= names:
+            await ctx.storage_state(path=str(STATE_FILE))
+            console.print("[green]Session verified (c_user + xs) — saved to fb_state.json[/green]")
+        else:
+            console.print("[yellow]Login cookies vanished after reload — Facebook likely[/yellow]")
+            console.print("[yellow]still wants verification. Nothing saved; try again.[/yellow]")
         await browser.close()
+
+
+async def login_from_cookies(path):
+    """Import a Cookie-Editor export of facebook.com cookies (made in your
+    normal browser while logged in, AFTER any 2FA/CAPTCHA was completed
+    there) and save it as fb_state.json. Then verify it headlessly."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as e:
+        console.print(f"[red]Couldn't read {path}: {e}[/red]")
+        return
+    if not isinstance(raw, list):
+        console.print("[red]That doesn't look like a Cookie-Editor export (expected a JSON list).[/red]")
+        return
+    cookies = cookie_editor_to_playwright(raw)
+    if not cookies:
+        console.print("[red]No facebook.com cookies found in that file.[/red]")
+        return
+    names = {c["name"] for c in cookies}
+    if not {"c_user", "xs"} <= names:
+        console.print("[yellow]Warning: the export has no c_user/xs login cookies —[/yellow]")
+        console.print("[yellow]it probably wasn't exported while logged in. Saving anyway.[/yellow]")
+    STATE_FILE.write_text(json.dumps({"cookies": cookies, "origins": []}, indent=2),
+                          encoding="utf-8")
+    console.print(f"[green]Imported {len(cookies)} facebook.com cookies -> fb_state.json[/green]")
+    console.print("[dim]Verifying the session headlessly...[/dim]")
+    status = await verify_session_report()
+    if status == "ok":
+        console.print("[green]✅ Session works — the daemon can use it now.[/green]")
+    elif status == "checkpoint":
+        console.print("[yellow]⚠️ Facebook still wants verification on this session.[/yellow]")
+        console.print("[yellow]   Open facebook.com in your normal browser, complete the[/yellow]")
+        console.print("[yellow]   2FA/CAPTCHA there, then re-export and re-import the cookies.[/yellow]")
+    elif status == "missing":
+        console.print("[red]State file wasn't written — check permissions.[/red]")
+    else:
+        console.print("[yellow]⚠️ Cookies imported but the login looks expired/invalid.[/yellow]")
+        console.print("[yellow]   Re-export from your browser while logged in and try again.[/yellow]")
 
 async def extract_profile(page, url, kind):
     """Visit a profile/page, then its About tab, and pull public fields."""
@@ -233,12 +446,25 @@ def extract_result_links(hrefs):
 async def scrape(args):
     if not STATE_FILE.exists():
         console.print("[red]No session. Run: python fb_scraper.py login[/red]")
+        console.print("[red]or import browser cookies:[/red]")
+        console.print("[red]  python fb_scraper.py login --cookies cookies.json[/red]")
         return
+    # Validate the session BEFORE burning a search: the old code happily ran
+    # with a half-saved state (no c_user/xs) and produced 0 links with no
+    # explanation.
+    if not state_has_login():
+        console.print("[red]fb_state.json has NO active login (missing c_user/xs cookies).[/red]")
+        console.print("[red]It was probably saved mid-verification. Re-run:[/red]")
+        console.print("[red]  python fb_scraper.py login[/red]")
+        console.print("[red]or import cookies from your browser:[/red]")
+        console.print("[red]  python fb_scraper.py login --cookies cookies.json[/red]")
+        return
+
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=args.headless)
+        browser = await p.chromium.launch(headless=args.headless, args=STEALTH_ARGS)
         ctx = await browser.new_context(user_agent=UA, storage_state=str(STATE_FILE))
         page = await ctx.new_page()
 
@@ -253,9 +479,24 @@ async def scrape(args):
 
         title = await page.title()
         console.print(f"[dim]page title: {title}[/dim]")
-        logged_in = await page.query_selector('[aria-label="Your profile"], [aria-label="Profile"], [data-pagelet="LeftRail"]')
+        current_url = page.url.lower()
+
+        # Cookie-level login check (DOM selectors lie on localized/lagged pages).
+        cookie_names = {c["name"] for c in await ctx.cookies()}
+        logged_in = {"c_user", "xs"} <= cookie_names
+        if any(bit in current_url for bit in CHALLENGE_URL_BITS):
+            console.print("[red]Facebook is asking for verification on this session[/red]")
+            console.print("[red](checkpoint / 2FA / CAPTCHA). Open facebook.com in your[/red]")
+            console.print("[red]normal browser, complete it there, then re-run:[/red]")
+            console.print("[red]  python fb_scraper.py login --cookies cookies.json[/red]")
+            console.print("[red]with freshly exported cookies.[/red]")
+            await browser.close()
+            return
         if not logged_in:
-            console.print("[red]Not logged in! Re-run: python fb_scraper.py login[/red]")
+            console.print("[red]Not logged in! (no c_user/xs cookies on this session)[/red]")
+            console.print("[red]Re-run: python fb_scraper.py login[/red]")
+            await browser.close()
+            return
         try:
             await page.wait_for_selector('div[role="main"] a[href]', timeout=15000)
         except Exception:
@@ -286,7 +527,7 @@ async def scrape(args):
 
     results = []
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=args.headless)
+        browser = await p.chromium.launch(headless=args.headless, args=STEALTH_ARGS)
         ctx = await browser.new_context(user_agent=UA, storage_state=str(STATE_FILE))
         page = await ctx.new_page()
         for i, link in enumerate(links, 1):
@@ -359,7 +600,10 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd")
 
-    sub.add_parser("login", help="save your FB session (run once)")
+    l = sub.add_parser("login", help="save your FB session (run once)")
+    l.add_argument("--cookies", help="Cookie-Editor export (facebook.com) to import "
+                                     "instead of logging in manually — use this when the "
+                                     "verification/CAPTCHA page won't load in the automated window")
 
     s = sub.add_parser("scrape", help="run a search")
     s.add_argument("--query", required=True)
@@ -381,7 +625,7 @@ def main():
     args = ap.parse_args()
     try:
         if args.cmd == "login":
-            asyncio.run(login())
+            asyncio.run(login(cookies_file=args.cookies))
         elif args.cmd == "scrape":
             asyncio.run(scrape(args))
         else:

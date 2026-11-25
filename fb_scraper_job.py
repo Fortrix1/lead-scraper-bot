@@ -5,11 +5,18 @@ maps_daemon.handle_job() routes {type: "fbscrape", ...} jobs here. We run
 fb_scraper.py as a subprocess (it needs the saved fb_state.json login session
 and a real browser), then read the newest results_*.json and report the
 leads back to Telegram in batches + the JSON file as a document.
+
+FIX: the session is now VALIDATED BEFORE the search runs (fb_scraper.
+verify_session_report) instead of discovering a broken/mid-verification
+session after 25 minutes of nothing. If the session is missing, expired, or
+Facebook is showing a checkpoint/2FA wall on it, the user gets an exact
+Telegram message telling them what to do — no more silent empty runs.
 """
-import glob, json, os, subprocess, sys, time
+import asyncio, glob, json, os, subprocess, sys, time
 from pathlib import Path
 
 import maps_daemon as md
+import fb_scraper
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -37,17 +44,56 @@ def card(r, n):
     return "\n".join(lines)
 
 
+def _session_help() -> str:
+    return ("On the PC running the daemon, run once:\n"
+            "  python fb_scraper.py login\n\n"
+            "If the verification / CAPTCHA page won't load in that window, instead:\n"
+            "  1. In your NORMAL browser (where you can solve the 2FA/CAPTCHA), "
+            "stay logged into facebook.com\n"
+            "  2. Export the cookies with the Cookie-Editor extension, save as cookies.json\n"
+            "  3. python fb_scraper.py login --cookies cookies.json\n\n"
+            "fb_state.json is gitignored — never push it.")
+
+
 def process_job(data):
     chat_id = str(data.get("chat_id", ""))
     out = BASE_DIR / "fb_results"
     out.mkdir(parents=True, exist_ok=True)
 
-    if not (BASE_DIR / "fb_state.json").exists():
+    state_file = BASE_DIR / "fb_state.json"
+    if not state_file.exists():
         md.send_telegram(chat_id,
-            "⚠️ No Facebook login session on this machine yet.\n\n"
-            "On the PC running the daemon, run once:\n"
-            "python fb_scraper.py login\n\n"
-            "(log in fully in the window that opens, then press ENTER)")
+            "⚠️ No Facebook login session on this machine yet.\n\n" + _session_help())
+        return
+
+    # ── Validate the session BEFORE driving a real search ──
+    try:
+        status = asyncio.run(fb_scraper.verify_session_report())
+    except Exception as e:
+        status = "unknown"
+        print(f"  session pre-check failed to run: {e}")
+
+    if status != "ok":
+        if status == "checkpoint":
+            md.send_telegram(chat_id,
+                "🚧 Facebook is showing a verification / 2FA / CAPTCHA wall on the saved "
+                "session (this is the spinning Meta-logo page that never loads in an "
+                "automated browser).\n\n"
+                "Fix it in your NORMAL browser — where the challenge actually renders:\n"
+                "1. Open facebook.com in your everyday browser (same account)\n"
+                "2. Complete the verification/2FA there once\n"
+                "3. Re-export cookies (Cookie-Editor) and on the daemon PC run:\n"
+                "   python fb_scraper.py login --cookies cookies.json\n\n"
+                "Your job was NOT run, so nothing was wasted.")
+        elif status == "not_logged_in":
+            md.send_telegram(chat_id,
+                "⚠️ The saved Facebook session has no active login (the c_user/xs cookies "
+                "are missing or expired — probably saved while the verification page was "
+                "still spinning).\n\n" + _session_help() + "\n\nYour job was NOT run.")
+        else:
+            md.send_telegram(chat_id,
+                "⚠️ Couldn't validate the Facebook session (unexpected error). "
+                "On the daemon PC run:\n  python fb_scraper.py login\n\nYour job was NOT run.")
         return
 
     ftype = "people" if data.get("ftype") == "people" else "pages"
@@ -90,8 +136,10 @@ def process_job(data):
                        key=os.path.getmtime)
     if not new_files:
         md.send_telegram(chat_id,
-            "No results were produced — the search likely found 0 links. "
-            "Check the daemon console and fb_results/debug_search.png to see what Facebook served.")
+            "No results were produced — the search likely found 0 links "
+            "(or the session was rejected mid-run). "
+            "Check the daemon console and fb_results/debug_search.png to see what Facebook served. "
+            "If it shows a login/verification page, re-run: python fb_scraper.py login")
         return
     try:
         kept = json.loads(Path(new_files[-1]).read_text(encoding="utf-8"))
